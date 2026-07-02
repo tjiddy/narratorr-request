@@ -345,10 +345,16 @@ export class ConnectorSettingsService {
 
   // ---- Generic, registry-driven notifier helpers ----------------------------
 
-  /** Reveal a stored notifier into the runtime shape (secrets decrypted; unknown type passes opaque). */
+  /**
+   * Reveal a stored notifier into the runtime shape (secrets decrypted; unknown type passes opaque).
+   * Events are sanitized via `safeEvents()` on BOTH branches — a non-iterable stored value (e.g.
+   * `events: 42`) would otherwise reach `new Set(nf.events)` in `buildNotifier` and crash-loop boot.
+   * This mirrors the DTO path's degrade so the runtime and DTO surfaces agree on a corrupt row.
+   */
   private toRuntimeNotifier(n: StoredNotifier): RuntimeNotifier {
-    if (!isKnownNotifierType(n.type)) return { ...n, config: n.config };
-    return { ...n, config: this.revealNotifierConfig(NOTIFIER_REGISTRY[n.type], n.config) };
+    const events = this.safeEvents(n);
+    if (!isKnownNotifierType(n.type)) return { ...n, events, config: n.config };
+    return { ...n, events, config: this.revealNotifierConfig(NOTIFIER_REGISTRY[n.type], n.config) };
   }
 
   /**

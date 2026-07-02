@@ -127,8 +127,10 @@ export interface StoredConnectors {
  *     non-string secret passes the envelope and is treated as "unconfigured" at runtime by
  *     `reveal()` + the shared usable-secret mask predicate, NOT a whole-blob reset.
  *   • Notifier `events` is loosened to `unknown` — malformed events keep degrading ROW-LOCALLY via
- *     `safeEvents()`, NOT a whole-blob reset (composing `storedNotifierSchema` verbatim would turn
- *     a bad-events row into a tier-2 wipe).
+ *     `safeEvents()` on BOTH read surfaces (the DTO path in `toNotifierDto` AND the runtime path in
+ *     `toRuntimeNotifier`, so a non-iterable value like `events: 42` can never reach `new Set()` at
+ *     boot), NOT a whole-blob reset (composing `storedNotifierSchema` verbatim would turn a
+ *     bad-events row into a tier-2 wipe).
  * A blob that fails THIS schema (bad envelope: not an object; `notifiers` not an array; `narratorr`
  * neither null nor `{ url: string, … }`; `publicUrl` neither null nor a string; a notifier row that
  * is not an object / lacks a string `id`/`name`/`type` / has a non-object `config`) is what the read
