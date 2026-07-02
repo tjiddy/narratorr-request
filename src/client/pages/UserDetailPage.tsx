@@ -251,6 +251,7 @@ function UserRequestsList({
     <div>
       <h2 className="mb-3 font-display text-lg font-semibold">Requests</h2>
       {requests.isLoading && <p className="text-sm text-muted-foreground/70">Loading…</p>}
+      {requests.error && <p className="text-sm text-destructive">Could not load requests.</p>}
       {requests.data && requests.data.data.length === 0 && (
         <EmptyState
           icon={InboxIcon}
