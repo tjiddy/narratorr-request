@@ -33,8 +33,8 @@ vi.mock('@tanstack/react-query', () => ({
   useMutation: (options: unknown) => options,
   useQuery: (options: unknown) => options,
   useQueryClient: () => hoisted.qc,
-  // Sentinel matching the real symbol's role as a placeholderData value — the paged
-  // list hooks pass it through; no assertion inspects it, it just needs to resolve.
+  // The paged hooks now pass a scoped `keepSameListData(key)` function rather than this
+  // sentinel (#115), but keep the export mocked so any incidental import still resolves.
   keepPreviousData: (prev: unknown) => prev,
 }));
 vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
@@ -78,9 +78,10 @@ vi.mock('react', async (importActual) => {
 });
 
 import { toast } from 'sonner';
-import { keepPreviousData } from '@tanstack/react-query';
 import {
   qk,
+  samePagedList,
+  keepSameListData,
   useRequestBook,
   useUpdateUser,
   useDecide,
@@ -133,6 +134,11 @@ interface QueryOptions {
 }
 const query = (hook: unknown): QueryOptions => hook as QueryOptions;
 
+// The scoped `placeholderData` is a function `(prev, prevQuery) => data`. Cast it out of the
+// `unknown` slot so a test can drive it directly (node-only — no render harness).
+type PlaceholderFn = (prev: unknown, prevQuery?: { queryKey: readonly unknown[] }) => unknown;
+const placeholder = (q: QueryOptions): PlaceholderFn => q.placeholderData as PlaceholderFn;
+
 // Minimal cast helpers — the callbacks only read the few fields we set.
 const req = (over: Partial<RequestDto>): RequestDto => ({ title: 'Dune', status: 'pending', ...over } as RequestDto);
 
@@ -172,11 +178,12 @@ describe('qk query-key builders', () => {
 });
 
 // F2 — pin the AC-critical paged hook wiring so a future edit can't silently drop the
-// limit-keyed cache, the `{ limit }` pass-through, the polling interval, or keepPreviousData.
-// The mocked useQuery returns its raw options, so we read queryKey/queryFn/etc. directly and
-// drive queryFn against the mocked api spies (node-only — no jsdom/component modality).
-describe('paged request list hooks — key isolation, limit pass-through, polling, keepPreviousData', () => {
-  it('useMyRequestsPaged keys by limit, passes { limit }, polls at 4s, keeps previous data', async () => {
+// limit-keyed cache, the `{ limit }` pass-through, the polling interval, or the scoped
+// placeholder. The mocked useQuery returns its raw options, so we read queryKey/queryFn/etc.
+// directly and drive queryFn against the mocked api spies (node-only — no jsdom/component
+// modality).
+describe('paged request list hooks — key isolation, limit pass-through, polling, scoped placeholder', () => {
+  it('useMyRequestsPaged keys by limit, passes { limit }, polls at 4s, scopes the placeholder', async () => {
     const q = query(useMyRequestsPaged(100));
     expect(q.queryKey).toEqual(qk.myRequestsPaged(100));
     expect(q.queryKey).toEqual(['requests', 'mine', 'paged', 100]);
@@ -184,7 +191,8 @@ describe('paged request list hooks — key isolation, limit pass-through, pollin
     // so invalidating that prefix still refetches every loaded page.
     expect((q.queryKey as unknown[]).slice(0, 2)).toEqual(qk.myRequests);
     expect(q.refetchInterval).toBe(4000);
-    expect(q.placeholderData).toBe(keepPreviousData);
+    // No longer the bare keepPreviousData sentinel — a scoped function closing over the key.
+    expect(typeof q.placeholderData).toBe('function');
     await q.queryFn();
     expect(hoisted.api.listMyRequests).toHaveBeenCalledWith({ limit: 100 });
   });
@@ -197,12 +205,12 @@ describe('paged request list hooks — key isolation, limit pass-through, pollin
     expect(hoisted.api.listMyRequests).toHaveBeenCalledWith(); // no args → bare /api/requests
   });
 
-  it('useAdminQueue keys by status+limit, passes status+{ limit }, polls at 5s, keeps previous data', async () => {
+  it('useAdminQueue keys by status+limit, passes status+{ limit }, polls at 5s, scopes the placeholder', async () => {
     const q = query(useAdminQueue('pending', 100));
     expect(q.queryKey).toEqual(qk.adminQueuePaged('pending', 100));
     expect(q.queryKey).toEqual(['admin', 'requests', 'pending', 100]);
     expect(q.refetchInterval).toBe(5000);
-    expect(q.placeholderData).toBe(keepPreviousData);
+    expect(typeof q.placeholderData).toBe('function');
     await q.queryFn();
     expect(hoisted.api.listAdminQueue).toHaveBeenCalledWith('pending', { limit: 100 });
   });
@@ -215,13 +223,89 @@ describe('paged request list hooks — key isolation, limit pass-through, pollin
     expect(hoisted.api.listAdminQueue).toHaveBeenCalledWith(undefined, { limit: 50 });
   });
 
-  it('useUserRequests keys by user+limit, passes { limit }, keeps previous data', async () => {
+  it('useUserRequests keys by user+limit, passes { limit }, scopes the placeholder', async () => {
     const q = query(useUserRequests('us_abc', 150));
     expect(q.queryKey).toEqual(qk.userRequests('us_abc', 150));
     expect(q.queryKey).toEqual(['admin', 'users', 'us_abc', 'requests', 150]);
-    expect(q.placeholderData).toBe(keepPreviousData);
+    expect(typeof q.placeholderData).toBe('function');
     await q.queryFn();
     expect(hoisted.api.listUserRequests).toHaveBeenCalledWith('us_abc', { limit: 150 });
+  });
+});
+
+// #115 — the scoped placeholder comparator. `keepPreviousData` was over-applied: a filter
+// or user switch (a non-limit key-segment change) briefly rendered the prior list's rows as
+// current instead of "Loading…". `samePagedList` / `keepSameListData` restrict the retention
+// to a growing-limit page of the *same* list. Pure logic — driven directly (node-only).
+describe('samePagedList — retain only across a limit change of the same list', () => {
+  it('is true when the keys differ only in the trailing (limit) element', () => {
+    expect(samePagedList(['admin', 'requests', 'pending', 50], ['admin', 'requests', 'pending', 100])).toBe(true);
+  });
+
+  it('is false when a non-limit segment differs (filter switch)', () => {
+    expect(samePagedList(['admin', 'requests', 'pending', 50], ['admin', 'requests', 'active', 50])).toBe(false);
+  });
+
+  it('is false when a non-limit segment differs (user switch)', () => {
+    expect(
+      samePagedList(['admin', 'users', 'us_a', 'requests', 50], ['admin', 'users', 'us_b', 'requests', 50]),
+    ).toBe(false);
+  });
+
+  it('is false when the key lengths differ', () => {
+    expect(samePagedList(['admin', 'requests', 'pending', 50], ['admin', 'requests', 'pending'])).toBe(false);
+  });
+});
+
+describe('keepSameListData — drop the placeholder across a filter/user switch, keep it on limit growth', () => {
+  const prevData = [{ title: 'Dune' }];
+
+  it('returns the prev data when the prior query is the same list at a different limit', () => {
+    const fn = keepSameListData(['admin', 'requests', 'pending', 100]);
+    expect(fn(prevData, { queryKey: ['admin', 'requests', 'pending', 50] })).toBe(prevData);
+  });
+
+  it('returns undefined when a non-limit segment differs (loading returns)', () => {
+    const fn = keepSameListData(['admin', 'requests', 'pending', 50]);
+    expect(fn(prevData, { queryKey: ['admin', 'requests', 'active', 50] })).toBeUndefined();
+  });
+
+  it('returns undefined when there is no prior data', () => {
+    const fn = keepSameListData(['admin', 'requests', 'pending', 100]);
+    expect(fn(undefined, { queryKey: ['admin', 'requests', 'pending', 50] })).toBeUndefined();
+  });
+
+  it('returns undefined when the prior query is absent', () => {
+    const fn = keepSameListData(['admin', 'requests', 'pending', 100]);
+    expect(fn(prevData, undefined)).toBeUndefined();
+  });
+});
+
+// AC1/AC2/AC3/AC4 — drive each hook's actual `placeholderData` function with a prior query to
+// prove the wired-in behavior: filter/user switch drops the placeholder (loading returns),
+// limit growth of the same list keeps it (Load-more retention preserved).
+describe('paged hooks scope the placeholder to same-list limit growth', () => {
+  const prevData = [{ title: 'Dune' }];
+
+  it('useAdminQueue drops the placeholder on a filter switch but keeps it on limit growth', () => {
+    const fn = placeholder(query(useAdminQueue('pending', 100)));
+    // Prior page was the `active` filter → different list → loading returns.
+    expect(fn(prevData, { queryKey: ['admin', 'requests', 'active', 50] })).toBeUndefined();
+    // Prior page was the same `pending` filter at a smaller limit → retain the rows.
+    expect(fn(prevData, { queryKey: ['admin', 'requests', 'pending', 50] })).toBe(prevData);
+  });
+
+  it('useUserRequests drops the placeholder on a user switch but keeps it on limit growth', () => {
+    const fn = placeholder(query(useUserRequests('us_b', 150)));
+    // Prior page was a different user → loading returns.
+    expect(fn(prevData, { queryKey: ['admin', 'users', 'us_a', 'requests', 50] })).toBeUndefined();
+    // Prior page was the same user at a smaller limit → retain the rows.
+    expect(fn(prevData, { queryKey: ['admin', 'users', 'us_b', 'requests', 50] })).toBe(prevData);
+  });
+
+  it('useMyRequestsPaged (limit-only key) still keeps the prev data across a limit change (AC3/AC4)', () => {
+    const fn = placeholder(query(useMyRequestsPaged(100)));
+    expect(fn(prevData, { queryKey: ['requests', 'mine', 'paged', 50] })).toBe(prevData);
   });
 });
 

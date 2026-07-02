@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import type { V1AudibleResult } from '@shared/schemas/v1/metadata';
 import type { RequestStatus } from '@shared/schemas/request';
@@ -63,6 +63,39 @@ export const qk = {
   authProviders: ['auth', 'providers'] as const,
 };
 
+// --- Paged-list placeholder scoping ------------------------------------------
+// The paged request-list hooks key on a growing `limit` (the trailing key element).
+// We want the previous page's rows to stay on-screen while a *larger* page of the SAME
+// list loads (Load-more, and each poll at a stable limit) — but NOT to bleed across a
+// filter or user switch, where the prior key differs in a non-limit segment and the
+// stale rows would be mislabeled as the new list. A bare `keepPreviousData` retains the
+// prior data on *every* key change, so a filter/user switch resolves to `success` with
+// the wrong rows and `isLoading` never re-fires. These helpers scope the retention to
+// the intended case.
+
+/**
+ * True when two query keys describe the same paged list at a (possibly) different limit:
+ * equal length and identical in every element except the trailing `limit`. `false` on any
+ * non-limit segment difference (filter/user switch) or a length mismatch.
+ */
+export const samePagedList = (a: readonly unknown[], b: readonly unknown[]): boolean =>
+  a.length === b.length && a.slice(0, -1).every((v, i) => Object.is(v, b[i]));
+
+/**
+ * A `placeholderData` factory scoped to one paged list. Retains the previous query's data
+ * only when that query is the same list (same filter / same user) at a different limit;
+ * otherwise returns `undefined` so the query re-enters `pending` and the page's existing
+ * `isLoading` "Loading…" branch renders instead of the prior filter/user's rows.
+ *
+ * TanStack v5's `PlaceholderDataFunction` receives `(previousData, previousQuery)` but not
+ * the current key, so we close over it here. The returned function stays generic in the
+ * data type so it satisfies each hook's `placeholderData` slot without a cast.
+ */
+export const keepSameListData =
+  (currentKey: readonly unknown[]) =>
+  <TData>(prev: TData | undefined, prevQuery?: { queryKey: readonly unknown[] }): TData | undefined =>
+    prev !== undefined && prevQuery && samePagedList(prevQuery.queryKey, currentKey) ? prev : undefined;
+
 export const useMe = () =>
   useQuery({ queryKey: qk.me, queryFn: getMe, retry: false, staleTime: 60_000 });
 
@@ -80,23 +113,32 @@ export const useMyRequests = () =>
   useQuery({ queryKey: qk.myRequests, queryFn: () => listMyRequests(), refetchInterval: 4000 });
 
 /** My Requests list view — a bounded growing-limit page, polled so `acquiring → available`
- *  transitions show up live. `keepPreviousData` holds the loaded rows on-screen while a
- *  larger page fetches, so "Load more" (and each poll at a stable limit) never blanks the list. */
-export const useMyRequestsPaged = (limit: number) =>
-  useQuery({
-    queryKey: qk.myRequestsPaged(limit),
+ *  transitions show up live. `keepSameListData` holds the loaded rows on-screen while a
+ *  larger page of the same list fetches, so "Load more" (and each poll at a stable limit)
+ *  never blanks the list. This key varies only by `limit`, so the scoping is a no-op here —
+ *  it always retains — but sharing the helper keeps all three paged hooks consistent. */
+export const useMyRequestsPaged = (limit: number) => {
+  const key = qk.myRequestsPaged(limit);
+  return useQuery({
+    queryKey: key,
     queryFn: () => listMyRequests({ limit }),
     refetchInterval: 4000,
-    placeholderData: keepPreviousData,
+    placeholderData: keepSameListData(key),
   });
+};
 
-export const useAdminQueue = (status: RequestStatus | undefined, limit: number) =>
-  useQuery({
-    queryKey: qk.adminQueuePaged(status, limit),
+export const useAdminQueue = (status: RequestStatus | undefined, limit: number) => {
+  const key = qk.adminQueuePaged(status, limit);
+  return useQuery({
+    queryKey: key,
     queryFn: () => listAdminQueue(status, { limit }),
     refetchInterval: 5000,
-    placeholderData: keepPreviousData,
+    // Retain rows only while a larger page of the *same* status loads — a filter switch
+    // (non-limit segment change) drops the placeholder so "Loading…" shows, never the
+    // previous filter's rows.
+    placeholderData: keepSameListData(key),
   });
+};
 
 export function useRequestBook() {
   const qc = useQueryClient();
@@ -114,12 +156,17 @@ export function useRequestBook() {
 export const useUsers = () =>
   useQuery({ queryKey: qk.users, queryFn: listUsers });
 
-export const useUserRequests = (publicId: string, limit: number) =>
-  useQuery({
-    queryKey: qk.userRequests(publicId, limit),
+export const useUserRequests = (publicId: string, limit: number) => {
+  const key = qk.userRequests(publicId, limit);
+  return useQuery({
+    queryKey: key,
     queryFn: () => listUserRequests(publicId, { limit }),
-    placeholderData: keepPreviousData,
+    // Retain rows only while a larger page of the *same* user loads — navigating to a
+    // different user (non-limit segment change) drops the placeholder so "Loading…" shows,
+    // never the previous user's requests.
+    placeholderData: keepSameListData(key),
   });
+};
 
 export function useUpdateUser() {
   const qc = useQueryClient();
