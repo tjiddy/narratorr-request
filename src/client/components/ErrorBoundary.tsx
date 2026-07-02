@@ -4,11 +4,15 @@ import { Button } from './Button';
 import { RefreshIcon } from './icons';
 import {
   deriveErrorState,
+  deriveResetState,
   resetErrorState,
   errorMessage,
   logBoundaryError,
   type ErrorBoundaryState,
+  type BoundaryState,
 } from './error-boundary-state';
+
+type ErrorBoundaryProps = { children: ReactNode; resetKey: string };
 
 /**
  * Route-level React error boundary. `App.tsx` uses the JSX `<BrowserRouter><Routes>` idiom
@@ -17,13 +21,27 @@ import {
  * `Layout`'s `<main>`, so a caught render throw leaves the header (nav / theme / sign-out)
  * fully interactive while the page content is replaced by a recoverable fallback card.
  *
- * All decision logic lives in the pure, node-tested `error-boundary-state` helpers.
+ * Because `Layout` is the persistent layout-route element, this instance (and its state)
+ * survives child-route navigation — so the boundary must reset itself, or a single caught
+ * error would leave the stale fallback on every healthy route the user then clicks to. That
+ * reset is driven by `resetKey` (the current pathname): `getDerivedStateFromProps` clears the
+ * error whenever the key changes. All decision logic lives in the pure, node-tested
+ * `error-boundary-state` helpers.
  */
-export class ErrorBoundary extends Component<{ children: ReactNode }, ErrorBoundaryState> {
-  state: ErrorBoundaryState = resetErrorState();
+export class ErrorBoundary extends Component<ErrorBoundaryProps, BoundaryState> {
+  // Seed `prevResetKey` to the current key so a same-route error is not self-cleared on the
+  // very next render (getDerivedStateFromProps runs right after getDerivedStateFromError).
+  state: BoundaryState = { ...resetErrorState(), prevResetKey: this.props.resetKey };
 
   static getDerivedStateFromError(error: unknown): ErrorBoundaryState {
     return deriveErrorState(error);
+  }
+
+  static getDerivedStateFromProps(
+    props: ErrorBoundaryProps,
+    state: BoundaryState,
+  ): Partial<BoundaryState> | null {
+    return deriveResetState(props.resetKey, state);
   }
 
   componentDidCatch(error: Error, info: ErrorInfo): void {

@@ -8,9 +8,38 @@
 /** Errored → carries the thrown value; recovered → no error. */
 export type ErrorBoundaryState = { hasError: false } | { hasError: true; error: unknown };
 
+/**
+ * The boundary's full class state: the error union plus the last resetKey it observed.
+ * `prevResetKey` is what lets `getDerivedStateFromProps` tell a real navigation (key
+ * changed → recover) from an ordinary re-render on the same route (key equal → leave
+ * a freshly-caught error alone). See {@link deriveResetState}.
+ */
+export type BoundaryState = ErrorBoundaryState & { prevResetKey: string };
+
 /** The boundary's initial / reset state (a pure reset helper, testable + reusable). */
 export function resetErrorState(): ErrorBoundaryState {
   return { hasError: false };
+}
+
+/**
+ * The `getDerivedStateFromProps` reducer for navigation-driven reset. It runs on **every**
+ * render — including the one right after `getDerivedStateFromError` — so it resets **only**
+ * when the resetKey actually changed. An equal key must never clobber a freshly-caught error
+ * on the same route (the no-clobber path); that is why we compare against the stored
+ * `prevResetKey` rather than reacting to `hasError` alone. Returns the state patch to merge,
+ * or `null` for no change.
+ *
+ * - key changed while errored → recover (clear the error) and advance `prevResetKey`.
+ * - key unchanged            → `null` (no-clobber; covers the same-route re-render).
+ * - key changed while healthy → just advance `prevResetKey` (no spurious state churn).
+ */
+export function deriveResetState(
+  nextResetKey: string,
+  state: BoundaryState,
+): Partial<BoundaryState> | null {
+  if (nextResetKey === state.prevResetKey) return null;
+  if (state.hasError) return { ...resetErrorState(), prevResetKey: nextResetKey };
+  return { prevResetKey: nextResetKey };
 }
 
 /**
