@@ -12,9 +12,9 @@ import { ErrorBoundary } from './ErrorBoundary';
 describe('ErrorBoundary class seam', () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it('starts from the recovered (non-errored) state', () => {
-    const boundary = new ErrorBoundary({ children: null });
-    expect(boundary.state).toEqual({ hasError: false });
+  it('starts from the recovered (non-errored) state, seeding prevResetKey from the current key', () => {
+    const boundary = new ErrorBoundary({ children: null, resetKey: '/start' });
+    expect(boundary.state).toEqual({ hasError: false, prevResetKey: '/start' });
   });
 
   it('getDerivedStateFromError delegates the thrown value into the errored state', () => {
@@ -24,9 +24,21 @@ describe('ErrorBoundary class seam', () => {
     expect(ErrorBoundary.getDerivedStateFromError('kaboom')).toEqual({ hasError: true, error: 'kaboom' });
   });
 
+  it('getDerivedStateFromProps delegates to the pure reset reducer', () => {
+    const errored = { hasError: true as const, error: new Error('boom'), prevResetKey: '/a' };
+    // key changed while errored → recover
+    expect(
+      ErrorBoundary.getDerivedStateFromProps({ children: null, resetKey: '/b' }, errored),
+    ).toEqual({ hasError: false, prevResetKey: '/b' });
+    // same key → no-clobber of the freshly-caught error
+    expect(
+      ErrorBoundary.getDerivedStateFromProps({ children: null, resetKey: '/a' }, errored),
+    ).toBeNull();
+  });
+
   it('componentDidCatch surfaces the error and component stack via console.error', () => {
     const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    const boundary = new ErrorBoundary({ children: null });
+    const boundary = new ErrorBoundary({ children: null, resetKey: '/' });
     const error = new Error('boom');
     const info: ErrorInfo = { componentStack: 'at SearchPage' };
 
