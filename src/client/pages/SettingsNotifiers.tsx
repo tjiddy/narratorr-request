@@ -25,7 +25,15 @@ function isKnownNotifier(n: NotifierDto): n is KnownNotifierDto {
   return !('unknown' in n && n.unknown);
 }
 
-export function NotifiersSection({ notifiers, publicUrl }: { notifiers: NotifierDto[]; publicUrl: string | null }) {
+export function NotifiersSection({
+  notifiers,
+  publicUrl,
+  requesterEmailWarning,
+}: {
+  notifiers: NotifierDto[];
+  publicUrl: string | null;
+  requesterEmailWarning: boolean;
+}) {
   const [editing, setEditing] = useState<NotifierFormState | null>(null);
   const del = useDeleteNotifier();
   const test = useTestNotifier();
@@ -51,6 +59,17 @@ export function NotifiersSection({ notifiers, publicUrl }: { notifiers: Notifier
           </Button>
         }
       />
+
+      {requesterEmailWarning && (
+        <div
+          role="alert"
+          className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-4 text-sm text-amber-700 dark:text-amber-300"
+        >
+          Some users opted in to be emailed when their request is ready, but no usable email
+          notifier is configured — those emails won’t be delivered. Add an <strong>email</strong>{' '}
+          notifier below to enable requester notifications.
+        </div>
+      )}
 
       {notifiers.length === 0 ? (
         <SettingsCard delay="60ms">

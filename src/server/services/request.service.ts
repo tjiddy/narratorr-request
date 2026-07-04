@@ -5,6 +5,8 @@ import { requests, users, type RequestRow } from '../../db/schema.js';
 import type { Notifier } from './notifications/index.js';
 import { redact } from './notifications/redact.js';
 import type { NotifierLogger } from './notifications/types.js';
+import type { RequesterEmailSender } from './notifications/requester-email.js';
+import { sanitizeNotifyOn } from '../../shared/schemas/user.js';
 import type { UserService } from './user.service.js';
 import type {
   CreateRequestBody,
@@ -95,9 +97,11 @@ export interface QuotaUsage {
 }
 
 /**
- * Wiring for the admin-facing `request.failed` notification (issue #60). Optional — when
- * absent the service simply doesn't emit (existing call-sites that don't care about
- * notifications keep their 3-arg construction).
+ * Wiring for the notification side effects the request lifecycle fires — the admin-facing
+ * `request.failed` heads-up (issue #60) AND the requester-facing `available` email (issue #50).
+ * Optional as a whole — when absent the service simply doesn't emit (existing call-sites that
+ * don't care about notifications keep their 3-arg construction). Each side effect is
+ * fire-and-forget and NEVER throws into the request/poll path.
  */
 export interface RequestFailureNotifyDeps {
   /**
@@ -106,8 +110,14 @@ export interface RequestFailureNotifyDeps {
    * change, so capturing it would dispatch failed-notifications through a stale channel set.
    */
   getNotifier: () => Notifier;
-  /** Resolves `requester.username`; an absent row falls back to a stable placeholder. */
+  /** Resolves `requester.username` (failed) / the requester's opt-in + email (available); an absent row is a no-op. */
   users: Pick<UserService, 'getById'>;
+  /**
+   * Requester-email sender (issue #50). Optional — when absent, `available` transitions emit no
+   * requester email (the failed path is unaffected). Builds its SMTP transport from the operator's
+   * first usable email notifier at send time; a missing source is its own silent no-op.
+   */
+  requesterEmail?: RequesterEmailSender;
   /**
    * Optional log sink for fire-and-forget emission faults (a requester lookup that rejects, or a
    * notifier dispatch that rejects). Without it a lost `request.failed` is undiagnosable; the
@@ -406,11 +416,20 @@ export class RequestService {
         });
         return failed ?? row;
       }
+      // Atomically claim the OBSERVED `approved` edge (mirrors transitionToFailed): the real race
+      // is handler-vs-poller — create()'s in-flight handoff vs recoverHandoff firing a second
+      // handoff on the same `(approved, bookId NULL)` row. Both call addBook (idempotent by ASIN),
+      // then both reach here; the `WHERE status = row.status` guard lets exactly ONE land the edge,
+      // so the availability email fires exactly once (only when the claim returns a row). The loser
+      // matches zero rows and emits nothing.
       const [updated] = await this.db
         .update(requests)
         .set({ narratorrBookId: book.id, status: next })
-        .where(eq(requests.id, row.id))
+        .where(and(eq(requests.id, row.id), eq(requests.status, row.status)))
         .returning();
+      // A book that was already imported short-circuits approved → available here (never entering
+      // acquiring), so this is the ONLY available emit site for the synchronous / recovered paths.
+      if (updated && next === 'available') this.emitAvailable(updated);
       return updated ?? row;
     } catch (err) {
       if (!isTerminalHandoffError(err)) throw err; // transient — stays `approved`, poller retries
@@ -525,6 +544,52 @@ export class RequestService {
     });
   }
 
+  /**
+   * Fire-and-forget requester `available` email (issue #50). Called only when an available
+   * atomic claim landed a row, so it fires EXACTLY ONCE per transition. NEVER throws into the
+   * request/poll path — the available transition is already committed, so an opted-out user, a
+   * missing contact, a missing SMTP source, or a send fault must not unwind it. Resolves the
+   * requester at send time (opt-in and contact both live on their row and can have changed): a
+   * missing row / not-opted-in / null email are all valid SILENT no-ops, not invariant violations.
+   */
+  private emitAvailable(row: RequestRow): void {
+    const deps = this.notifyDeps;
+    const sender = deps?.requesterEmail;
+    if (!deps || !sender) return;
+    void (async () => {
+      let user: Awaited<ReturnType<typeof deps.users.getById>>;
+      try {
+        user = await deps.users.getById(row.userId);
+      } catch (err) {
+        // redact() before logging: a lookup fault's error text could embed a secret-bearing value.
+        deps.logger?.warn(
+          { err: redact(err), request: row.publicId },
+          'request.available: requester lookup failed; skipping email',
+        );
+        return;
+      }
+      if (!user) return; // requester row gone (deleted account) — nothing to email
+      if (!sanitizeNotifyOn(user.notifyOn).includes('available')) return; // not opted in
+      if (!user.email) return; // opted in but no contact — a valid silent no-op (Design #4)
+      try {
+        await sender.send({
+          to: user.email,
+          transition: 'available',
+          request: { title: row.title, author: row.author },
+        });
+      } catch (err) {
+        // A lost requester email must be diagnosable; the available transition already committed,
+        // never propagate. redact() before logging: a send fault can embed SMTP credentials.
+        deps.logger?.warn(
+          { err: redact(err), request: row.publicId },
+          'request.available: requester email dispatch failed; notification lost',
+        );
+      }
+    })().catch((err) => {
+      deps.logger?.warn({ err: redact(err), request: row.publicId }, 'request.available: emission failed unexpectedly');
+    });
+  }
+
   // --- reconciliation (poller) ----------------------------------------------
 
   /**
@@ -576,10 +641,17 @@ export class RequestService {
       });
       return failed ? 'failed' : null;
     }
-    await this.db
+    // Claim the OBSERVED (`acquiring`) edge atomically — the same `WHERE status = <observed>
+    // … .returning()` guard as the failed edge. This is the normal `acquiring → available` write;
+    // emitting the availability email only when the claim lands a row keeps it exactly-once even
+    // if this path ever raced another writer (the loser matches zero rows and emits nothing).
+    const [updated] = await this.db
       .update(requests)
       .set({ status: next, narratorrBookId: bookId })
-      .where(eq(requests.id, row.id));
+      .where(and(eq(requests.id, row.id), eq(requests.status, row.status)))
+      .returning();
+    if (!updated) return null; // lost the claim — the row already moved off the observed status
+    if (next === 'available') this.emitAvailable(updated);
     return next === row.status ? null : next;
   }
 

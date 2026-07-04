@@ -1,7 +1,7 @@
 import { and, asc, eq, sql } from 'drizzle-orm';
 import type { Db } from '../../db/client.js';
 import { users, type UserRow } from '../../db/schema.js';
-import type { Role, UserStatus, UserDto, UpdateUserBody } from '../../shared/schemas/user.js';
+import type { Role, UserStatus, UserDto, UpdateUserBody, NotifiableTransition } from '../../shared/schemas/user.js';
 import type { AuthUser } from '../types.js';
 import type { OidcProfile } from './oidc.service.js';
 import { publicId } from '../util/ids.js';
@@ -123,6 +123,24 @@ export class UserService {
       return existing;
     }
     const [updated] = await this.db.update(users).set(set).where(eq(users.publicId, pid)).returning();
+    if (!updated) throw notFound('user not found');
+    return updated;
+  }
+
+  /**
+   * Set the caller's own requester-notification opt-in set (issue #50). Self-scoped: the route
+   * passes the AUTHENTICATED user's id, and this touches only `notify_on` — no path here can
+   * mutate another user or any other column. Storage-permissive by design (Design #4): the set is
+   * persisted regardless of email/SMTP state (opt-in may legitimately outlive a contact); delivery
+   * is gated at send time, not here. `notifyOn` is already validated to `NotifiableTransition[]`
+   * by the route's Zod body, so it's stored as-is. Returns the updated row.
+   */
+  async setNotifyOn(userId: number, notifyOn: NotifiableTransition[]): Promise<UserRow> {
+    const [updated] = await this.db
+      .update(users)
+      .set({ notifyOn })
+      .where(eq(users.id, userId))
+      .returning();
     if (!updated) throw notFound('user not found');
     return updated;
   }

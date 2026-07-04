@@ -1,4 +1,4 @@
-import type { MeDto, UserDto, UpdateUserBody, AuthProvidersDto } from '@shared/schemas/user';
+import type { MeDto, UserDto, UpdateUserBody, UpdateMeBody, AuthProvidersDto } from '@shared/schemas/user';
 import type { RequestDto, RequestStatus } from '@shared/schemas/request';
 import { isPublicHttpsUrl } from '@shared/schemas/request';
 import type { V1AudibleResult } from '@shared/schemas/v1/metadata';
@@ -47,6 +47,14 @@ async function parse<T>(res: Response): Promise<T> {
 const opts = (init?: RequestInit): RequestInit => ({ credentials: 'same-origin', ...init });
 
 export const getMe = () => fetch('/api/me', opts()).then(parse<MeDto>);
+
+/** Update the caller's own requester-notification opt-in set. Self-scoped (PATCH /api/me). */
+export const updateMe = (body: UpdateMeBody) =>
+  fetch('/api/me', opts({
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })).then(parse<MeDto>);
 
 export const searchCatalog = (q: string) =>
   fetch(`/api/search?q=${encodeURIComponent(q)}`, opts()).then(parse<{ data: V1AudibleResult[] }>);

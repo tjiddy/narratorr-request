@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import type { V1AudibleResult } from '@shared/schemas/v1/metadata';
 import type { RequestStatus } from '@shared/schemas/request';
-import type { UpdateUserBody } from '@shared/schemas/user';
+import type { UpdateUserBody, UpdateMeBody } from '@shared/schemas/user';
 import type {
   UpdateConnectorSettingsBody,
   TestConnectorBody,
@@ -13,6 +13,7 @@ import type {
 } from '@shared/schemas/connectors';
 import {
   getMe,
+  updateMe,
   searchCatalog,
   listMyRequests,
   listAdminQueue,
@@ -98,6 +99,20 @@ export const keepSameListData =
 
 export const useMe = () =>
   useQuery({ queryKey: qk.me, queryFn: getMe, retry: false, staleTime: 60_000 });
+
+/** Save the caller's own requester-notification opt-in set (issue #50). Writes the fresh MeDto
+ *  straight into the `me` cache so the control + nudge reflect the new set immediately. */
+export function useUpdateMe() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: UpdateMeBody) => updateMe(body),
+    onSuccess: (dto) => {
+      qc.setQueryData(qk.me, dto);
+      toast.success('Notification preferences saved');
+    },
+    onError: (err) => toast.error(err instanceof ApiError ? err.message : 'Could not save preferences'),
+  });
+}
 
 export const useSearch = (q: string) =>
   useQuery({

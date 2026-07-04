@@ -33,7 +33,12 @@ const ntfyRuntimeSchema = z.object({
   token: z.string().nullable(),
   priority: z.string().nullable(),
 });
-const emailRuntimeSchema = z.object({
+// Exported so the requester-email path (issue #50) selects its SMTP source with the SAME
+// runtime predicate the dispatcher's adapter map uses — `user`/`pass` nullable, so a
+// passwordless / open-relay email notifier is usable. Do NOT re-validate a source against the
+// registry WRITE `configSchema` (its `pass` is optional and a different shape); that would
+// wrongly reject a healthy passwordless source. See requester-email.ts / AC9.
+export const emailRuntimeSchema = z.object({
   host: z.string(),
   port: z.number(),
   secure: z.boolean(),
@@ -42,6 +47,7 @@ const emailRuntimeSchema = z.object({
   from: z.string(),
   to: z.string(),
 });
+export type EmailRuntimeConfig = z.infer<typeof emailRuntimeSchema>;
 const webhookRuntimeSchema = z.object({ url: z.string().min(1) });
 const discordRuntimeSchema = z.object({ webhookUrl: z.string().min(1), includeCover: z.boolean().default(true) });
 const slackRuntimeSchema = z.object({ webhookUrl: z.string().min(1) });

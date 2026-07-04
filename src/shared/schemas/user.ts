@@ -33,6 +33,31 @@ export type RequestQuota = z.infer<typeof requestQuotaSchema>;
 export const REQUEST_QUOTA_MODES = ['inherit', 'unlimited', 'limited', 'blocked'] as const;
 export type RequestQuotaMode = (typeof REQUEST_QUOTA_MODES)[number];
 
+// --- Requester notification opt-in -------------------------------------------
+// The transitions a requester can opt into being emailed about. A DEDICATED const — NOT
+// the 6-value RequestStatus — because only transitions with a real emit site belong here
+// (pending/approved/acquiring never email anyone, so reusing RequestStatus would ship
+// checkboxes that can never fire). This is the single source of truth for the opt-in Zod
+// schema, the client control, and emit-site coverage. v1 ships `available` only; the
+// `denied`/`failed` entries land in the follow-up ALONGSIDE their emit sites, so the const
+// never lists a transition that can't fire (issue #50).
+export const NOTIFIABLE_TRANSITIONS = ['available'] as const;
+export type NotifiableTransition = (typeof NOTIFIABLE_TRANSITIONS)[number];
+export const notifiableTransitionSchema = z.enum(NOTIFIABLE_TRANSITIONS);
+
+/**
+ * Narrow a stored/legacy `notify_on` JSON value into a clean `NotifiableTransition[]`. A
+ * corrupt / hand-edited / legacy blob (non-array, or an entry outside the current const)
+ * DEGRADES TO EMPTY rather than throwing — mirroring the `autoApproveRoles`/`connectors`
+ * degrade-and-continue discipline (a bad opt-in must never brick a read or a send). Duplicate
+ * values are collapsed. Pure, so it's shared by the DB read path, the DTO, and the client.
+ */
+export function sanitizeNotifyOn(raw: unknown): NotifiableTransition[] {
+  const parsed = z.array(notifiableTransitionSchema).safeParse(raw);
+  if (!parsed.success) return [];
+  return [...new Set(parsed.data)];
+}
+
 // Shape returned to the client for a user.
 export const userDtoSchema = z.object({
   publicId: z.string(),
@@ -74,8 +99,27 @@ export const meDtoSchema = userDtoSchema.extend({
     remaining: z.number().int().nullable(), // null for unlimited
     windowDays: quotaWindowDaysSchema,
   }),
+  // The caller's own requester-notification opt-in set (issue #50). Self-scoped — NOT on the
+  // admin `userDtoSchema`, so no admin surface exposes another user's preferences.
+  notifyOn: z.array(notifiableTransitionSchema),
+  // True IFF the caller has a non-null email AND the operator has a usable email-notifier SMTP
+  // source. Drives the opt-in control's enabled state and the one-time discoverability nudge;
+  // opt-in STORAGE is permissive (may outlive a contact), but DELIVERY + the UI gate on this.
+  emailNotifyAvailable: z.boolean(),
 });
 export type MeDto = z.infer<typeof meDtoSchema>;
+
+// `PATCH /api/me` — the self-scoped opt-in write. Body carries ONLY `notifyOn`; each element
+// must be in `NOTIFIABLE_TRANSITIONS` (v1: `available`) or Zod rejects it (400). Strict so a
+// stray key (e.g. an attempt to smuggle `role`) is refused — this endpoint can never mutate
+// anything but the caller's own opt-in set. The set is stored as-is regardless of email/SMTP
+// state (storage-permissive; no 403 on enable-without-contact).
+export const updateMeBodySchema = z
+  .object({
+    notifyOn: z.array(notifiableTransitionSchema),
+  })
+  .strict();
+export type UpdateMeBody = z.infer<typeof updateMeBodySchema>;
 
 // --- Auth: login screen + local auth ----------------------------------------
 

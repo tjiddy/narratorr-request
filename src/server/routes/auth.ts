@@ -3,7 +3,16 @@ import type { FastifyInstance } from 'fastify';
 import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import type { AppDeps } from '../services/deps.js';
 import type { UpsertResult } from '../services/user.service.js';
-import { meDtoSchema, authProvidersDtoSchema, localCredentialsSchema } from '../../shared/schemas/user.js';
+import {
+  meDtoSchema,
+  authProvidersDtoSchema,
+  localCredentialsSchema,
+  updateMeBodySchema,
+  sanitizeNotifyOn,
+  type MeDto,
+} from '../../shared/schemas/user.js';
+import type { UserRow } from '../../db/schema.js';
+import { selectEmailSource } from '../services/notifications/requester-email.js';
 import { requireUser, setSessionCookie, clearSessionCookie } from '../plugins/auth.js';
 import { hashPassword, verifyPassword } from '../util/password.js';
 import { badRequest, conflict, notFound, unauthorized } from '../util/errors.js';
@@ -42,13 +51,34 @@ export function registerAuthRoutes(app: FastifyInstance, deps: AppDeps): void {
   const rl = (max: number) =>
     deps.config.authMode === 'bypass' ? {} : { config: { rateLimit: { max, timeWindow: '1 minute' } } };
 
-  // Current user + rolling quota usage.
+  // Build the self-scoped `/api/me` DTO: the user + rolling quota usage + the caller's own
+  // requester-notification opt-in set and whether email delivery is currently available (a
+  // non-null contact AND a usable email-notifier SMTP source). `emailNotifyAvailable` drives the
+  // client's opt-in enabled state + discoverability nudge; the opt-in SET is stored regardless
+  // (storage-permissive — Design #4). Shared by GET (reads the row) and PATCH (echoes the write).
+  const buildMeDto = async (row: UserRow): Promise<MeDto> => {
+    const quota = await deps.requests.quotaUsage(row.id, deps.requests.resolveQuota(row));
+    const emailNotifyAvailable =
+      row.email !== null && selectEmailSource(await deps.connectorSettings.getNotificationsConfig()) !== null;
+    return { ...deps.users.toDto(row), quota, notifyOn: sanitizeNotifyOn(row.notifyOn), emailNotifyAvailable };
+  };
+
+  // Current user + rolling quota usage + own opt-in set.
   a.get('/api/me', { schema: { response: { 200: meDtoSchema } } }, async (request) => {
     const user = requireUser(request);
     const row = await deps.users.getById(user.id);
     if (!row) throw badRequest('NO_USER', 'session user no longer exists');
-    const quota = await deps.requests.quotaUsage(row.id, deps.requests.resolveQuota(row));
-    return { ...deps.users.toDto(row), quota };
+    return buildMeDto(row);
+  });
+
+  // Update the caller's own requester-notification opt-in set. Self-scoped — no target id, cannot
+  // mutate another user (requireUser gates it; the manifest test asserts the guard). Storage-
+  // permissive: a value outside NOTIFIABLE_TRANSITIONS is a 400 (Zod), but enabling without a
+  // usable email/SMTP is NOT a 403 — the set is stored and delivery is gated at send time.
+  a.patch('/api/me', { schema: { body: updateMeBodySchema, response: { 200: meDtoSchema } } }, async (request) => {
+    const user = requireUser(request);
+    const row = await deps.users.setNotifyOn(user.id, request.body.notifyOn);
+    return buildMeDto(row);
   });
 
   // Server-driven login screen. The client renders the password form when `local` is
