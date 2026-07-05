@@ -6,7 +6,7 @@ import { NarratorrError, type INarratorrClient } from './narratorr-client.js';
 import { UserService } from './user.service.js';
 import type { Notifier, NotificationPayload } from './notifications/index.js';
 import { createTestDb, insertUser } from '../test-support/db.js';
-import { requests } from '../../db/schema.js';
+import { requests, users } from '../../db/schema.js';
 import type { Db } from '../../db/client.js';
 import type { FastifyBaseLogger } from 'fastify';
 import type { V1Book } from '../../shared/schemas/v1/books.js';
@@ -424,6 +424,76 @@ describe('StatusPoller 404 path — request.failed emission (#60)', () => {
 // #68 AC4) — recoverHandoff resolves on terminal failure so the poller doesn't log it as an
 // upstream error and wrongly trip backoff. (The transient half — counted as an upstream error,
 // row left `approved` for retry — is pinned by 'AC#2 counts a transient stranded-handoff failure'.)
+// The requester availability-email sweep (#121) is the third pollOnce pass and the SOLE sender of
+// the "your audiobook is ready" email. These assert the poller DRIVES the sweep, and that the
+// sweep's fire-and-forget isolation matches the other passes: a per-row send fault never unwinds
+// the tick, while a sweep-level DB READ fault propagates to the tick's guard (backoff), exactly
+// like findAcquiring rejecting (AC#1c above).
+describe('StatusPoller availability-email sweep (#121)', () => {
+  function sweepSvc(send: (args: unknown) => Promise<'delivered' | 'skipped-no-config'>) {
+    return new RequestService(
+      db,
+      client,
+      { defaultQuota: { mode: 'limited', limit: 10 }, windowDays: 30, autoApproveRoles: ['admin'] },
+      {
+        getNotifier: () => ({ notify: async () => {} } as unknown as Notifier),
+        users: new UserService(db),
+        requesterEmail: { send: send as never },
+      },
+    );
+  }
+
+  /** Seed an `available` row owed an email: opted-in requester with a contact, null marker. */
+  async function seedOwedAvailable(asin: string) {
+    const user = await insertUser(db);
+    await db.update(users).set({ email: `${asin}@example.com`, notifyOn: ['available'] }).where(eq(users.id, user.id));
+    const [row] = await db
+      .insert(requests)
+      .values({ publicId: `rq_${asin}`, userId: user.id, asin, title: 't', status: 'available', narratorrBookId: 'bk_1' })
+      .returning();
+    return row!;
+  }
+
+  it('pollOnce drives the sweep — an owed available row is delivered and its marker settled', async () => {
+    const send = vi.fn(async (): Promise<'delivered'> => 'delivered');
+    const svc = sweepSvc(send);
+    const p = new StatusPoller({ requests: svc, client, logger: noopLogger, jitterMs: 0 });
+    const row = await seedOwedAvailable('A1');
+
+    // No acquiring rows — checked stays 0 — but the sweep still runs and delivers.
+    const summary = await p.pollOnce();
+    expect(summary).toMatchObject({ checked: 0 });
+    expect(send).toHaveBeenCalledTimes(1);
+    const [fresh] = await db.select().from(requests).where(eq(requests.id, row.id));
+    expect(fresh?.availableNotifiedAt).not.toBeNull();
+  });
+
+  it('a per-row send rejection in the sweep never unwinds the tick (pollOnce still resolves; marker left null)', async () => {
+    const send = vi.fn(async (): Promise<'delivered'> => {
+      throw new Error('smtp down');
+    });
+    const svc = sweepSvc(send);
+    const p = new StatusPoller({ requests: svc, client, logger: noopLogger, jitterMs: 0 });
+    const row = await seedOwedAvailable('A1');
+
+    await expect(p.pollOnce()).resolves.toMatchObject({ checked: 0, upstreamErrors: 0 });
+    expect(send).toHaveBeenCalledTimes(1);
+    const [fresh] = await db.select().from(requests).where(eq(requests.id, row.id));
+    expect(fresh?.availableNotifiedAt).toBeNull(); // replayable next tick
+  });
+
+  it('a sweep-level DB read fault propagates to the tick guard (pollOnce rejects → backoff)', async () => {
+    const send = vi.fn(async (): Promise<'delivered'> => 'delivered');
+    const svc = sweepSvc(send);
+    vi.spyOn(svc, 'findAvailableAwaitingNotify').mockRejectedValueOnce(new Error('db read boom'));
+    const p = new StatusPoller({ requests: svc, client, logger: noopLogger, jitterMs: 0 });
+    await seedOwedAvailable('A1');
+
+    await expect(p.pollOnce()).rejects.toThrow('db read boom');
+    expect(send).not.toHaveBeenCalled();
+  });
+});
+
 describe('StatusPoller stranded-handoff terminal emission (#68)', () => {
   it('emits request.failed once on a terminal stranded handoff, counts it as a transition (not an upstream error), and does not re-emit on the next poll', async () => {
     const { notify, notifyingSvc, dispatched } = notifyHarness();

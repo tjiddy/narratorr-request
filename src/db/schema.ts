@@ -98,6 +98,13 @@ export const requests = sqliteTable(
       .default(sql`(unixepoch())`),
     decidedAt: integer('decided_at', { mode: 'timestamp' }),
     decidedBy: integer('decided_by').references(() => users.id, { onDelete: 'set null' }),
+    // Durable "requester availability email settled" marker (issue #121). Nullable: null means the
+    // availability email still owes an attempt; a timestamp means a TERMINAL per-row outcome was
+    // reached (delivered, or a permanent no-op — not opted in / null email) and no further attempt
+    // is needed. The poller sweep is the SOLE writer, setting it atomically
+    // (`… WHERE available_notified_at IS NULL RETURNING`); a global no-config skip / transient SMTP
+    // failure leaves it null so the row is re-attempted next tick.
+    availableNotifiedAt: integer('available_notified_at', { mode: 'timestamp' }),
   },
   (table) => [
     index('idx_requests_user_id').on(table.userId),

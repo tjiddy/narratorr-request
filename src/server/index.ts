@@ -74,7 +74,7 @@ async function main(): Promise<void> {
   // Requester-facing `available` email (issue #50). Reads the LIVE decrypted notifier config at
   // send time (accessor, not captured) so it selects the current first-usable email notifier as
   // its SMTP source after any Settings save. Never routes through the admin notifier/EmailChannel.
-  const requesterEmail = new RequesterEmailService(() => connectorSettings.getNotificationsConfig(), app.log);
+  const requesterEmail = new RequesterEmailService(() => connectorSettings.getNotificationsConfig());
   const requests = new RequestService(
     db,
     narratorr,

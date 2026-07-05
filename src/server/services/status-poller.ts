@@ -142,6 +142,16 @@ export class StatusPoller {
       }
     }
 
+    // Third pass: the durable requester availability-email sweep (issue #121). The SOLE sender of
+    // the "your audiobook is ready" email — re-attempts opted-in `available` rows whose
+    // `available_notified_at` marker is null and settles each on a terminal outcome, so a transient
+    // SMTP outage or a crash between the `available` commit and the send never loses the email.
+    // Runs LAST so the acquiring reconciliation (which may itself produce new `available` rows) is
+    // already committed. Per-row send faults are swallowed inside the sweep; a sweep-level DB read
+    // fault propagates to the tick's guard, which backs off like any other poll error — never
+    // unwinding the transitions already committed above.
+    await this.requests.sweepAvailableNotifications(this.batchSize);
+
     return { checked: rows.length, transitioned, upstreamErrors };
   }
 }
