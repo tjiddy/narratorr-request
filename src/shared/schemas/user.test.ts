@@ -8,6 +8,9 @@ import {
   notifiableTransitionSchema,
   sanitizeNotifyOn,
   updateMeBodySchema,
+  contactEmailSchema,
+  normalizeContactEmail,
+  hasDeliverableContact,
 } from './user.js';
 
 describe('requestQuotaSchema — four-mode discriminated union', () => {
@@ -145,6 +148,42 @@ describe('localCredentialsSchema', () => {
   describe('.strict()', () => {
     it('rejects an unknown key', () => {
       expect(localCredentialsSchema.safeParse({ email: 'user@x.com', password: pw, extra: 1 }).success).toBe(false);
+    });
+  });
+});
+
+describe('contactEmailSchema / normalizeContactEmail / hasDeliverableContact (issue #120)', () => {
+  it('localCredentialsSchema.email reuses the shared contactEmailSchema (same shape, no drift)', () => {
+    // The local-login email IS contactEmailSchema — parsing the extracted schema directly
+    // must produce the same normalized value the login form relies on.
+    expect(contactEmailSchema.parse('  USER@EXAMPLE.COM ')).toBe('user@example.com');
+    expect(contactEmailSchema.safeParse('notanemail').success).toBe(false);
+  });
+
+  describe('normalizeContactEmail', () => {
+    it('returns the trimmed + lowercased address for a valid claim', () => {
+      expect(normalizeContactEmail('  T@X.COM ')).toBe('t@x.com');
+    });
+    it('collapses null/undefined/empty/whitespace to null', () => {
+      expect(normalizeContactEmail(null)).toBeNull();
+      expect(normalizeContactEmail(undefined)).toBeNull();
+      expect(normalizeContactEmail('')).toBeNull();
+      expect(normalizeContactEmail('   ')).toBeNull();
+    });
+    it('collapses a malformed or over-length (>254) value to null', () => {
+      expect(normalizeContactEmail('not-an-email')).toBeNull();
+      expect(normalizeContactEmail(`${'a'.repeat(250)}@example.com`)).toBeNull();
+    });
+  });
+
+  describe('hasDeliverableContact — the shared UI/sweep predicate', () => {
+    it('is true only for a parseable address; false for null/empty/whitespace/malformed', () => {
+      expect(hasDeliverableContact('user@x.com')).toBe(true);
+      expect(hasDeliverableContact('  User@X.COM ')).toBe(true);
+      expect(hasDeliverableContact(null)).toBe(false);
+      expect(hasDeliverableContact('')).toBe(false);
+      expect(hasDeliverableContact('  ')).toBe(false);
+      expect(hasDeliverableContact('garbage')).toBe(false);
     });
   });
 });

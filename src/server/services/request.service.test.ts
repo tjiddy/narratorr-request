@@ -931,14 +931,15 @@ describe('durable requester availability email sweep (#50/#121)', () => {
     const send = vi.fn(async (_a: RequesterEmailArgs): Promise<RequesterEmailOutcome> => 'delivered');
     const info = vi.fn();
     const warn = vi.fn();
-    const logger: NotifierLogger = { info, warn, error() {}, debug() {} };
+    const debug = vi.fn();
+    const logger: NotifierLogger = { info, warn, error() {}, debug };
     const deps = (over: Partial<RequesterEmailSender> = {}): RequestFailureNotifyDeps => ({
       getNotifier: () => ({ notify: async () => {} } as unknown as Notifier),
       users: new UserService(db),
       requesterEmail: { send: over.send ?? send },
       logger,
     });
-    return { send, info, warn, deps };
+    return { send, info, warn, debug, deps };
   }
 
   /** Opt a seeded user into `available` (or a given set) and set their contact email (nullable). */
@@ -1155,6 +1156,38 @@ describe('durable requester availability email sweep (#50/#121)', () => {
     expect(send).toHaveBeenCalledTimes(2); // both attempted despite the first throwing
     expect(await markerOf(r1.id)).toBeNull();
     expect(await markerOf(r2.id)).toBeNull();
+  });
+
+  it('issue #120 a legacy row with an UNPARSEABLE email is a silent no-op: no send, settled, status unchanged, no throw', async () => {
+    const h = availHarness();
+    const user = await insertUser(db, { role: 'user', username: 'todd' });
+    await optIn(user.id, 'not-an-email'); // opted in, but a persisted garbage contact
+    const svc = new RequestService(db, client, policy(), h.deps());
+    const row = await seedRequest(user.id, 'available', { narratorrBookId: 'bk_1' });
+
+    await expect(svc.sweepAvailableNotifications()).resolves.toBeUndefined();
+    expect(h.send).not.toHaveBeenCalled(); // never delivers to a non-deliverable contact
+    expect(await markerOf(row.id)).not.toBeNull(); // settled — drops out of the capped backlog
+    const [after] = await db.select().from(requests).where(eq(requests.id, row.id));
+    expect(after!.status).toBe('available'); // request status unchanged
+    // A redacted, publicId-keyed debug breadcrumb records the drop; the recipient is never logged.
+    expect(h.debug).toHaveBeenCalled();
+    for (const call of h.debug.mock.calls as [unknown, unknown][]) {
+      expect(JSON.stringify(call)).not.toContain('not-an-email');
+    }
+  });
+
+  it('issue #120 a legacy PADDED/mixed-case email is sent as its normalized form (not the raw stored string)', async () => {
+    const h = availHarness();
+    const user = await insertUser(db, { role: 'user', username: 'todd' });
+    await optIn(user.id, '  User@X.COM '); // parseable but not normalized at rest
+    const svc = new RequestService(db, client, policy(), h.deps());
+    const row = await seedRequest(user.id, 'available', { narratorrBookId: 'bk_1' });
+
+    await svc.sweepAvailableNotifications();
+    expect(h.send).toHaveBeenCalledTimes(1);
+    expect(h.send.mock.calls[0]![0]!.to).toBe('user@x.com'); // normalized value delivered, not the raw
+    expect(await markerOf(row.id)).not.toBeNull();
   });
 
   it('the sweep is a no-op when no requesterEmail dep is wired (failed-only construction unaffected)', async () => {

@@ -3,7 +3,10 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import cookie from '@fastify/cookie';
 import rateLimit from '@fastify/rate-limit';
 import { serializerCompiler, validatorCompiler, type ZodTypeProvider } from 'fastify-type-provider-zod';
+import { eq } from 'drizzle-orm';
 import { createTestDb } from '../test-support/db.js';
+import { users } from '../../db/schema.js';
+import type { Db } from '../../db/client.js';
 import { UserService } from '../services/user.service.js';
 import { SettingsService } from '../services/settings.service.js';
 import { RequestService } from '../services/request.service.js';
@@ -54,11 +57,15 @@ let usersSvc: UserService;
 // The live ConnectorSettingsService so a test can configure an email notifier and assert
 // GET /api/me flips `emailNotifyAvailable` true (issue #50). Reassigned per buildApp().
 let connectorSvc: ConnectorSettingsService;
+// The live test DB so a test can force a legacy at-rest value the write paths can't produce
+// (e.g. an empty-string `users.email`, to pin the shared-predicate parity in issue #120).
+let dbRef: Db;
 
 async function buildApp(
   opts: { config?: Partial<AppConfig>; oidc?: AppDeps['oidc'] } = {},
 ): Promise<FastifyInstance> {
   const db = await createTestDb();
+  dbRef = db;
   await new SettingsService(db).ensure();
   const users = new UserService(db, {});
   usersSvc = users;
@@ -455,5 +462,20 @@ describe('requester-notification opt-in — GET + PATCH /api/me (#50)', () => {
       config: { host: 'smtp.example.com', port: 587, secure: false, user: 'u', pass: 'p', from: 'ops@example.com', to: 'admin@example.com' },
     });
     expect((await me(sessionCookie(guest))).json().emailNotifyAvailable).toBe(true);
+  });
+
+  it('issue #120 an empty-string users.email reads as unavailable even with a usable notifier (shared predicate)', async () => {
+    const guest = await signup(app, 'guest@example.com');
+    await connectorSvc.createNotifier({
+      name: 'Mail',
+      type: 'email',
+      events: ['request.created'],
+      config: { host: 'smtp.example.com', port: 587, secure: false, user: 'u', pass: 'p', from: 'ops@example.com', to: 'admin@example.com' },
+    });
+    // Force a legacy at-rest value the signup/OIDC write paths can't produce: an empty string.
+    // The OLD `row.email !== null` gate would have reported this deliverable; `hasDeliverableContact`
+    // agrees with the sweep's send gate — both treat '' as no usable contact.
+    await dbRef.update(users).set({ email: '' }).where(eq(users.authSubject, 'guest@example.com'));
+    expect((await me(sessionCookie(guest))).json().emailNotifyAvailable).toBe(false);
   });
 });

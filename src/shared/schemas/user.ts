@@ -58,6 +58,38 @@ export function sanitizeNotifyOn(raw: unknown): NotifiableTransition[] {
   return [...new Set(parsed.data)];
 }
 
+// --- Contact email: the single deliverability shape + predicate ---------------
+// One schema for "a deliverable contact address": trim + lowercase, then a valid email
+// bounded at 254. Reused as the local-login identity (`localCredentialsSchema.email`), the
+// OIDC email-claim gate (`makeOidcMapper`), and the availability-send predicate — so the
+// "has usable email" decision can never drift between the UI (`emailNotifyAvailable`) and the
+// poller sweep (issue #120). Non-`.strict()` domain schema; the error string only surfaces for
+// the local-login form (OIDC/sweep use the normalizing helper below and ignore it).
+export const contactEmailSchema = z
+  .string()
+  .trim()
+  .toLowerCase()
+  .pipe(z.email('enter a valid email address').max(254));
+
+/**
+ * Normalize an arbitrary stored/claimed email into a deliverable address, or `null`. Trims +
+ * lowercases and enforces the `contactEmailSchema` bound; an empty, whitespace-only, malformed,
+ * or over-length value (or `null`/`undefined`) collapses to `null` rather than throwing. This is
+ * the SINGLE SOURCE OF TRUTH for both the value we deliver to and the predicate that gates the
+ * send — the OIDC mapper stores its result, the sweep sends its result, and the UI/sweep gate on
+ * {@link hasDeliverableContact}, so the "available" signal and the address delivered can't diverge.
+ */
+export function normalizeContactEmail(email: string | null | undefined): string | null {
+  if (email == null) return null;
+  const parsed = contactEmailSchema.safeParse(email);
+  return parsed.success ? parsed.data : null;
+}
+
+/** Whether a stored/claimed email parses as a deliverable contact. Derived from {@link normalizeContactEmail}. */
+export function hasDeliverableContact(email: string | null | undefined): boolean {
+  return normalizeContactEmail(email) !== null;
+}
+
 // Shape returned to the client for a user.
 export const userDtoSchema = z.object({
   publicId: z.string(),
@@ -136,7 +168,7 @@ export type AuthProvidersDto = z.infer<typeof authProvidersDtoSchema>;
 // the cheap, effective lever).
 export const localCredentialsSchema = z
   .object({
-    email: z.string().trim().toLowerCase().pipe(z.email('enter a valid email address').max(254)),
+    email: contactEmailSchema,
     password: z.string().min(8, 'password must be at least 8 characters').max(200),
   })
   .strict();
