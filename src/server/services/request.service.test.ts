@@ -5,7 +5,7 @@ import { NarratorrError, type INarratorrClient } from './narratorr-client.js';
 import { UserService } from './user.service.js';
 import type { Notifier, NotificationPayload } from './notifications/index.js';
 import type { NotifierLogger } from './notifications/types.js';
-import type { RequesterEmailArgs, RequesterEmailSender } from './notifications/requester-email.js';
+import type { RequesterEmailArgs, RequesterEmailSender, RequesterEmailOutcome } from './notifications/requester-email.js';
 import { createTestDb, insertUser } from '../test-support/db.js';
 import { requests, users } from '../../db/schema.js';
 import type { NotifiableTransition } from '../../shared/schemas/user.js';
@@ -921,22 +921,24 @@ describe('sanitizeAutoApproveRoles — storage-boundary narrowing (tier 5)', () 
   });
 });
 
-describe('request available requester email (#50)', () => {
-  // A fake sender captures the send-one-email calls; the SMTP-source/render internals are unit-
-  // tested separately in requester-email.test.ts. These assert the RequestService emit contract:
-  // exactly-once per available transition, from every emit site, opt-in + contact gated, and
-  // never throwing into the request/poll flow.
+describe('durable requester availability email sweep (#50/#121)', () => {
+  // A fake sender captures the send-one-email calls (default outcome: delivered); the SMTP-source/
+  // render internals are unit-tested separately in requester-email.test.ts. These assert the #121
+  // sweep contract: the sweep is the SOLE sender, at-most-once per request (durable marker), opt-in
+  // + contact gated, typed-outcome driven (delivered settles, skipped-no-config stays replayable),
+  // observable per-outcome without ever logging the recipient, and never throwing into the flow.
   function availHarness() {
-    const send = vi.fn(async (_a: RequesterEmailArgs) => {});
+    const send = vi.fn(async (_a: RequesterEmailArgs): Promise<RequesterEmailOutcome> => 'delivered');
+    const info = vi.fn();
     const warn = vi.fn();
-    const logger: NotifierLogger = { info() {}, warn, error() {}, debug() {} };
+    const logger: NotifierLogger = { info, warn, error() {}, debug() {} };
     const deps = (over: Partial<RequesterEmailSender> = {}): RequestFailureNotifyDeps => ({
       getNotifier: () => ({ notify: async () => {} } as unknown as Notifier),
       users: new UserService(db),
       requesterEmail: { send: over.send ?? send },
       logger,
     });
-    return { send, warn, deps };
+    return { send, info, warn, deps };
   }
 
   /** Opt a seeded user into `available` (or a given set) and set their contact email (nullable). */
@@ -944,8 +946,11 @@ describe('request available requester email (#50)', () => {
     await db.update(users).set({ email, notifyOn: on }).where(eq(users.id, id));
   }
 
-  const warnFor = (warn: ReturnType<typeof vi.fn>, needle: string) =>
-    warn.mock.calls.find((c) => String(c[1]).includes(needle));
+  /** The durable settle marker for a request row, or null if still owed. */
+  async function markerOf(id: number): Promise<Date | null> {
+    const [row] = await db.select().from(requests).where(eq(requests.id, id));
+    return row?.availableNotifiedAt ?? null;
+  }
 
   const importedBook: V1Book = { id: 'bk_1', title: 't', authors: [], narrators: [], status: 'imported' };
 
@@ -958,111 +963,204 @@ describe('request available requester email (#50)', () => {
     return row!;
   }
 
-  it('emits exactly one available email via applyBook (poller edge), to the requester with user-facing content', async () => {
+  it('AC3 the transition edges no longer send directly — applyBook/handoff/recoverHandoff defer to the sweep', async () => {
     const h = availHarness();
-    const user = await insertUser(db, { role: 'user', username: 'todd' });
-    await optIn(user.id, 'todd@example.com');
-    const svc = new RequestService(db, client, policy(), h.deps());
-    const row = await seedRequest(user.id, 'acquiring', { narratorrBookId: 'bk_1' });
-
-    expect(await svc.applyBook(row, importedBook)).toBe('available');
-    await vi.waitFor(() => expect(h.send).toHaveBeenCalledTimes(1));
-    expect(h.send.mock.calls[0]![0]).toMatchObject({
-      to: 'todd@example.com',
-      transition: 'available',
-      request: { title: 'A Book', author: 'Author' },
-    });
-  });
-
-  it('emits exactly once via the handoff immediate-available branch (already-imported book)', async () => {
-    const h = availHarness();
-    const admin = await insertUser(db, { role: 'admin', username: 'todd' });
-    await optIn(admin.id, 'todd@example.com');
     client.status = 'imported';
     const svc = new RequestService(db, client, policy(), h.deps());
 
-    const { row } = await svc.create(admin.id, body('B1'));
-    expect(row.status).toBe('available');
-    await vi.waitFor(() => expect(h.send).toHaveBeenCalledTimes(1));
-    expect(h.send.mock.calls[0]![0]).toMatchObject({ to: 'todd@example.com', transition: 'available' });
-  });
+    // poll edge: acquiring → available
+    const u1 = await insertUser(db, { role: 'user', username: 'a' });
+    await optIn(u1.id, 'a@example.com');
+    const acq = await seedRequest(u1.id, 'acquiring', { narratorrBookId: 'bk_1' });
+    expect(await svc.applyBook(acq, importedBook)).toBe('available');
 
-  it('emits exactly once via recoverHandoff on a stranded approved row', async () => {
-    const h = availHarness();
-    const user = await insertUser(db, { role: 'user', username: 'todd' });
-    await optIn(user.id, 'todd@example.com');
-    client.status = 'imported';
-    const svc = new RequestService(db, client, policy(), h.deps());
-    const row = await seedRequest(user.id, 'approved');
+    // handoff immediate-available: approved → available on an already-imported book
+    const u2 = await insertUser(db, { role: 'admin', username: 'b' });
+    await optIn(u2.id, 'b@example.com');
+    const { row: handed } = await svc.create(u2.id, body('B2'));
+    expect(handed.status).toBe('available');
 
-    expect(await svc.recoverHandoff(row)).toBe('recovered');
-    await vi.waitFor(() => expect(h.send).toHaveBeenCalledTimes(1));
-  });
+    // recoverHandoff on a stranded approved row
+    const u3 = await insertUser(db, { role: 'user', username: 'c' });
+    await optIn(u3.id, 'c@example.com');
+    const stranded = await seedRequest(u3.id, 'approved', { asin: 'B3' });
+    expect(await svc.recoverHandoff(stranded)).toBe('recovered');
 
-  it('sends EXACTLY once under a handler-vs-poller race (handoff + recoverHandoff on the same approved row)', async () => {
-    const h = availHarness();
-    const user = await insertUser(db, { role: 'user', username: 'todd' });
-    await optIn(user.id, 'todd@example.com');
-    client.status = 'imported';
-    const svc = new RequestService(db, client, policy(), h.deps());
-    const row = await seedRequest(user.id, 'approved');
-
-    // Both call addBook (idempotent by ASIN in prod) then race the approved → available claim;
-    // the atomic `.returning()` guard lets exactly one land the edge and emit. Removing it double-emits.
-    await Promise.all([svc.handoff(row), svc.recoverHandoff(row)]);
-    await vi.waitFor(() => expect(h.send).toHaveBeenCalledTimes(1));
+    // None of the three transition edges sent — the sweep is the sole sender.
     await new Promise((r) => setTimeout(r, 20));
+    expect(h.send).not.toHaveBeenCalled();
+
+    // The sweep now delivers all three owed availability emails, to the requester with user-facing copy.
+    await svc.sweepAvailableNotifications();
+    expect(h.send).toHaveBeenCalledTimes(3);
+    expect(h.send.mock.calls.map((c) => c[0]!.to).sort()).toEqual(['a@example.com', 'b@example.com', 'c@example.com']);
+    expect(h.send.mock.calls[0]![0]).toMatchObject({ transition: 'available', request: { title: 'A Book' } });
+  });
+
+  it('AC2 delivers a row committed available with a null marker (crash between commit and send) and settles it', async () => {
+    const h = availHarness();
+    const user = await insertUser(db, { role: 'user', username: 'todd' });
+    await optIn(user.id, 'todd@example.com');
+    const svc = new RequestService(db, client, policy(), h.deps());
+    const row = await seedRequest(user.id, 'available', { narratorrBookId: 'bk_1' });
+
+    await svc.sweepAvailableNotifications();
     expect(h.send).toHaveBeenCalledTimes(1);
+    expect(h.send.mock.calls[0]![0]).toMatchObject({ to: 'todd@example.com', transition: 'available' });
+    expect(await markerOf(row.id)).not.toBeNull();
   });
 
-  it('does not email a user who opted out', async () => {
+  it('AC1 a transient SMTP failure leaves the marker null; a later sweep delivers exactly once, then settles', async () => {
     const h = availHarness();
-    const user = await insertUser(db, { role: 'user', username: 'todd' });
-    await optIn(user.id, 'todd@example.com', []); // has email, but opted into nothing
-    const svc = new RequestService(db, client, policy(), h.deps());
-    const row = await seedRequest(user.id, 'acquiring', { narratorrBookId: 'bk_1' });
-
-    expect(await svc.applyBook(row, importedBook)).toBe('available');
-    await new Promise((r) => setTimeout(r, 20));
-    expect(h.send).not.toHaveBeenCalled();
-  });
-
-  it('opted-in with a null email is a silent no-op (status still correct, no send, no throw)', async () => {
-    const h = availHarness();
-    const user = await insertUser(db, { role: 'user', username: 'todd' });
-    await optIn(user.id, null); // opted in but no contact
-    const svc = new RequestService(db, client, policy(), h.deps());
-    const row = await seedRequest(user.id, 'acquiring', { narratorrBookId: 'bk_1' });
-
-    expect(await svc.applyBook(row, importedBook)).toBe('available');
-    const [fresh] = await db.select().from(requests).where(eq(requests.id, row.id));
-    expect(fresh?.status).toBe('available');
-    await new Promise((r) => setTimeout(r, 20));
-    expect(h.send).not.toHaveBeenCalled();
-  });
-
-  it('a send failure never throws into the flow and never alters the recorded status (logged breadcrumb)', async () => {
-    const h = availHarness();
-    const send = vi.fn(async () => {
-      throw new Error('smtp down');
+    let down = true;
+    const send = vi.fn(async (): Promise<RequesterEmailOutcome> => {
+      if (down) throw new Error('smtp down');
+      return 'delivered';
     });
     const user = await insertUser(db, { role: 'user', username: 'todd' });
     await optIn(user.id, 'todd@example.com');
     const svc = new RequestService(db, client, policy(), h.deps({ send }));
-    const row = await seedRequest(user.id, 'acquiring', { narratorrBookId: 'bk_1' });
+    const row = await seedRequest(user.id, 'available', { narratorrBookId: 'bk_1' });
 
-    expect(await svc.applyBook(row, importedBook)).toBe('available'); // transition unaffected
-    const [fresh] = await db.select().from(requests).where(eq(requests.id, row.id));
-    expect(fresh?.status).toBe('available');
-    await vi.waitFor(() => expect(warnFor(h.warn, 'requester email dispatch failed')).toBeTruthy());
+    await svc.sweepAvailableNotifications(); // SMTP down → attempt throws
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(await markerOf(row.id)).toBeNull(); // stays null → replayable
+
+    down = false;
+    await svc.sweepAvailableNotifications(); // SMTP recovered → delivers, settles
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(await markerOf(row.id)).not.toBeNull();
+
+    await svc.sweepAvailableNotifications(); // settled → not re-attempted
+    expect(send).toHaveBeenCalledTimes(2); // exactly one DELIVERED send across the ticks
   });
 
-  it('emits nothing when no requesterEmail dep is wired (the failed-only construction is unaffected)', async () => {
+  it('AC3 a delivered/settled row is not re-loaded or re-sent on the next sweep (atomic marker)', async () => {
+    const h = availHarness();
     const user = await insertUser(db, { role: 'user', username: 'todd' });
     await optIn(user.id, 'todd@example.com');
-    // 3-arg construction: no notify deps at all.
-    const svc = new RequestService(db, client, policy());
-    const row = await seedRequest(user.id, 'acquiring', { narratorrBookId: 'bk_1' });
-    expect(await svc.applyBook(row, importedBook)).toBe('available'); // no throw, transition lands
+    const svc = new RequestService(db, client, policy(), h.deps());
+    const row = await seedRequest(user.id, 'available', { narratorrBookId: 'bk_1' });
+
+    await svc.sweepAvailableNotifications();
+    expect(h.send).toHaveBeenCalledTimes(1);
+    expect(await svc.findAvailableAwaitingNotify()).toHaveLength(0); // settled → out of the backlog
+
+    await svc.sweepAvailableNotifications();
+    expect(h.send).toHaveBeenCalledTimes(1); // no second send
+    expect(await markerOf(row.id)).not.toBeNull();
+  });
+
+  it('AC3 a pre-settled row (marker already set) is never loaded by the finder or sent', async () => {
+    const h = availHarness();
+    const user = await insertUser(db, { role: 'user', username: 'todd' });
+    await optIn(user.id, 'todd@example.com');
+    const svc = new RequestService(db, client, policy(), h.deps());
+    await seedRequest(user.id, 'available', { narratorrBookId: 'bk_1', availableNotifiedAt: new Date() });
+
+    expect(await svc.findAvailableAwaitingNotify()).toHaveLength(0);
+    await svc.sweepAvailableNotifications();
+    expect(h.send).not.toHaveBeenCalled();
+  });
+
+  it('AC4 skipped-no-config leaves the marker null (replayable); a later sweep delivers once configured', async () => {
+    const h = availHarness();
+    let configured = false;
+    const send = vi.fn(async (): Promise<RequesterEmailOutcome> => (configured ? 'delivered' : 'skipped-no-config'));
+    const user = await insertUser(db, { role: 'user', username: 'todd' });
+    await optIn(user.id, 'todd@example.com');
+    const svc = new RequestService(db, client, policy(), h.deps({ send }));
+    const row = await seedRequest(user.id, 'available', { narratorrBookId: 'bk_1' });
+
+    await svc.sweepAvailableNotifications(); // no usable email notifier → skipped-no-config
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(await markerOf(row.id)).toBeNull(); // NOT settled — the backlog waits for config
+
+    configured = true;
+    await svc.sweepAvailableNotifications(); // now delivers, settles
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(await markerOf(row.id)).not.toBeNull();
+  });
+
+  it('AC4 permanent no-ops settle without a send (not opted in / opted-in with null email) and drop out of the backlog', async () => {
+    const h = availHarness();
+    const optedOut = await insertUser(db, { role: 'user', username: 'x' });
+    await optIn(optedOut.id, 'x@example.com', []); // has email, opted into nothing
+    const nullEmail = await insertUser(db, { role: 'user', username: 'y' });
+    await optIn(nullEmail.id, null); // opted in, but no contact
+    const svc = new RequestService(db, client, policy(), h.deps());
+    const r1 = await seedRequest(optedOut.id, 'available', { narratorrBookId: 'bk_1' });
+    const r2 = await seedRequest(nullEmail.id, 'available', { narratorrBookId: 'bk_2' });
+
+    await svc.sweepAvailableNotifications();
+    expect(h.send).not.toHaveBeenCalled();
+    expect(await markerOf(r1.id)).not.toBeNull(); // settled (no email owed)
+    expect(await markerOf(r2.id)).not.toBeNull();
+    expect(await svc.findAvailableAwaitingNotify()).toHaveLength(0); // cannot crowd the capped batch
+  });
+
+  it('AC5 logs a distinguishable, publicId-keyed breadcrumb per outcome and never logs the recipient', async () => {
+    const h = availHarness();
+    // Outcome is keyed off the recipient so one sweep exercises delivered / skipped / failed at once.
+    const send = vi.fn(async (a: RequesterEmailArgs): Promise<RequesterEmailOutcome> => {
+      if (a.to === 'skip@example.com') return 'skipped-no-config';
+      if (a.to === 'fail@example.com') throw new Error('smtp handshake reset');
+      return 'delivered';
+    });
+    const uD = await insertUser(db, { role: 'user', username: 'd' });
+    await optIn(uD.id, 'deliver@example.com');
+    const uS = await insertUser(db, { role: 'user', username: 's' });
+    await optIn(uS.id, 'skip@example.com');
+    const uF = await insertUser(db, { role: 'user', username: 'f' });
+    await optIn(uF.id, 'fail@example.com');
+    const svc = new RequestService(db, client, policy(), h.deps({ send }));
+    await seedRequest(uD.id, 'available', { narratorrBookId: 'bk_d', publicId: 'rq_deliver' });
+    await seedRequest(uS.id, 'available', { narratorrBookId: 'bk_s', publicId: 'rq_skip' });
+    await seedRequest(uF.id, 'available', { narratorrBookId: 'bk_f', publicId: 'rq_fail' });
+
+    await svc.sweepAvailableNotifications();
+
+    const keyed = (calls: [unknown, unknown][], pid: string, re: RegExp) =>
+      calls.some((c) => (c[0] as { request?: string }).request === pid && re.test(String(c[1])));
+    expect(keyed(h.info.mock.calls as [unknown, unknown][], 'rq_deliver', /delivered/i)).toBe(true);
+    expect(keyed(h.warn.mock.calls as [unknown, unknown][], 'rq_skip', /skipped/i)).toBe(true);
+    expect(keyed(h.warn.mock.calls as [unknown, unknown][], 'rq_fail', /attempt failed/i)).toBe(true);
+
+    // The recipient address is never present on ANY log line (obj or message), on any outcome.
+    for (const call of [...h.info.mock.calls, ...h.warn.mock.calls]) {
+      expect(JSON.stringify(call)).not.toContain('@example.com');
+    }
+  });
+
+  it('AC6 a per-row send rejection never throws out of the sweep; the marker stays null and later rows still run', async () => {
+    const h = availHarness();
+    const send = vi.fn(async (): Promise<RequesterEmailOutcome> => {
+      throw new Error('smtp down');
+    });
+    const u1 = await insertUser(db, { role: 'user', username: 'a' });
+    await optIn(u1.id, 'a@example.com');
+    const u2 = await insertUser(db, { role: 'user', username: 'b' });
+    await optIn(u2.id, 'b@example.com');
+    const svc = new RequestService(db, client, policy(), h.deps({ send }));
+    const r1 = await seedRequest(u1.id, 'available', { narratorrBookId: 'bk_1' });
+    const r2 = await seedRequest(u2.id, 'available', { narratorrBookId: 'bk_2' });
+
+    await expect(svc.sweepAvailableNotifications()).resolves.toBeUndefined();
+    expect(send).toHaveBeenCalledTimes(2); // both attempted despite the first throwing
+    expect(await markerOf(r1.id)).toBeNull();
+    expect(await markerOf(r2.id)).toBeNull();
+  });
+
+  it('the sweep is a no-op when no requesterEmail dep is wired (failed-only construction unaffected)', async () => {
+    const user = await insertUser(db, { role: 'user', username: 'todd' });
+    await optIn(user.id, 'todd@example.com');
+    // notify deps present but no requesterEmail sender.
+    const svc = new RequestService(db, client, policy(), {
+      getNotifier: () => ({ notify: async () => {} } as unknown as Notifier),
+      users: new UserService(db),
+    });
+    const row = await seedRequest(user.id, 'available', { narratorrBookId: 'bk_1' });
+    await expect(svc.sweepAvailableNotifications()).resolves.toBeUndefined();
+    expect(await markerOf(row.id)).toBeNull(); // untouched — no sender to owe
   });
 });

@@ -94,10 +94,11 @@ describe('RequesterEmailService.send', () => {
     createTransport.mockClear();
   });
 
-  it('builds the transport from the selected source and overrides `to` with the requester (never the admin to)', async () => {
+  it('builds the transport from the selected source, overrides `to`, and returns `delivered`', async () => {
     const svc = new RequesterEmailService(async () => cfg([emailNotifier({ host: 'smtp.pick.me', from: 'ops@pick.me', to: 'admin@pick.me' })]));
-    await svc.send({ to: 'requester@example.com', transition: 'available', request: { title: 'Dune', author: 'Herbert' } });
+    const outcome = await svc.send({ to: 'requester@example.com', transition: 'available', request: { title: 'Dune', author: 'Herbert' } });
 
+    expect(outcome).toBe('delivered'); // typed outcome the sweep marks the row on (#121)
     expect(createTransport).toHaveBeenCalledOnce();
     expect(createTransport.mock.calls[0]![0]).toMatchObject({ host: 'smtp.pick.me', port: 587, secure: false });
     expect(sendMail).toHaveBeenCalledOnce();
@@ -107,11 +108,12 @@ describe('RequesterEmailService.send', () => {
     expect(mail.subject).toMatch(/ready/i);
   });
 
-  it('is a silent no-op when no usable email source exists (never throws, never sends)', async () => {
+  it('returns `skipped-no-config` when no usable email source exists (never throws, never sends)', async () => {
     const svc = new RequesterEmailService(async () => cfg([]));
+    // The typed skip is what keeps the sweep marker null so the backlog delivers once SMTP is set up.
     await expect(
       svc.send({ to: 'requester@example.com', transition: 'available', request: { title: 'Dune', author: null } }),
-    ).resolves.toBeUndefined();
+    ).resolves.toBe('skipped-no-config');
     expect(sendMail).not.toHaveBeenCalled();
   });
 

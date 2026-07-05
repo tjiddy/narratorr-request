@@ -2,8 +2,9 @@ import { and, desc, eq, gte, inArray, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import type { Db } from '../../db/client.js';
 import { requests, users, type RequestRow } from '../../db/schema.js';
-import { emitFailed, emitAvailable, type RequestFailureNotifyDeps } from './request-notifications.js';
+import { emitFailed, type RequestFailureNotifyDeps } from './request-notifications.js';
 export type { RequestFailureNotifyDeps } from './request-notifications.js';
+import { redact } from './notifications/redact.js';
 import type {
   CreateRequestBody,
   DecisionBody,
@@ -11,7 +12,7 @@ import type {
   RequestStatus,
 } from '../../shared/schemas/request.js';
 import { OPEN_REQUEST_STATUSES, ACTIVE_REQUEST_STATUSES, APPROVED_REQUEST_STATUSES } from '../../shared/schemas/request.js';
-import { roleSchema, type Role, type RequestQuotaMode } from '../../shared/schemas/user.js';
+import { roleSchema, sanitizeNotifyOn, type Role, type RequestQuotaMode } from '../../shared/schemas/user.js';
 import type { DefaultQuota, QuotaWindowDays } from '../../shared/schemas/connectors.js';
 import type { V1Book } from '../../shared/schemas/v1/books.js';
 import type { INarratorrClient } from './narratorr-client.js';
@@ -389,17 +390,15 @@ export class RequestService {
       // Atomically claim the OBSERVED `approved` edge (mirrors transitionToFailed): the real race
       // is handler-vs-poller — create()'s in-flight handoff vs recoverHandoff firing a second
       // handoff on the same `(approved, bookId NULL)` row. Both call addBook (idempotent by ASIN),
-      // then both reach here; the `WHERE status = row.status` guard lets exactly ONE land the edge,
-      // so the availability email fires exactly once (only when the claim returns a row). The loser
-      // matches zero rows and emits nothing.
+      // then both reach here; the `WHERE status = row.status` guard lets exactly ONE land the edge.
+      // The loser matches zero rows. The requester availability email is NOT emitted here (issue
+      // #121): the `available` commit lands, and the poller sweep is the SOLE sender — it re-attempts
+      // the durable `available_notified_at IS NULL` backlog, surviving a crash between commit and send.
       const [updated] = await this.db
         .update(requests)
         .set({ narratorrBookId: book.id, status: next })
         .where(and(eq(requests.id, row.id), eq(requests.status, row.status)))
         .returning();
-      // A book that was already imported short-circuits approved → available here (never entering
-      // acquiring), so this is the ONLY available emit site for the synchronous / recovered paths.
-      if (updated && next === 'available') emitAvailable(this.notifyDeps, updated);
       return updated ?? row;
     } catch (err) {
       if (!isTerminalHandoffError(err)) throw err; // transient — stays `approved`, poller retries
@@ -488,9 +487,30 @@ export class RequestService {
   }
 
   /**
+   * The durable requester-availability-email backlog (issue #121): `available` rows whose
+   * `available_notified_at` marker is still null — i.e. the email hasn't reached a terminal outcome
+   * (delivered, or a permanent no-op). Joins the requester's `notify_on` + `email` so the sweep can
+   * decide opted-in-vs-settled without an N+1 lookup. Ordered oldest-first and SQL-capped like
+   * {@link findAcquiring}, so a tick never does an unbounded read and the oldest owed emails are
+   * always serviced. `innerJoin` is safe: `requests.userId` is NOT NULL and cascade-deletes with the
+   * user, so an `available` row always has its requester.
+   */
+  async findAvailableAwaitingNotify(
+    limit = 100,
+  ): Promise<Array<{ request: RequestRow; notifyOn: unknown; email: string | null }>> {
+    return this.db
+      .select({ request: requests, notifyOn: users.notifyOn, email: users.email })
+      .from(requests)
+      .innerJoin(users, eq(requests.userId, users.id))
+      .where(and(eq(requests.status, 'available'), sql`${requests.availableNotifiedAt} IS NULL`))
+      .orderBy(requests.requestedAt)
+      .limit(limit);
+  }
+
+  /**
    * Apply a freshly-polled book to a request. Returns the new status if it changed,
-   * else null (so the poller logs only on transitions — there is no requester
-   * notification today; see #50). We mirror narratorr's
+   * else null (so the poller logs only on transitions). The requester availability
+   * email is NOT sent here (issue #121) — the poller sweep owns it durably. We mirror narratorr's
    * lifecycle and never invent a terminal state on a timer: a request stays `acquiring`
    * for as long as the book is pre-`imported` (a not-found book legitimately sits
    * `wanted` until narratorr's next scheduled search) and only goes terminal when
@@ -510,16 +530,16 @@ export class RequestService {
       return failed ? 'failed' : null;
     }
     // Claim the OBSERVED (`acquiring`) edge atomically — the same `WHERE status = <observed>
-    // … .returning()` guard as the failed edge. This is the normal `acquiring → available` write;
-    // emitting the availability email only when the claim lands a row keeps it exactly-once even
-    // if this path ever raced another writer (the loser matches zero rows and emits nothing).
+    // … .returning()` guard as the failed edge. This is the normal `acquiring → available` write.
+    // The requester availability email is NOT emitted here (issue #121): the commit lands and the
+    // poller sweep is the SOLE sender, re-attempting the durable `available_notified_at IS NULL`
+    // backlog so a crash between this commit and the send never loses the notification.
     const [updated] = await this.db
       .update(requests)
       .set({ status: next, narratorrBookId: bookId })
       .where(and(eq(requests.id, row.id), eq(requests.status, row.status)))
       .returning();
     if (!updated) return null; // lost the claim — the row already moved off the observed status
-    if (next === 'available') emitAvailable(this.notifyDeps, updated);
     return next === row.status ? null : next;
   }
 
@@ -531,6 +551,72 @@ export class RequestService {
    */
   async markFailed(row: RequestRow, reason: string): Promise<boolean> {
     return (await this.transitionToFailed(row, reason)) !== null;
+  }
+
+  /**
+   * Atomically settle a row's requester-availability-email marker (issue #121). Sets
+   * `available_notified_at` ONLY while it's still null (`… WHERE available_notified_at IS NULL
+   * RETURNING`), mirroring the atomic `.returning()` claims elsewhere in this service. Returns
+   * whether THIS call wrote the marker; a second attempt on an already-settled row claims zero rows
+   * and returns false, so the sweep can never double-settle or re-send.
+   */
+  private async settleAvailableNotified(id: number): Promise<boolean> {
+    const [settled] = await this.db
+      .update(requests)
+      .set({ availableNotifiedAt: new Date() })
+      .where(and(eq(requests.id, id), sql`${requests.availableNotifiedAt} IS NULL`))
+      .returning();
+    return settled !== undefined;
+  }
+
+  /**
+   * Durable requester-availability-email sweep (issue #121) — the SOLE sender of the "your audiobook
+   * is ready" email. Runs one serialized pass under the poller's `Cron { protect: true }`, so sends
+   * never overlap in-process and no pre-send lease is needed. For each owed `available` row (marker
+   * still null):
+   *   • not opted into `available`, OR opted in with a null email → a permanent no-op: settle the
+   *     marker (no email owed) so the row drops out of the capped batch and can't accumulate;
+   *   • opted in with an email → attempt the send:
+   *       – `delivered`         → settle the marker;
+   *       – `skipped-no-config` → GLOBAL, replayable: leave the marker null (backlog delivers once
+   *                               the admin configures a usable email notifier), log the skip;
+   *       – a throw (transient SMTP failure, or a marker-write fault after delivery) → leave the
+   *         marker null and retry next tick (the standard at-least-once residual: a rare duplicate).
+   * Fire-and-forget isolation (AC6): a per-row send/settle fault is caught and logged (never unwinds
+   * the pass), mirroring `emitFailed`'s fire-and-forget guard-and-swallow. A sweep-level DB READ fault (the
+   * finder) propagates to the poller tick's guard, which backs off like any other poll error. No
+   * requester-email dep wired → no-op. Per-outcome logs are keyed on `request.publicId` and NEVER
+   * carry the recipient address (PII).
+   */
+  async sweepAvailableNotifications(limit = 100): Promise<void> {
+    const sender = this.notifyDeps?.requesterEmail;
+    if (!sender) return; // no requester-email sender wired → nothing to sweep
+    const logger = this.notifyDeps?.logger;
+    const owed = await this.findAvailableAwaitingNotify(limit);
+    for (const { request: row, notifyOn, email } of owed) {
+      try {
+        // Permanent no-op — no email is owed. Settle so the row leaves the capped backlog (AC4).
+        if (!sanitizeNotifyOn(notifyOn).includes('available') || !email) {
+          await this.settleAvailableNotified(row.id);
+          continue;
+        }
+        const outcome = await sender.send({ to: email, transition: 'available', request: { title: row.title, author: row.author } });
+        if (outcome === 'skipped-no-config') {
+          // GLOBAL, replayable: leave the marker null so a later sweep delivers once SMTP is set up.
+          logger?.warn({ request: row.publicId }, 'request.available: requester email skipped — no usable email notifier configured');
+          continue;
+        }
+        // delivered: record the prod-visible success breadcrumb, then settle the marker. A settle
+        // fault here throws into the catch below → marker stays null → a rare duplicate next tick.
+        logger?.info({ request: row.publicId }, 'request.available: requester email delivered');
+        await this.settleAvailableNotified(row.id);
+      } catch (err) {
+        // Transient SMTP failure (send threw) or a post-delivery marker-write fault. Never unwind the
+        // sweep; leave the marker null so the row is re-attempted. redact() before logging: a send
+        // fault can embed SMTP credentials.
+        logger?.warn({ err: redact(err), request: row.publicId }, 'request.available: requester email attempt failed; will retry next sweep');
+      }
+    }
   }
 
   private mapBookStatus(status: V1Book['status']): RequestStatus {

@@ -1,0 +1,1 @@
+ALTER TABLE `requests` ADD `available_notified_at` integer;

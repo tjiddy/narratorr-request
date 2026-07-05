@@ -1,6 +1,6 @@
 import nodemailer, { type Transporter } from 'nodemailer';
 import { emailRuntimeSchema, type EmailRuntimeConfig } from './index.js';
-import type { NotificationsConfig, NotifierLogger } from './types.js';
+import type { NotificationsConfig } from './types.js';
 import type { NotifiableTransition } from '../../../shared/schemas/user.js';
 
 /**
@@ -93,34 +93,43 @@ export interface RequesterEmailArgs {
   request: { title: string; author: string | null };
 }
 
+/**
+ * Terminal outcome of a requester-email send attempt (issue #121). The poller sweep uses this to
+ * decide whether the row is settled: `delivered` → set the marker; `skipped-no-config` → leave the
+ * marker null (a GLOBAL, replayable condition — the backlog delivers once the admin configures a
+ * usable email notifier). A transient SMTP failure is NOT a value here — it still THROWS, which the
+ * sweep treats as "failed, retry next tick".
+ */
+export type RequesterEmailOutcome = 'delivered' | 'skipped-no-config';
+
 /** The seam RequestService depends on — a plain "send one email to a recipient" contract. */
 export interface RequesterEmailSender {
-  send(args: RequesterEmailArgs): Promise<void>;
+  send(args: RequesterEmailArgs): Promise<RequesterEmailOutcome>;
 }
 
 /**
  * Sends a single requester email, building a fresh nodemailer transport at send time from the
  * operator's first usable email notifier (so config can't drift from a rebuilt-on-save singleton,
- * and a few-times/hour path needs no live transport). No usable source ⇒ a silent no-op (never
- * throws — per the "never endangers fulfillment" requirement; the caller is fire-and-forget). An
- * SMTP failure rejects, which the fire-and-forget caller catches and logs.
+ * and a few-times/hour path needs no live transport). Returns a typed outcome (issue #121) so the
+ * poller sweep can decide whether the row is settled: `skipped-no-config` when no usable source
+ * exists (never throws — a GLOBAL replayable condition), `delivered` once `sendMail` completes. An
+ * SMTP failure still rejects, which the fire-and-forget sweep catches and retries next tick.
  */
 export class RequesterEmailService implements RequesterEmailSender {
   constructor(
     // An ACCESSOR, not a captured config: notifier settings are rebuilt on every Settings save,
     // so read the live decrypted config at send time (mirrors the live-notifier accessor pattern).
     private readonly getConfig: () => Promise<NotificationsConfig>,
-    private readonly logger?: NotifierLogger,
   ) {}
 
-  async send(args: RequesterEmailArgs): Promise<void> {
+  async send(args: RequesterEmailArgs): Promise<RequesterEmailOutcome> {
     const cfg = await this.getConfig();
     const source = selectEmailSource(cfg);
     if (!source) {
-      // No usable email notifier — a silent no-op (the opt-in surface reflects this via
-      // `emailNotifyAvailable`; this breadcrumb makes a genuinely-lost email diagnosable).
-      this.logger?.debug({ to: args.to }, 'requester email skipped — no usable email notifier configured');
-      return;
+      // No usable email notifier — a GLOBAL, replayable skip (the sweep leaves the marker null so
+      // the backlog delivers once configured, and logs the prod-visible, publicId-keyed breadcrumb).
+      // NEVER log `args.to` (the recipient is PII) — the sweep owns the operator-facing log.
+      return 'skipped-no-config';
     }
     const message = renderRequesterMessage(args.transition, args.request, cfg.publicUrl);
     const transport = buildRequesterTransport(source);
@@ -131,6 +140,7 @@ export class RequesterEmailService implements RequesterEmailSender {
       text: message.text,
       html: message.html,
     });
+    return 'delivered';
   }
 }
 
