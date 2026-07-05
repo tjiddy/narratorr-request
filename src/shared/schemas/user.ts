@@ -58,6 +58,20 @@ export function sanitizeNotifyOn(raw: unknown): NotifiableTransition[] {
   return [...new Set(parsed.data)];
 }
 
+/**
+ * Whether a stored/legacy `notify_on` value represents ANY real opt-in — true iff
+ * {@link sanitizeNotifyOn} yields a non-empty set (so a corrupt/legacy value outside the const,
+ * or `'[]'`, is `false`). The SINGLE authoritative opt-in-existence predicate: the admin
+ * "requester emails enabled but no source" warning decides "has anyone opted in?" with THIS, and
+ * the send path derives its per-transition decision from the same {@link sanitizeNotifyOn} +
+ * `NOTIFIABLE_TRANSITIONS`, so the warning can't drift from whether a send would fire. Kept
+ * transition-agnostic on purpose — the `available` sweep tests `sanitizeNotifyOn(...).includes('available')`
+ * so a future `denied`/`failed` opt-in never mis-fires an availability email (issue #50).
+ */
+export function hasNotifyOn(raw: unknown): boolean {
+  return sanitizeNotifyOn(raw).length > 0;
+}
+
 // --- Contact email: the single deliverability shape + predicate ---------------
 // One schema for "a deliverable contact address": trim + lowercase, then a valid email
 // bounded at 254. Reused as the local-login identity (`localCredentialsSchema.email`), the

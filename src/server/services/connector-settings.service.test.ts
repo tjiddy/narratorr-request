@@ -740,6 +740,16 @@ describe('getDto — requesterEmailWarning (#50 admin-visible warning)', () => {
     expect((await svc.getDto()).requesterEmailWarning).toBe(false);
   });
 
+  it('is false for a corrupt/legacy notify_on that sanitizes to empty (agrees with the send path)', async () => {
+    const u = await insertUser(db, {});
+    // Simulate legacy/hand-edited data outside NOTIFIABLE_TRANSITIONS via raw SQL — the typed
+    // column is `NotifiableTransition[]`, so a typed write of `['bogus']` wouldn't compile. This
+    // row is `<> '[]'` (survives the coarse prefilter) but `hasNotifyOn` rejects it, so it must
+    // NOT fire the warning, mirroring that the send path never emails it.
+    db.run(sql`UPDATE users SET notify_on = '["bogus"]' WHERE id = ${u.id}`);
+    expect((await svc.getDto()).requesterEmailWarning).toBe(false);
+  });
+
   it('is true when a user opted in but no usable email notifier exists', async () => {
     const u = await insertUser(db, {});
     await db.update(users).set({ notifyOn: ['available'] }).where(eq(users.id, u.id));

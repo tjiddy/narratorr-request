@@ -7,6 +7,7 @@ import {
   NOTIFIABLE_TRANSITIONS,
   notifiableTransitionSchema,
   sanitizeNotifyOn,
+  hasNotifyOn,
   updateMeBodySchema,
   contactEmailSchema,
   normalizeContactEmail,
@@ -216,6 +217,12 @@ describe('sanitizeNotifyOn — degrade-to-empty on a corrupt/legacy read', () =>
   });
   it('collapses duplicates', () => {
     expect(sanitizeNotifyOn(['available', 'available'])).toEqual(['available']);
+  });
+  it('hasNotifyOn is true iff sanitizeNotifyOn yields a real opt-in', () => {
+    expect(hasNotifyOn(['available'])).toBe(true);
+    expect(hasNotifyOn(['bogus'])).toBe(false); // outside the const → degrades to empty → no opt-in
+    expect(hasNotifyOn([])).toBe(false);
+    expect(hasNotifyOn('not-an-array')).toBe(false); // non-array degrades to empty, like sanitizeNotifyOn
   });
 });
 
