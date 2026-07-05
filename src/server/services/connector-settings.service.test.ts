@@ -8,7 +8,8 @@ import { RequestService, resolveRequestPolicy } from './request.service.js';
 import { buildNotifier } from './notifications/index.js';
 import type { NotifierLogger } from './notifications/types.js';
 import { SecretCodec, deriveSettingsKey } from '../util/secret-codec.js';
-import { appSettings } from '../../db/schema.js';
+import { appSettings, users } from '../../db/schema.js';
+import { insertUser } from '../test-support/db.js';
 import { connectorSettingsDtoSchema } from '../../shared/schemas/connectors.js';
 import type { Db } from '../../db/client.js';
 import type { CreateNotifierBody, KnownNotifierDto, StoredConnectors } from '../../shared/schemas/connectors.js';
@@ -724,5 +725,31 @@ describe('ConnectorSettingsService — stored connectors envelope guard (#93)', 
     expect(await logged.getNarratorrConfig()).toEqual({ url: 'https://n.example.com:443', apiKey: 'real-key' });
     expect((await logged.getNotificationsConfig()).notifiers[0]!.config.token).toBe('real-token');
     expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+describe('getDto — requesterEmailWarning (#50 admin-visible warning)', () => {
+  const emailBody = (): CreateNotifierBody => ({
+    name: 'Mail',
+    type: 'email',
+    events: ['request.created'],
+    config: { host: 'smtp.example.com', port: 587, secure: false, user: 'u', pass: 'p', from: 'ops@example.com', to: 'admin@example.com' },
+  });
+
+  it('is false when nobody has opted in (even without an email notifier)', async () => {
+    expect((await svc.getDto()).requesterEmailWarning).toBe(false);
+  });
+
+  it('is true when a user opted in but no usable email notifier exists', async () => {
+    const u = await insertUser(db, {});
+    await db.update(users).set({ notifyOn: ['available'] }).where(eq(users.id, u.id));
+    expect((await svc.getDto()).requesterEmailWarning).toBe(true);
+  });
+
+  it('is false when a user opted in AND a usable email notifier exists', async () => {
+    const u = await insertUser(db, {});
+    await db.update(users).set({ notifyOn: ['available'] }).where(eq(users.id, u.id));
+    await svc.createNotifier(emailBody());
+    expect((await svc.getDto()).requesterEmailWarning).toBe(false);
   });
 });

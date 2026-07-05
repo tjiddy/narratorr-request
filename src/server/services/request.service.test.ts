@@ -5,8 +5,10 @@ import { NarratorrError, type INarratorrClient } from './narratorr-client.js';
 import { UserService } from './user.service.js';
 import type { Notifier, NotificationPayload } from './notifications/index.js';
 import type { NotifierLogger } from './notifications/types.js';
+import type { RequesterEmailArgs, RequesterEmailSender } from './notifications/requester-email.js';
 import { createTestDb, insertUser } from '../test-support/db.js';
-import { requests } from '../../db/schema.js';
+import { requests, users } from '../../db/schema.js';
+import type { NotifiableTransition } from '../../shared/schemas/user.js';
 import type { Db } from '../../db/client.js';
 import type { V1Book } from '../../shared/schemas/v1/books.js';
 import type { V1System } from '../../shared/schemas/v1/system.js';
@@ -916,5 +918,151 @@ describe('sanitizeAutoApproveRoles — storage-boundary narrowing (tier 5)', () 
     const warn = vi.fn();
     expect(sanitizeAutoApproveRoles(['nope'], { warn })).toEqual(['admin']);
     expect(warn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('request available requester email (#50)', () => {
+  // A fake sender captures the send-one-email calls; the SMTP-source/render internals are unit-
+  // tested separately in requester-email.test.ts. These assert the RequestService emit contract:
+  // exactly-once per available transition, from every emit site, opt-in + contact gated, and
+  // never throwing into the request/poll flow.
+  function availHarness() {
+    const send = vi.fn(async (_a: RequesterEmailArgs) => {});
+    const warn = vi.fn();
+    const logger: NotifierLogger = { info() {}, warn, error() {}, debug() {} };
+    const deps = (over: Partial<RequesterEmailSender> = {}): RequestFailureNotifyDeps => ({
+      getNotifier: () => ({ notify: async () => {} } as unknown as Notifier),
+      users: new UserService(db),
+      requesterEmail: { send: over.send ?? send },
+      logger,
+    });
+    return { send, warn, deps };
+  }
+
+  /** Opt a seeded user into `available` (or a given set) and set their contact email (nullable). */
+  async function optIn(id: number, email: string | null, on: NotifiableTransition[] = ['available']) {
+    await db.update(users).set({ email, notifyOn: on }).where(eq(users.id, id));
+  }
+
+  const warnFor = (warn: ReturnType<typeof vi.fn>, needle: string) =>
+    warn.mock.calls.find((c) => String(c[1]).includes(needle));
+
+  const importedBook: V1Book = { id: 'bk_1', title: 't', authors: [], narrators: [], status: 'imported' };
+
+  /** Seed a request row directly in a given status (bypasses create so tests target one edge). */
+  async function seedRequest(userId: number, status: RequestStatus, extra: Record<string, unknown> = {}) {
+    const [row] = await db
+      .insert(requests)
+      .values({ publicId: `rq_${status}_${userId}`, userId, asin: 'B1', title: 'A Book', author: 'Author', status, ...extra })
+      .returning();
+    return row!;
+  }
+
+  it('emits exactly one available email via applyBook (poller edge), to the requester with user-facing content', async () => {
+    const h = availHarness();
+    const user = await insertUser(db, { role: 'user', username: 'todd' });
+    await optIn(user.id, 'todd@example.com');
+    const svc = new RequestService(db, client, policy(), h.deps());
+    const row = await seedRequest(user.id, 'acquiring', { narratorrBookId: 'bk_1' });
+
+    expect(await svc.applyBook(row, importedBook)).toBe('available');
+    await vi.waitFor(() => expect(h.send).toHaveBeenCalledTimes(1));
+    expect(h.send.mock.calls[0]![0]).toMatchObject({
+      to: 'todd@example.com',
+      transition: 'available',
+      request: { title: 'A Book', author: 'Author' },
+    });
+  });
+
+  it('emits exactly once via the handoff immediate-available branch (already-imported book)', async () => {
+    const h = availHarness();
+    const admin = await insertUser(db, { role: 'admin', username: 'todd' });
+    await optIn(admin.id, 'todd@example.com');
+    client.status = 'imported';
+    const svc = new RequestService(db, client, policy(), h.deps());
+
+    const { row } = await svc.create(admin.id, body('B1'));
+    expect(row.status).toBe('available');
+    await vi.waitFor(() => expect(h.send).toHaveBeenCalledTimes(1));
+    expect(h.send.mock.calls[0]![0]).toMatchObject({ to: 'todd@example.com', transition: 'available' });
+  });
+
+  it('emits exactly once via recoverHandoff on a stranded approved row', async () => {
+    const h = availHarness();
+    const user = await insertUser(db, { role: 'user', username: 'todd' });
+    await optIn(user.id, 'todd@example.com');
+    client.status = 'imported';
+    const svc = new RequestService(db, client, policy(), h.deps());
+    const row = await seedRequest(user.id, 'approved');
+
+    expect(await svc.recoverHandoff(row)).toBe('recovered');
+    await vi.waitFor(() => expect(h.send).toHaveBeenCalledTimes(1));
+  });
+
+  it('sends EXACTLY once under a handler-vs-poller race (handoff + recoverHandoff on the same approved row)', async () => {
+    const h = availHarness();
+    const user = await insertUser(db, { role: 'user', username: 'todd' });
+    await optIn(user.id, 'todd@example.com');
+    client.status = 'imported';
+    const svc = new RequestService(db, client, policy(), h.deps());
+    const row = await seedRequest(user.id, 'approved');
+
+    // Both call addBook (idempotent by ASIN in prod) then race the approved → available claim;
+    // the atomic `.returning()` guard lets exactly one land the edge and emit. Removing it double-emits.
+    await Promise.all([svc.handoff(row), svc.recoverHandoff(row)]);
+    await vi.waitFor(() => expect(h.send).toHaveBeenCalledTimes(1));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(h.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not email a user who opted out', async () => {
+    const h = availHarness();
+    const user = await insertUser(db, { role: 'user', username: 'todd' });
+    await optIn(user.id, 'todd@example.com', []); // has email, but opted into nothing
+    const svc = new RequestService(db, client, policy(), h.deps());
+    const row = await seedRequest(user.id, 'acquiring', { narratorrBookId: 'bk_1' });
+
+    expect(await svc.applyBook(row, importedBook)).toBe('available');
+    await new Promise((r) => setTimeout(r, 20));
+    expect(h.send).not.toHaveBeenCalled();
+  });
+
+  it('opted-in with a null email is a silent no-op (status still correct, no send, no throw)', async () => {
+    const h = availHarness();
+    const user = await insertUser(db, { role: 'user', username: 'todd' });
+    await optIn(user.id, null); // opted in but no contact
+    const svc = new RequestService(db, client, policy(), h.deps());
+    const row = await seedRequest(user.id, 'acquiring', { narratorrBookId: 'bk_1' });
+
+    expect(await svc.applyBook(row, importedBook)).toBe('available');
+    const [fresh] = await db.select().from(requests).where(eq(requests.id, row.id));
+    expect(fresh?.status).toBe('available');
+    await new Promise((r) => setTimeout(r, 20));
+    expect(h.send).not.toHaveBeenCalled();
+  });
+
+  it('a send failure never throws into the flow and never alters the recorded status (logged breadcrumb)', async () => {
+    const h = availHarness();
+    const send = vi.fn(async () => {
+      throw new Error('smtp down');
+    });
+    const user = await insertUser(db, { role: 'user', username: 'todd' });
+    await optIn(user.id, 'todd@example.com');
+    const svc = new RequestService(db, client, policy(), h.deps({ send }));
+    const row = await seedRequest(user.id, 'acquiring', { narratorrBookId: 'bk_1' });
+
+    expect(await svc.applyBook(row, importedBook)).toBe('available'); // transition unaffected
+    const [fresh] = await db.select().from(requests).where(eq(requests.id, row.id));
+    expect(fresh?.status).toBe('available');
+    await vi.waitFor(() => expect(warnFor(h.warn, 'requester email dispatch failed')).toBeTruthy());
+  });
+
+  it('emits nothing when no requesterEmail dep is wired (the failed-only construction is unaffected)', async () => {
+    const user = await insertUser(db, { role: 'user', username: 'todd' });
+    await optIn(user.id, 'todd@example.com');
+    // 3-arg construction: no notify deps at all.
+    const svc = new RequestService(db, client, policy());
+    const row = await seedRequest(user.id, 'acquiring', { narratorrBookId: 'bk_1' });
+    expect(await svc.applyBook(row, importedBook)).toBe('available'); // no throw, transition lands
   });
 });

@@ -223,6 +223,7 @@ describe('connectorSettingsDtoSchema', () => {
         { id: 'nf_2', name: 'Legacy', type: 'apprise', events: ['user.pending'], unknown: true },
       ],
       defaultQuota: { mode: 'limited', limit: 10, windowDays: 30 },
+      requesterEmailWarning: false,
     };
     expect(connectorSettingsDtoSchema.safeParse(dto).success).toBe(true);
   });
@@ -234,8 +235,9 @@ describe('connectorSettingsDtoSchema', () => {
         narratorr: null,
         notifiers: [],
         defaultQuota: { mode: 'unlimited', windowDays: 30 },
+        requesterEmailWarning: false,
       }),
-    ).toEqual({ publicUrl: null, narratorr: null, notifiers: [], defaultQuota: { mode: 'unlimited', windowDays: 30 } });
+    ).toEqual({ publicUrl: null, narratorr: null, notifiers: [], defaultQuota: { mode: 'unlimited', windowDays: 30 }, requesterEmailWarning: false });
   });
 
   it('requires defaultQuota in the masked DTO', () => {
@@ -248,6 +250,7 @@ describe('connectorSettingsDtoSchema', () => {
       narratorr: null,
       notifiers: [],
       defaultQuota: { mode: 'limited', limit: 10, windowDays },
+      requesterEmailWarning: false,
     });
     for (const allowed of [1, 7, 30]) {
       expect(connectorSettingsDtoSchema.safeParse(dto(allowed)).success).toBe(true);

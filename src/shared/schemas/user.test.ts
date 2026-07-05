@@ -1,5 +1,14 @@
 import { describe, it, expect } from 'vitest';
-import { updateUserBodySchema, requestQuotaSchema, userDtoSchema, localCredentialsSchema } from './user.js';
+import {
+  updateUserBodySchema,
+  requestQuotaSchema,
+  userDtoSchema,
+  localCredentialsSchema,
+  NOTIFIABLE_TRANSITIONS,
+  notifiableTransitionSchema,
+  sanitizeNotifyOn,
+  updateMeBodySchema,
+} from './user.js';
 
 describe('requestQuotaSchema — four-mode discriminated union', () => {
   it('accepts each mode in its valid shape', () => {
@@ -137,5 +146,53 @@ describe('localCredentialsSchema', () => {
     it('rejects an unknown key', () => {
       expect(localCredentialsSchema.safeParse({ email: 'user@x.com', password: pw, extra: 1 }).success).toBe(false);
     });
+  });
+});
+
+describe('NOTIFIABLE_TRANSITIONS (v1) — requester opt-in (#50)', () => {
+  it('ships `available` ONLY — no transition that lacks an emit site', () => {
+    expect(NOTIFIABLE_TRANSITIONS).toEqual(['available']);
+  });
+});
+
+describe('notifiableTransitionSchema', () => {
+  it('accepts an in-const value', () => {
+    expect(notifiableTransitionSchema.safeParse('available').success).toBe(true);
+  });
+  it('rejects a value outside the const (a RequestStatus with no emit site, or garbage)', () => {
+    for (const bad of ['denied', 'failed', 'pending', 'approved', 'acquiring', '']) {
+      expect(notifiableTransitionSchema.safeParse(bad).success).toBe(false);
+    }
+  });
+});
+
+describe('sanitizeNotifyOn — degrade-to-empty on a corrupt/legacy read', () => {
+  it('passes a clean array through', () => {
+    expect(sanitizeNotifyOn(['available'])).toEqual(['available']);
+  });
+  it('degrades a non-array / legacy / unknown value to empty', () => {
+    for (const bad of [null, undefined, 42, 'available', {}, ['available', 'denied'], ['bogus']]) {
+      expect(sanitizeNotifyOn(bad)).toEqual([]);
+    }
+  });
+  it('collapses duplicates', () => {
+    expect(sanitizeNotifyOn(['available', 'available'])).toEqual(['available']);
+  });
+});
+
+describe('updateMeBodySchema (PATCH /api/me)', () => {
+  it('accepts a valid notifyOn set (including empty)', () => {
+    expect(updateMeBodySchema.safeParse({ notifyOn: ['available'] }).success).toBe(true);
+    expect(updateMeBodySchema.safeParse({ notifyOn: [] }).success).toBe(true);
+  });
+  it('rejects a value outside NOTIFIABLE_TRANSITIONS (→ 400)', () => {
+    expect(updateMeBodySchema.safeParse({ notifyOn: ['denied'] }).success).toBe(false);
+    expect(updateMeBodySchema.safeParse({ notifyOn: ['failed'] }).success).toBe(false);
+  });
+  it('is strict — a stray key (e.g. smuggling role) is rejected', () => {
+    expect(updateMeBodySchema.safeParse({ notifyOn: ['available'], role: 'admin' }).success).toBe(false);
+  });
+  it('requires notifyOn', () => {
+    expect(updateMeBodySchema.safeParse({}).success).toBe(false);
   });
 });
