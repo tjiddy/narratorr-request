@@ -1122,6 +1122,12 @@ describe('durable requester availability email sweep (#50/#121)', () => {
 
     const keyed = (calls: [unknown, unknown][], pid: string, re: RegExp) =>
       calls.some((c) => (c[0] as { request?: string }).request === pid && re.test(String(c[1])));
+    // Every eligible row logs an `attempted` breadcrumb before the send (AC5 fourth outcome), keyed
+    // on publicId — so an in-flight/interrupted attempt is distinguishable from one never reached.
+    // Mutation-sensitive: dropping the pre-send log fails these three regardless of the terminal one.
+    for (const pid of ['rq_deliver', 'rq_skip', 'rq_fail']) {
+      expect(keyed(h.info.mock.calls as [unknown, unknown][], pid, /attempting/i)).toBe(true);
+    }
     expect(keyed(h.info.mock.calls as [unknown, unknown][], 'rq_deliver', /delivered/i)).toBe(true);
     expect(keyed(h.warn.mock.calls as [unknown, unknown][], 'rq_skip', /skipped/i)).toBe(true);
     expect(keyed(h.warn.mock.calls as [unknown, unknown][], 'rq_fail', /attempt failed/i)).toBe(true);

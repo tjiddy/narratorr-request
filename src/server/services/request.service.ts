@@ -576,7 +576,7 @@ export class RequestService {
    * still null):
    *   • not opted into `available`, OR opted in with a null email → a permanent no-op: settle the
    *     marker (no email owed) so the row drops out of the capped batch and can't accumulate;
-   *   • opted in with an email → attempt the send:
+   *   • opted in with an email → log an `attempted` breadcrumb, then attempt the send:
    *       – `delivered`         → settle the marker;
    *       – `skipped-no-config` → GLOBAL, replayable: leave the marker null (backlog delivers once
    *                               the admin configures a usable email notifier), log the skip;
@@ -600,6 +600,11 @@ export class RequestService {
           await this.settleAvailableNotified(row.id);
           continue;
         }
+        // Pre-send ATTEMPTED breadcrumb (AC5): the fourth distinguishable outcome. Lets an operator
+        // tell an eligible row that was attempted (send in flight, terminal log pending) apart from
+        // one that was never reached — without it, an in-flight/interrupted attempt is invisible.
+        // Keyed on publicId, NEVER the recipient; paired at `info` with the `delivered` breadcrumb.
+        logger?.info({ request: row.publicId }, 'request.available: attempting requester email');
         const outcome = await sender.send({ to: email, transition: 'available', request: { title: row.title, author: row.author } });
         if (outcome === 'skipped-no-config') {
           // GLOBAL, replayable: leave the marker null so a later sweep delivers once SMTP is set up.
