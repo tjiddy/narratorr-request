@@ -129,3 +129,19 @@ describe('0003 available_notified_at backfill', () => {
     }
   });
 });
+
+describe('seedThenMigrate helper', () => {
+  it('rejects an unknown migration target before running the seed callback', async () => {
+    let seeded = false;
+    await expect(
+      seedThenMigrate({
+        target: '9999_does_not_exist',
+        seed: async () => {
+          seeded = true;
+        },
+      }),
+    ).rejects.toThrow(/unknown migration tag/);
+    // The guard must reject up front — never seed against a schema for a target it can't apply.
+    expect(seeded).toBe(false);
+  });
+});
