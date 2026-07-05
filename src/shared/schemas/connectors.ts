@@ -203,6 +203,11 @@ export const connectorSettingsDtoSchema = z.object({
     .nullable(),
   notifiers: z.array(notifierDtoSchema),
   defaultQuota: defaultQuotaSchema,
+  // Admin-visible warning (issue #50): true when one or more users have opted into requester
+  // emails but NO usable email-notifier SMTP source is configured — so those opt-ins deliver
+  // nothing. Rendered on the Notifications settings section. False when there's a usable email
+  // source OR nobody has opted in (nothing to warn about).
+  requesterEmailWarning: z.boolean(),
 });
 /** Hand-written (the runtime schema's `notifiers` infers `unknown[]`; this keeps it typed). */
 export interface ConnectorSettingsDto {
@@ -210,6 +215,7 @@ export interface ConnectorSettingsDto {
   narratorr: { url: string; hasApiKey: boolean } | null;
   notifiers: NotifierDto[];
   defaultQuota: DefaultQuota;
+  requesterEmailWarning: boolean;
 }
 
 // ---- narratorr connector (shared by PUT + Test) -----------------------------

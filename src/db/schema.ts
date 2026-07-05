@@ -1,6 +1,6 @@
 import { sqliteTable, text, integer, index, uniqueIndex, check } from 'drizzle-orm/sqlite-core';
 import { sql } from 'drizzle-orm';
-import { USER_ROLES, USER_STATUSES, REQUEST_QUOTA_MODES, type Role } from '../shared/schemas/user.js';
+import { USER_ROLES, USER_STATUSES, REQUEST_QUOTA_MODES, type Role, type NotifiableTransition } from '../shared/schemas/user.js';
 import { REQUEST_STATUSES, ACTIVE_REQUEST_STATUSES } from '../shared/schemas/request.js';
 import type { StoredConnectors } from '../shared/schemas/connectors.js';
 
@@ -41,6 +41,17 @@ export const users = sqliteTable(
     // Per-user auto-approve: this user's requests skip the pending queue. Orthogonal
     // to quota — an auto-approved user's requests still count against their limit.
     autoApprove: integer('auto_approve', { mode: 'boolean' }).notNull().default(false),
+    // Requester-notification opt-in (issue #50): the transitions this user asked to be
+    // emailed about, as a JSON array keyed to `NOTIFIABLE_TRANSITIONS` (v1: ['available']).
+    // Default empty (off); a corrupt/legacy value degrades to empty on read via
+    // `sanitizeNotifyOn` — matching the autoApproveRoles/connectors JSON-on-a-row precedent.
+    // NO opt-in↔contact DB CHECK: opt-in may legitimately outlive a contact, and a
+    // JSON-array-vs-nullable-column CHECK hits the sqlite-check-null-is-satisfied trap (see
+    // the request_quota check below); contact is gated at send time, not by a constraint.
+    notifyOn: text('notify_on', { mode: 'json' })
+      .notNull()
+      .$type<NotifiableTransition[]>()
+      .default(sql`'[]'`),
     createdAt: integer('created_at', { mode: 'timestamp' })
       .notNull()
       .default(sql`(unixepoch())`),

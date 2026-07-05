@@ -2,10 +2,8 @@ import { and, desc, eq, gte, inArray, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import type { Db } from '../../db/client.js';
 import { requests, users, type RequestRow } from '../../db/schema.js';
-import type { Notifier } from './notifications/index.js';
-import { redact } from './notifications/redact.js';
-import type { NotifierLogger } from './notifications/types.js';
-import type { UserService } from './user.service.js';
+import { emitFailed, emitAvailable, type RequestFailureNotifyDeps } from './request-notifications.js';
+export type { RequestFailureNotifyDeps } from './request-notifications.js';
 import type {
   CreateRequestBody,
   DecisionBody,
@@ -15,9 +13,16 @@ import type {
 import { OPEN_REQUEST_STATUSES, ACTIVE_REQUEST_STATUSES, APPROVED_REQUEST_STATUSES } from '../../shared/schemas/request.js';
 import { roleSchema, type Role, type RequestQuotaMode } from '../../shared/schemas/user.js';
 import type { DefaultQuota, QuotaWindowDays } from '../../shared/schemas/connectors.js';
-import { ADD_BOOK_ERROR_CODES, type V1Book } from '../../shared/schemas/v1/books.js';
+import type { V1Book } from '../../shared/schemas/v1/books.js';
 import type { INarratorrClient } from './narratorr-client.js';
-import { NarratorrError } from './narratorr-client.js';
+import {
+  isTerminalHandoffError,
+  handoffFailureReason,
+  bookStatusFailureReason,
+} from './request-failure-reasons.js';
+// Re-exported so `status-poller` (+ its test) keep importing it from here — the poller's 404 path
+// writes it via `markFailed`, so its home stays alongside the service it's used with.
+export { BOOK_VANISHED_REASON } from './request-failure-reasons.js';
 import { publicId } from '../util/ids.js';
 import { conflict, notFound, quotaBlocked, tooManyRequests } from '../util/errors.js';
 import { isUniqueViolation } from '../util/db.js';
@@ -93,31 +98,6 @@ export interface QuotaUsage {
   remaining: number | null;
   windowDays: QuotaWindowDays;
 }
-
-/**
- * Wiring for the admin-facing `request.failed` notification (issue #60). Optional — when
- * absent the service simply doesn't emit (existing call-sites that don't care about
- * notifications keep their 3-arg construction).
- */
-export interface RequestFailureNotifyDeps {
-  /**
-   * Reads the CURRENT notifier at call time. MUST be an accessor, not a captured
-   * instance: the live notifier is rebuilt and reassigned on every notifier-settings
-   * change, so capturing it would dispatch failed-notifications through a stale channel set.
-   */
-  getNotifier: () => Notifier;
-  /** Resolves `requester.username`; an absent row falls back to a stable placeholder. */
-  users: Pick<UserService, 'getById'>;
-  /**
-   * Optional log sink for fire-and-forget emission faults (a requester lookup that rejects, or a
-   * notifier dispatch that rejects). Without it a lost `request.failed` is undiagnosable; the
-   * emission stays non-blocking either way — these are breadcrumbs, never thrown to the caller.
-   */
-  logger?: NotifierLogger;
-}
-
-/** Username used when the requester row is gone (e.g. deleted account) — the admin still hears it failed. */
-const UNKNOWN_REQUESTER = '(unknown requester)';
 
 export class RequestService {
   constructor(
@@ -406,11 +386,20 @@ export class RequestService {
         });
         return failed ?? row;
       }
+      // Atomically claim the OBSERVED `approved` edge (mirrors transitionToFailed): the real race
+      // is handler-vs-poller — create()'s in-flight handoff vs recoverHandoff firing a second
+      // handoff on the same `(approved, bookId NULL)` row. Both call addBook (idempotent by ASIN),
+      // then both reach here; the `WHERE status = row.status` guard lets exactly ONE land the edge,
+      // so the availability email fires exactly once (only when the claim returns a row). The loser
+      // matches zero rows and emits nothing.
       const [updated] = await this.db
         .update(requests)
         .set({ narratorrBookId: book.id, status: next })
-        .where(eq(requests.id, row.id))
+        .where(and(eq(requests.id, row.id), eq(requests.status, row.status)))
         .returning();
+      // A book that was already imported short-circuits approved → available here (never entering
+      // acquiring), so this is the ONLY available emit site for the synchronous / recovered paths.
+      if (updated && next === 'available') emitAvailable(this.notifyDeps, updated);
       return updated ?? row;
     } catch (err) {
       if (!isTerminalHandoffError(err)) throw err; // transient — stays `approved`, poller retries
@@ -465,64 +454,8 @@ export class RequestService {
       .where(and(eq(requests.id, row.id), eq(requests.status, row.status)))
       .returning();
     if (!updated) return null;
-    this.emitFailed(updated, reason);
+    emitFailed(this.notifyDeps, updated, reason);
     return updated;
-  }
-
-  /**
-   * Fire-and-forget `request.failed` emission. NEVER throws into the request/poll path:
-   * the failed transition is already committed, so a missing requester or a dispatch
-   * hiccup must not unwind it. Resolves the requester via the live UserService and
-   * dispatches through the LIVE notifier (read at call time). A missing requester row
-   * still emits with a stable placeholder username — the admin needs to hear it failed.
-   */
-  private emitFailed(row: RequestRow, reason: string | null): void {
-    const deps = this.notifyDeps;
-    if (!deps) return;
-    void (async () => {
-      // A requester lookup fault (DB fault) must NOT lose the notification — the admin still
-      // needs to hear it failed. Log a redacted breadcrumb and fall back to the placeholder.
-      let requester: { username: string } | undefined;
-      try {
-        requester = await deps.users.getById(row.userId);
-      } catch (err) {
-        // redact() before logging: a lookup fault's error text could embed a secret-bearing
-        // value, and the breadcrumb must never carry one raw (URL-pattern scrub; no per-channel
-        // secrets to exact-match here — those live inside the dispatcher).
-        deps.logger?.warn(
-          { err: redact(err), request: row.publicId },
-          'request.failed: requester lookup failed; emitting with placeholder username',
-        );
-      }
-      try {
-        await deps.getNotifier().notify({
-          event: 'request.failed',
-          request: {
-            publicId: row.publicId,
-            title: row.title,
-            author: row.author,
-            asin: row.asin,
-            coverUrl: row.coverUrl,
-          },
-          requester: { username: requester?.username ?? UNKNOWN_REQUESTER },
-          reason,
-        });
-      } catch (err) {
-        // A lost notification must be diagnosable — without this breadcrumb a dropped
-        // request.failed is invisible. The failed transition already committed; never propagate.
-        // redact() before logging: a dispatch error can embed a capability webhook URL or a
-        // token-in-path (the very reason the dispatcher redacts), so scrub it here too.
-        deps.logger?.warn(
-          { err: redact(err), request: row.publicId },
-          'request.failed: notifier dispatch failed; notification lost',
-        );
-      }
-    })().catch((err) => {
-      // Final backstop: both awaits above are individually guarded, so this only fires on a
-      // truly unexpected throw. The failed transition already landed; swallow into a (redacted)
-      // breadcrumb.
-      deps.logger?.warn({ err: redact(err), request: row.publicId }, 'request.failed: emission failed unexpectedly');
-    });
   }
 
   // --- reconciliation (poller) ----------------------------------------------
@@ -576,10 +509,17 @@ export class RequestService {
       });
       return failed ? 'failed' : null;
     }
-    await this.db
+    // Claim the OBSERVED (`acquiring`) edge atomically — the same `WHERE status = <observed>
+    // … .returning()` guard as the failed edge. This is the normal `acquiring → available` write;
+    // emitting the availability email only when the claim lands a row keeps it exactly-once even
+    // if this path ever raced another writer (the loser matches zero rows and emits nothing).
+    const [updated] = await this.db
       .update(requests)
       .set({ status: next, narratorrBookId: bookId })
-      .where(eq(requests.id, row.id));
+      .where(and(eq(requests.id, row.id), eq(requests.status, row.status)))
+      .returning();
+    if (!updated) return null; // lost the claim — the row already moved off the observed status
+    if (next === 'available') emitAvailable(this.notifyDeps, updated);
     return next === row.status ? null : next;
   }
 
@@ -603,59 +543,5 @@ export class RequestService {
       default:
         return 'acquiring'; // wanted | searching | downloading | importing
     }
-  }
-}
-
-/**
- * Whether a handoff error is terminal (retrying can't fix it → fail the request) vs.
- * transient (429 rate-limit / 5xx / network → leave `approved` for the poller to
- * retry). A non-Narratorr error (e.g. a DB fault) is terminal so it can't loop forever.
- */
-function isTerminalHandoffError(err: unknown): boolean {
-  if (!(err instanceof NarratorrError)) return true;
-  // 400 malformed, 409 with no usable existingId, 422 unresolvable ASIN.
-  return err.upstreamStatus === 400 || err.upstreamStatus === 409 || err.upstreamStatus === 422;
-}
-
-// --- Friendly failure reasons ------------------------------------------------
-// Once a `failureReason` is surfaced to users/admins it must read as plain English,
-// not a raw upstream code. These map every terminal failure cause to a friendly string.
-// Branch on the upstream CODE (narratorr #1545), never the human message text.
-
-/** Per-code friendly text for the add-handoff terminal errors. */
-const HANDOFF_FAILURE_REASONS: Record<string, string> = {
-  [ADD_BOOK_ERROR_CODES.editionRejected]: "This edition is excluded by the library's filters.",
-  [ADD_BOOK_ERROR_CODES.asinNotResolved]: "Couldn't find this book in the catalog.",
-  [ADD_BOOK_ERROR_CODES.invalidRecord]: 'Incomplete book data from the provider.',
-};
-
-/** "The book is gone upstream" reason — written by the poller's 404 path (status-poller). */
-export const BOOK_VANISHED_REASON = 'This book is no longer available upstream.';
-
-/**
- * Friendly reason for a TERMINAL handoff error. A recognized `NarratorrError` code maps
- * to its per-code message; an unknown terminal code falls back to the readable
- * `${code}: ${message}` shape; a non-`NarratorrError` throw is a generic 'handoff failed'.
- */
-export function handoffFailureReason(err: unknown): string {
-  if (err instanceof NarratorrError) {
-    return HANDOFF_FAILURE_REASONS[err.upstreamCode] ?? `${err.upstreamCode}: ${err.message}`;
-  }
-  return 'handoff failed';
-}
-
-/**
- * Friendly reason for a book whose status maps to `failed` (`failed` / `missing`). Any
- * other status shouldn't reach here (only `failed`/`missing` collapse to a failed request),
- * but it degrades to a readable `book ${status}` string rather than throwing.
- */
-export function bookStatusFailureReason(status: V1Book['status']): string {
-  switch (status) {
-    case 'failed':
-      return 'Download failed upstream.';
-    case 'missing':
-      return 'No source found upstream.';
-    default:
-      return `book ${status}`;
   }
 }

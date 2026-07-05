@@ -7,6 +7,8 @@ import { createTestDb } from '../test-support/db.js';
 import { UserService } from '../services/user.service.js';
 import { SettingsService } from '../services/settings.service.js';
 import { RequestService } from '../services/request.service.js';
+import { ConnectorSettingsService } from '../services/connector-settings.service.js';
+import { SecretCodec, deriveSettingsKey } from '../util/secret-codec.js';
 import { errorHandlerPlugin } from '../plugins/error-handler.js';
 import { authRateLimitOptions } from '../plugins/rate-limit.js';
 import { authPlugin } from '../plugins/auth.js';
@@ -49,6 +51,9 @@ let notifySpy: ReturnType<typeof vi.fn>;
 // The live UserService so tests can spy on it (e.g. to simulate a signup losing the
 // unique-constraint race). Reassigned per buildApp().
 let usersSvc: UserService;
+// The live ConnectorSettingsService so a test can configure an email notifier and assert
+// GET /api/me flips `emailNotifyAvailable` true (issue #50). Reassigned per buildApp().
+let connectorSvc: ConnectorSettingsService;
 
 async function buildApp(
   opts: { config?: Partial<AppConfig>; oidc?: AppDeps['oidc'] } = {},
@@ -58,6 +63,10 @@ async function buildApp(
   const users = new UserService(db, {});
   usersSvc = users;
   const requests = new RequestService(db, stubNarratorr, { defaultQuota: { mode: 'limited', limit: 10 }, windowDays: 30, autoApproveRoles: ['admin'] });
+  // GET /api/me reads the notifier config to compute `emailNotifyAvailable` (issue #50) — wire a
+  // real (empty) connector service so the self-scoped DTO builds without a live SMTP source.
+  const connectorSettings = new ConnectorSettingsService(db, new SecretCodec(deriveSettingsKey({ sessionSecret: SESSION_SECRET })));
+  connectorSvc = connectorSettings;
   const config = {
     authMode: 'standard',
     sessionSecret: SESSION_SECRET,
@@ -72,6 +81,7 @@ async function buildApp(
     db,
     users,
     requests,
+    connectorSettings,
     notifier: { notify: notifySpy },
     oidc: opts.oidc ?? new Map(),
   } as unknown as AppDeps;
@@ -357,5 +367,93 @@ describe('generic OIDC routes', () => {
     expect(res.statusCode).toBe(302);
     expect(res.headers.location).toContain('login_error=oidc');
     await a.close();
+  });
+});
+
+describe('requester-notification opt-in — GET + PATCH /api/me (#50)', () => {
+  const me = (cookies: Record<string, string>) => app.inject({ method: 'GET', url: '/api/me', cookies });
+  const patchMe = (cookies: Record<string, string>, payload: Record<string, unknown>) =>
+    app.inject({ method: 'PATCH', url: '/api/me', cookies, payload });
+
+  it('GET exposes notifyOn (default empty) and emailNotifyAvailable (false with no email notifier configured)', async () => {
+    const guest = await signup(app, 'guest@example.com');
+    const body = (await me(sessionCookie(guest))).json();
+    expect(body.notifyOn).toEqual([]);
+    // The user has an email (local signup) but no usable email notifier ⇒ delivery unavailable.
+    expect(body.emailNotifyAvailable).toBe(false);
+  });
+
+  it('PATCH stores the opt-in set and echoes it; GET reflects it', async () => {
+    const guest = await signup(app, 'guest@example.com');
+    const cookie = sessionCookie(guest);
+    const res = await patchMe(cookie, { notifyOn: ['available'] });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().notifyOn).toEqual(['available']);
+    expect((await me(cookie)).json().notifyOn).toEqual(['available']);
+  });
+
+  it('stores the set even with no usable email notifier — enable-without-delivery is NOT a 403', async () => {
+    const guest = await signup(app, 'guest@example.com');
+    const cookie = sessionCookie(guest);
+    const res = await patchMe(cookie, { notifyOn: ['available'] });
+    expect(res.statusCode).toBe(200); // storage-permissive; delivery gates at send time, not here
+    expect(res.json()).toMatchObject({ notifyOn: ['available'], emailNotifyAvailable: false });
+  });
+
+  it('stores the set for a user with NO email contact (null users.email) — no 403, emailNotifyAvailable false (F1)', async () => {
+    // The default fakeOidc profile carries email: null — a genuine no-contact identity (the OIDC
+    // without-email population Design #4 targets). AC6 requires storage-permissive opt-in here: a
+    // future gate on `row.email !== null` in the PATCH handler would 403 this user, so pin the
+    // null-contact branch that the email-bearing local-signup cases above cannot exercise.
+    const a = await buildApp({ oidc: fakeOidc() });
+    try {
+      const cbRes = await a.inject({ method: 'GET', url: '/api/auth/oidc/test/callback?code=x&state=y' });
+      const cookie = sessionCookie(cbRes);
+      // Precondition: this caller genuinely has no email contact.
+      expect((await a.inject({ method: 'GET', url: '/api/me', cookies: cookie })).json().email).toBeNull();
+
+      const res = await a.inject({ method: 'PATCH', url: '/api/me', cookies: cookie, payload: { notifyOn: ['available'] } });
+      expect(res.statusCode).toBe(200); // NOT a 403 — opt-in is stored regardless of contact
+      expect(res.json()).toMatchObject({ notifyOn: ['available'], emailNotifyAvailable: false });
+      // Persisted: a fresh GET reflects the stored set (the write hit the row, not just the echo).
+      expect((await a.inject({ method: 'GET', url: '/api/me', cookies: cookie })).json().notifyOn).toEqual(['available']);
+    } finally {
+      await a.close();
+    }
+  });
+
+  it('rejects a value outside NOTIFIABLE_TRANSITIONS with 400', async () => {
+    const guest = await signup(app, 'guest@example.com');
+    const res = await patchMe(sessionCookie(guest), { notifyOn: ['denied'] });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('rejects a stray key (cannot smuggle a role/status change through the self-scoped endpoint)', async () => {
+    const guest = await signup(app, 'guest@example.com');
+    const res = await patchMe(sessionCookie(guest), { notifyOn: ['available'], role: 'admin' });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('mutates ONLY the caller — a second user’s opt-in set is untouched', async () => {
+    const owner = await signup(app, 'owner@example.com'); // first user → admin+active
+    const guest = await signup(app, 'guest@example.com');
+    await patchMe(sessionCookie(guest), { notifyOn: ['available'] });
+    expect((await me(sessionCookie(owner))).json().notifyOn).toEqual([]); // owner unchanged
+    expect((await me(sessionCookie(guest))).json().notifyOn).toEqual(['available']);
+  });
+
+  it('requires authentication (401 unauthenticated)', async () => {
+    expect((await app.inject({ method: 'PATCH', url: '/api/me', payload: { notifyOn: [] } })).statusCode).toBe(401);
+  });
+
+  it('emailNotifyAvailable is true once the user has an email AND a usable email notifier exists', async () => {
+    const guest = await signup(app, 'guest@example.com');
+    await connectorSvc.createNotifier({
+      name: 'Mail',
+      type: 'email',
+      events: ['request.created'],
+      config: { host: 'smtp.example.com', port: 587, secure: false, user: 'u', pass: 'p', from: 'ops@example.com', to: 'admin@example.com' },
+    });
+    expect((await me(sessionCookie(guest))).json().emailNotifyAvailable).toBe(true);
   });
 });

@@ -1,7 +1,8 @@
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import type { Db } from '../../db/client.js';
-import { appSettings } from '../../db/schema.js';
+import { appSettings, users } from '../../db/schema.js';
+import { selectEmailSource } from './notifications/requester-email.js';
 import { notificationEventSchema, type NotificationEvent } from '../../shared/notification-events.js';
 import { quotaWindowDaysSchema, storedConnectorsSchema } from '../../shared/schemas/connectors.js';
 import type {
@@ -225,7 +226,28 @@ export class ConnectorSettingsService {
         : null,
       notifiers: c.notifiers.map((n) => this.toNotifierDto(n)),
       defaultQuota: this.sanitizeQuota(row),
+      requesterEmailWarning: await this.computeRequesterEmailWarning(c),
     };
+  }
+
+  /**
+   * The admin-visible requester-email warning (issue #50): true IFF one or more users have opted
+   * into a requester notification but no usable email-notifier SMTP source exists — those opt-ins
+   * would deliver nothing. Reuses the SAME first-usable-email-source predicate as the send path
+   * (`selectEmailSource` over the decrypted runtime notifiers), so the warning can't disagree with
+   * whether an email would actually go out. Skips the source check when nobody has opted in.
+   */
+  private async computeRequesterEmailWarning(c: StoredConnectors): Promise<boolean> {
+    // `notify_on` defaults to the literal '[]'; any other stored value means a user opted into
+    // something (v1: `available`). A cheap existence check — no need to decrypt for this half.
+    const [optedIn] = await this.db
+      .select({ n: users.id })
+      .from(users)
+      .where(sql`${users.notifyOn} <> '[]'`)
+      .limit(1);
+    if (!optedIn) return false;
+    // Someone opted in — warn only when there's no usable email source to deliver through.
+    return selectEmailSource({ publicUrl: c.publicUrl, notifiers: c.notifiers.map((n) => this.toRuntimeNotifier(n)) }) === null;
   }
 
   /**
