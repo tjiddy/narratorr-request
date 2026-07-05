@@ -400,6 +400,28 @@ describe('requester-notification opt-in — GET + PATCH /api/me (#50)', () => {
     expect(res.json()).toMatchObject({ notifyOn: ['available'], emailNotifyAvailable: false });
   });
 
+  it('stores the set for a user with NO email contact (null users.email) — no 403, emailNotifyAvailable false (F1)', async () => {
+    // The default fakeOidc profile carries email: null — a genuine no-contact identity (the OIDC
+    // without-email population Design #4 targets). AC6 requires storage-permissive opt-in here: a
+    // future gate on `row.email !== null` in the PATCH handler would 403 this user, so pin the
+    // null-contact branch that the email-bearing local-signup cases above cannot exercise.
+    const a = await buildApp({ oidc: fakeOidc() });
+    try {
+      const cbRes = await a.inject({ method: 'GET', url: '/api/auth/oidc/test/callback?code=x&state=y' });
+      const cookie = sessionCookie(cbRes);
+      // Precondition: this caller genuinely has no email contact.
+      expect((await a.inject({ method: 'GET', url: '/api/me', cookies: cookie })).json().email).toBeNull();
+
+      const res = await a.inject({ method: 'PATCH', url: '/api/me', cookies: cookie, payload: { notifyOn: ['available'] } });
+      expect(res.statusCode).toBe(200); // NOT a 403 — opt-in is stored regardless of contact
+      expect(res.json()).toMatchObject({ notifyOn: ['available'], emailNotifyAvailable: false });
+      // Persisted: a fresh GET reflects the stored set (the write hit the row, not just the echo).
+      expect((await a.inject({ method: 'GET', url: '/api/me', cookies: cookie })).json().notifyOn).toEqual(['available']);
+    } finally {
+      await a.close();
+    }
+  });
+
   it('rejects a value outside NOTIFIABLE_TRANSITIONS with 400', async () => {
     const guest = await signup(app, 'guest@example.com');
     const res = await patchMe(sessionCookie(guest), { notifyOn: ['denied'] });

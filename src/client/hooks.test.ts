@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { RequestDto } from '@shared/schemas/request';
-import type { UserDto } from '@shared/schemas/user';
+import type { UserDto, MeDto } from '@shared/schemas/user';
 import type { ConnectorSettingsDto, TestConnectorResult } from '@shared/schemas/connectors';
 // Type-only namespace imports (erased at runtime, so they don't fight the mocks below) —
 // give importActual its return type without an inline `import()` annotation.
@@ -23,6 +23,7 @@ const hoisted = vi.hoisted(() => ({
     listMyRequests: vi.fn(),
     listAdminQueue: vi.fn(),
     listUserRequests: vi.fn(),
+    updateMe: vi.fn(),
   },
   // A module-scoped slot backing the test-only `react` useState mock so a re-invoked
   // `useTheme()` observes the value a prior `toggleTheme()` wrote.
@@ -50,6 +51,7 @@ vi.mock('./api', async (importActual) => {
     listMyRequests: hoisted.api.listMyRequests,
     listAdminQueue: hoisted.api.listAdminQueue,
     listUserRequests: hoisted.api.listUserRequests,
+    updateMe: hoisted.api.updateMe,
   };
 });
 
@@ -84,6 +86,7 @@ import {
   keepSameListData,
   useRequestBook,
   useUpdateUser,
+  useUpdateMe,
   useDecide,
   useUpdateConnectors,
   useTestConnector,
@@ -402,6 +405,35 @@ describe('useUpdateUser', () => {
     expect(error).toHaveBeenCalledWith('bad patch');
     h.onError(new Error('x'));
     expect(error).toHaveBeenCalledWith('Failed to update user');
+  });
+});
+
+describe('useUpdateMe — requester opt-in save (#50)', () => {
+  // F2 — the mutation owns observable behavior beyond the pure toggle helpers: it dispatches
+  // the PATCH via `updateMe`, writes the returned MeDto straight into the `qk.me` cache (so the
+  // control + nudge reflect the new set immediately), and surfaces success/error toasts. Node-only
+  // (mocked useMutation returns raw options), mirroring the other mutation-hook tests here.
+  const dto = { notifyOn: ['available'], emailNotifyAvailable: true } as unknown as MeDto;
+
+  it('dispatches updateMe with the exact opt-in body', () => {
+    mut(useUpdateMe()).mutationFn({ notifyOn: ['available'] } as never);
+    expect(hoisted.api.updateMe).toHaveBeenCalledWith({ notifyOn: ['available'] });
+  });
+
+  it('writes the returned DTO into the me cache directly (not invalidate) and toasts success', () => {
+    cb(useUpdateMe()).onSuccess(dto);
+    expect(hoisted.qc.setQueryData).toHaveBeenCalledWith(qk.me, dto);
+    expect(hoisted.qc.setQueryData).toHaveBeenCalledWith(['me'], dto); // key verbatim, no drift
+    expect(success).toHaveBeenCalledWith('Notification preferences saved');
+    expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalled();
+  });
+
+  it('surfaces ApiError message, else "Could not save preferences", on error', () => {
+    const h = cb(useUpdateMe());
+    h.onError(new ApiError(400, 'B', 'bad opt-in'));
+    expect(error).toHaveBeenCalledWith('bad opt-in');
+    h.onError(new Error('x'));
+    expect(error).toHaveBeenCalledWith('Could not save preferences');
   });
 });
 
