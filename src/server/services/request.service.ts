@@ -12,7 +12,7 @@ import type {
   RequestStatus,
 } from '../../shared/schemas/request.js';
 import { OPEN_REQUEST_STATUSES, ACTIVE_REQUEST_STATUSES, APPROVED_REQUEST_STATUSES } from '../../shared/schemas/request.js';
-import { roleSchema, sanitizeNotifyOn, type Role, type RequestQuotaMode } from '../../shared/schemas/user.js';
+import { roleSchema, sanitizeNotifyOn, normalizeContactEmail, type Role, type RequestQuotaMode } from '../../shared/schemas/user.js';
 import type { DefaultQuota, QuotaWindowDays } from '../../shared/schemas/connectors.js';
 import type { V1Book } from '../../shared/schemas/v1/books.js';
 import type { INarratorrClient } from './narratorr-client.js';
@@ -595,26 +595,7 @@ export class RequestService {
     const owed = await this.findAvailableAwaitingNotify(limit);
     for (const { request: row, notifyOn, email } of owed) {
       try {
-        // Permanent no-op — no email is owed. Settle so the row leaves the capped backlog (AC4).
-        if (!sanitizeNotifyOn(notifyOn).includes('available') || !email) {
-          await this.settleAvailableNotified(row.id);
-          continue;
-        }
-        // Pre-send ATTEMPTED breadcrumb (AC5): the fourth distinguishable outcome. Lets an operator
-        // tell an eligible row that was attempted (send in flight, terminal log pending) apart from
-        // one that was never reached — without it, an in-flight/interrupted attempt is invisible.
-        // Keyed on publicId, NEVER the recipient; paired at `info` with the `delivered` breadcrumb.
-        logger?.info({ request: row.publicId }, 'request.available: attempting requester email');
-        const outcome = await sender.send({ to: email, transition: 'available', request: { title: row.title, author: row.author } });
-        if (outcome === 'skipped-no-config') {
-          // GLOBAL, replayable: leave the marker null so a later sweep delivers once SMTP is set up.
-          logger?.warn({ request: row.publicId }, 'request.available: requester email skipped — no usable email notifier configured');
-          continue;
-        }
-        // delivered: record the prod-visible success breadcrumb, then settle the marker. A settle
-        // fault here throws into the catch below → marker stays null → a rare duplicate next tick.
-        logger?.info({ request: row.publicId }, 'request.available: requester email delivered');
-        await this.settleAvailableNotified(row.id);
+        await this.notifyOneAvailable(row, notifyOn, email, sender, logger);
       } catch (err) {
         // Transient SMTP failure (send threw) or a post-delivery marker-write fault. Never unwind the
         // sweep; leave the marker null so the row is re-attempted. redact() before logging: a send
@@ -622,6 +603,51 @@ export class RequestService {
         logger?.warn({ err: redact(err), request: row.publicId }, 'request.available: requester email attempt failed; will retry next sweep');
       }
     }
+  }
+
+  /**
+   * Settle-or-send one owed `available` row (issue #121 sweep body, extracted so the loop stays
+   * within the complexity budget). The caller wraps this in the per-row fire-and-forget guard; a
+   * throw here (transient SMTP failure, or a marker-write fault after delivery) leaves the marker
+   * null so the row is re-attempted next tick.
+   */
+  private async notifyOneAvailable(
+    row: RequestRow,
+    notifyOn: unknown,
+    email: string | null,
+    sender: NonNullable<RequestFailureNotifyDeps['requesterEmail']>,
+    logger: RequestFailureNotifyDeps['logger'],
+  ): Promise<void> {
+    // Normalize once (issue #120): the SAME `hasDeliverableContact` predicate the UI gates on,
+    // yielding the exact address we deliver to — so a padded/mixed-case legacy value is sent
+    // clean, and an unparseable one can never diverge the "available" signal from the send gate.
+    const to = normalizeContactEmail(email);
+    const optedIn = sanitizeNotifyOn(notifyOn).includes('available');
+    // Permanent no-op — not opted in, or no deliverable contact (null / empty / malformed /
+    // over-length legacy value). Settle so the row leaves the capped backlog (AC4); a redacted
+    // breadcrumb records an opted-in-but-undeliverable drop without ever logging the recipient.
+    if (!optedIn || !to) {
+      if (optedIn) {
+        logger?.debug({ request: row.publicId }, 'request.available: no deliverable contact email; settling as no-op');
+      }
+      await this.settleAvailableNotified(row.id);
+      return;
+    }
+    // Pre-send ATTEMPTED breadcrumb (AC5): the fourth distinguishable outcome. Lets an operator
+    // tell an eligible row that was attempted (send in flight, terminal log pending) apart from
+    // one that was never reached — without it, an in-flight/interrupted attempt is invisible.
+    // Keyed on publicId, NEVER the recipient; paired at `info` with the `delivered` breadcrumb.
+    logger?.info({ request: row.publicId }, 'request.available: attempting requester email');
+    const outcome = await sender.send({ to, transition: 'available', request: { title: row.title, author: row.author } });
+    if (outcome === 'skipped-no-config') {
+      // GLOBAL, replayable: leave the marker null so a later sweep delivers once SMTP is set up.
+      logger?.warn({ request: row.publicId }, 'request.available: requester email skipped — no usable email notifier configured');
+      return;
+    }
+    // delivered: record the prod-visible success breadcrumb, then settle the marker. A settle
+    // fault here throws into the caller's catch → marker stays null → a rare duplicate next tick.
+    logger?.info({ request: row.publicId }, 'request.available: requester email delivered');
+    await this.settleAvailableNotified(row.id);
   }
 
   private mapBookStatus(status: V1Book['status']): RequestStatus {

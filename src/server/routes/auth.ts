@@ -9,6 +9,7 @@ import {
   localCredentialsSchema,
   updateMeBodySchema,
   sanitizeNotifyOn,
+  hasDeliverableContact,
   type MeDto,
 } from '../../shared/schemas/user.js';
 import type { UserRow } from '../../db/schema.js';
@@ -59,7 +60,7 @@ export function registerAuthRoutes(app: FastifyInstance, deps: AppDeps): void {
   const buildMeDto = async (row: UserRow): Promise<MeDto> => {
     const quota = await deps.requests.quotaUsage(row.id, deps.requests.resolveQuota(row));
     const emailNotifyAvailable =
-      row.email !== null && selectEmailSource(await deps.connectorSettings.getNotificationsConfig()) !== null;
+      hasDeliverableContact(row.email) && selectEmailSource(await deps.connectorSettings.getNotificationsConfig()) !== null;
     return { ...deps.users.toDto(row), quota, notifyOn: sanitizeNotifyOn(row.notifyOn), emailNotifyAvailable };
   };
 
