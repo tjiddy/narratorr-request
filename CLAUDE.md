@@ -72,8 +72,10 @@ libSQL (SQLite) · Zod everywhere · TypeScript (strict) · ESM · tsup (server 
   `mapBookStatus` collapses narratorr's `BookStatus` (`imported` → `available`). Notifications are
   **fire-and-forget** — the dispatcher never throws into the request path.
 - **DB gotchas.** Migrations in `drizzle/` apply on boot (and via `pnpm db:migrate`). After a
-  `schema.ts` change run `pnpm db:generate` (drizzle-kit is interactive — needs a TTY; hand-author
-  the SQL + snapshot if scripting it). **Migrations are append-only once released** — never edit an
+  `schema.ts` change run `pnpm db:generate` — it runs fine without a TTY for adds/drops/creates
+  (and from-scratch squashes); it only prompts on **ambiguous renames** (an added+removed pair it
+  can't tell apart). There is no non-interactive flag for that case (drizzle-orm#2624 wishlist) —
+  resolve a rename as add + copy + drop, or `--custom` and hand-write the SQL. **Migrations are append-only once released** — never edit an
   applied migration (drizzle tracks by content hash, so an edited baseline won't re-run on an
   existing DB and the column silently never lands); add a new `NNNN_*.sql`. (The 1.0 baseline is a deliberate squash:
   pre-1.0 DBs are NOT auto-upgradable — fresh DB or manual export/import — and the baseline's

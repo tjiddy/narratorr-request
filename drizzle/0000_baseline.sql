@@ -7,7 +7,7 @@ CREATE TABLE `app_settings` (
 	`notify_config` text,
 	`connectors` text,
 	`updated_at` integer DEFAULT (unixepoch()) NOT NULL,
-	CONSTRAINT "default_quota_mode_limit" CHECK((`app_settings`.`default_quota_mode` = 'limited') = (`app_settings`.`default_quota_limit` IS NOT NULL) AND (`app_settings`.`default_quota_limit` IS NULL OR `app_settings`.`default_quota_limit` > 0))
+	CONSTRAINT "default_quota_mode_limit" CHECK(("app_settings"."default_quota_mode" = 'limited') = ("app_settings"."default_quota_limit" IS NOT NULL) AND ("app_settings"."default_quota_limit" IS NULL OR "app_settings"."default_quota_limit" > 0))
 );
 --> statement-breakpoint
 CREATE TABLE `requests` (
@@ -52,7 +52,7 @@ CREATE TABLE `users` (
 	`auto_approve` integer DEFAULT false NOT NULL,
 	`notify_on` text DEFAULT '[]' NOT NULL,
 	`created_at` integer DEFAULT (unixepoch()) NOT NULL,
-	CONSTRAINT "request_quota_mode_limit" CHECK((`users`.`request_quota_mode` = 'limited') = (`users`.`request_quota_limit` IS NOT NULL) AND (`users`.`request_quota_limit` IS NULL OR `users`.`request_quota_limit` > 0))
+	CONSTRAINT "request_quota_mode_limit" CHECK(("users"."request_quota_mode" = 'limited') = ("users"."request_quota_limit" IS NOT NULL) AND ("users"."request_quota_limit" IS NULL OR "users"."request_quota_limit" > 0))
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX `users_public_id_unique` ON `users` (`public_id`);--> statement-breakpoint
