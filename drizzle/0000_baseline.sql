@@ -22,11 +22,11 @@ CREATE TABLE `requests` (
 	`status` text DEFAULT 'pending' NOT NULL,
 	`narratorr_book_id` text,
 	`note` text,
-	`user_caused_failure` integer DEFAULT false NOT NULL,
 	`failure_reason` text,
 	`requested_at` integer DEFAULT (unixepoch()) NOT NULL,
 	`decided_at` integer,
 	`decided_by` integer,
+	`available_notified_at` integer,
 	FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON UPDATE no action ON DELETE cascade,
 	FOREIGN KEY (`decided_by`) REFERENCES `users`(`id`) ON UPDATE no action ON DELETE set null
 );
@@ -50,6 +50,7 @@ CREATE TABLE `users` (
 	`request_quota_mode` text DEFAULT 'inherit' NOT NULL,
 	`request_quota_limit` integer,
 	`auto_approve` integer DEFAULT false NOT NULL,
+	`notify_on` text DEFAULT '[]' NOT NULL,
 	`created_at` integer DEFAULT (unixepoch()) NOT NULL,
 	CONSTRAINT "request_quota_mode_limit" CHECK((`users`.`request_quota_mode` = 'limited') = (`users`.`request_quota_limit` IS NOT NULL) AND (`users`.`request_quota_limit` IS NULL OR `users`.`request_quota_limit` > 0))
 );

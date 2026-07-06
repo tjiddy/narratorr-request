@@ -50,7 +50,7 @@ async function applyStatements(client: Client, statements: string[]): Promise<vo
  * lets the caller seed rows against that pre-migration schema, then applies `target` alone so
  * assertions can prove the migration's data transform touched the right rows only.
  *
- * @param opts.target     migration tag to isolate, e.g. `0003_add_available_notified_at`
+ * @param opts.target     migration tag to isolate, e.g. `0001_add_some_column`
  * @param opts.seed       callback to insert rows against the schema built up to (excluding) target
  * @param opts.statements override the statements applied for `target` (defaults to the real
  *                        file); use `migrationStatements(target)` + a mutation for red-test checks

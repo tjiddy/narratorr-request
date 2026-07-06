@@ -1,1 +1,0 @@
-ALTER TABLE `users` ADD `notify_on` text DEFAULT '[]' NOT NULL;

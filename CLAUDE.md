@@ -75,8 +75,10 @@ libSQL (SQLite) · Zod everywhere · TypeScript (strict) · ESM · tsup (server 
   `schema.ts` change run `pnpm db:generate` (drizzle-kit is interactive — needs a TTY; hand-author
   the SQL + snapshot if scripting it). **Migrations are append-only once released** — never edit an
   applied migration (drizzle tracks by content hash, so an edited baseline won't re-run on an
-  existing DB and the column silently never lands); add a new `NNNN_*.sql`. (The 1.0.0 baseline
-  folded schema in place only because the rename forced a fresh DB.) Identity uniqueness is the
+  existing DB and the column silently never lands); add a new `NNNN_*.sql`. (The 1.0 baseline is a deliberate squash:
+  pre-1.0 DBs are NOT auto-upgradable — fresh DB or manual export/import — and the baseline's
+  fresh journal timestamp makes an old DB fail loudly at boot rather than silently skip. The
+  append-only rule applies from this baseline forward.) Identity uniqueness is the
   `(auth_provider, auth_subject)` index. **libSQL `:memory:` breaks across `db.transaction()`** —
   prefer atomic single statements in tests over transactions.
 

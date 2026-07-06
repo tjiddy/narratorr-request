@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "abb6da83-ee34-4601-96e1-54b32ceeee12",
+  "id": "b1d6ef5e-6d55-4e38-80cc-f3a776039b6f",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
     "app_settings": {
@@ -160,14 +160,6 @@
           "notNull": false,
           "autoincrement": false
         },
-        "user_caused_failure": {
-          "name": "user_caused_failure",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": false
-        },
         "failure_reason": {
           "name": "failure_reason",
           "type": "text",
@@ -192,6 +184,13 @@
         },
         "decided_by": {
           "name": "decided_by",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "available_notified_at": {
+          "name": "available_notified_at",
           "type": "integer",
           "primaryKey": false,
           "notNull": false,
@@ -366,6 +365,14 @@
           "notNull": true,
           "autoincrement": false,
           "default": false
+        },
+        "notify_on": {
+          "name": "notify_on",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'[]'"
         },
         "created_at": {
           "name": "created_at",

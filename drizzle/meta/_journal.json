@@ -5,29 +5,8 @@
     {
       "idx": 0,
       "version": "6",
-      "when": 1782182113916,
+      "when": 1783359885817,
       "tag": "0000_baseline",
-      "breakpoints": true
-    },
-    {
-      "idx": 1,
-      "version": "6",
-      "when": 1782182200000,
-      "tag": "0001_drop_user_caused_failure",
-      "breakpoints": true
-    },
-    {
-      "idx": 2,
-      "version": "6",
-      "when": 1782182300000,
-      "tag": "0002_add_notify_on",
-      "breakpoints": true
-    },
-    {
-      "idx": 3,
-      "version": "6",
-      "when": 1782182400000,
-      "tag": "0003_add_available_notified_at",
       "breakpoints": true
     }
   ]
