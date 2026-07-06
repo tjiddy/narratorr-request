@@ -137,7 +137,14 @@ export class NarratorrClient {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
 
+    // Keep the abort armed across BOTH the header read (`fetch`) and the body read
+    // (`res.text()`): the timeout must bound a narratorr that flushes headers then stalls
+    // the body, not just a slow-to-respond one. Clearing the timer in a `finally` that wraps
+    // both — and translating an abort raised by either — is why the body read sits inside
+    // this try. Everything after (JSON parse, error/contract handling) runs with the timer
+    // already cleared, so no path leaks it.
     let res: Response;
+    let text: string;
     try {
       res = await fetch(url, {
         method,
@@ -149,6 +156,7 @@ export class NarratorrClient {
         },
         ...(opts.body !== undefined ? { body: JSON.stringify(opts.body) } : {}),
       });
+      text = await res.text();
     } catch (err) {
       const reason = err instanceof Error && err.name === 'AbortError' ? 'timed out' : 'unreachable';
       throw new NarratorrError(0, 'NETWORK', `Narratorr ${method} ${path} ${reason}`);
@@ -156,7 +164,6 @@ export class NarratorrClient {
       clearTimeout(timer);
     }
 
-    const text = await res.text();
     let json: unknown;
     try {
       json = text ? JSON.parse(text) : undefined;

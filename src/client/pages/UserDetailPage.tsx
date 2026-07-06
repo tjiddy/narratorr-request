@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import type { UserDto } from '@shared/schemas/user';
+import { DEFAULT_LIMIT } from '@shared/schemas/v1/common';
 import { useMe, useUsers, useUpdateUser, useUserRequests } from '../hooks';
 import { Badge } from '../components/Badge';
 import { Button } from '../components/Button';
@@ -8,6 +9,8 @@ import { StatusBadge } from '../components/StatusBadge';
 import { EmptyState } from '../components/EmptyState';
 import { InboxIcon } from '../components/icons';
 import { requestFailureReason } from '../components/request-failure';
+import { PagedListFooter } from '../components/PagedListFooter';
+import { nextLimit } from '../components/paging';
 import {
   initRequestQuota,
   buildRequestQuota,
@@ -15,6 +18,7 @@ import {
   isRequestQuotaDirty,
   type RequestQuotaState,
 } from './parseQuota';
+import { selectUserDetailState } from './selectUserDetailState';
 import type { RequestQuotaMode } from '@shared/schemas/user';
 
 type UpdateUser = ReturnType<typeof useUpdateUser>;
@@ -23,10 +27,18 @@ type UserRequests = ReturnType<typeof useUserRequests>;
 export function UserDetailPage() {
   const { publicId } = useParams<{ publicId: string }>();
   const users = useUsers();
-  const user = users.data?.data.find((u) => u.publicId === publicId);
+  const state = selectUserDetailState(users, publicId);
 
-  if (users.isLoading) return <p className="text-sm text-muted-foreground/70">Loading…</p>;
-  if (!user) {
+  if (state.kind === 'loading') return <p className="text-sm text-muted-foreground/70">Loading…</p>;
+  if (state.kind === 'error') {
+    return (
+      <div className="flex flex-col gap-4">
+        <Link to="/users" className="text-sm text-muted-foreground hover:text-foreground">← Users</Link>
+        <p className="text-sm text-destructive">Could not load user.</p>
+      </div>
+    );
+  }
+  if (state.kind === 'not-found') {
     return (
       <div className="flex flex-col gap-4">
         <Link to="/users" className="text-sm text-muted-foreground hover:text-foreground">← Users</Link>
@@ -35,13 +47,14 @@ export function UserDetailPage() {
     );
   }
   // key on publicId so the editor state resets when navigating between users.
-  return <UserDetail key={user.publicId} user={user} />;
+  return <UserDetail key={state.user.publicId} user={state.user} />;
 }
 
 function UserDetail({ user }: { user: UserDto }) {
   const me = useMe();
   const update = useUpdateUser();
-  const requests = useUserRequests(user.publicId);
+  const [limit, setLimit] = useState(DEFAULT_LIMIT);
+  const requests = useUserRequests(user.publicId, limit);
 
   const isSelf = me.data?.publicId === user.publicId;
 
@@ -63,7 +76,12 @@ function UserDetail({ user }: { user: UserDto }) {
         <QuotaControl user={user} update={update} />
       </div>
 
-      <UserRequestsList requests={requests} username={user.username} />
+      <UserRequestsList
+        requests={requests}
+        username={user.username}
+        limit={limit}
+        onLoadMore={() => setLimit(nextLimit)}
+      />
     </div>
   );
 }
@@ -218,11 +236,22 @@ function QuotaControl({ user, update }: { user: UserDto; update: UpdateUser }) {
   );
 }
 
-function UserRequestsList({ requests, username }: { requests: UserRequests; username: string }) {
+function UserRequestsList({
+  requests,
+  username,
+  limit,
+  onLoadMore,
+}: {
+  requests: UserRequests;
+  username: string;
+  limit: number;
+  onLoadMore: () => void;
+}) {
   return (
     <div>
       <h2 className="mb-3 font-display text-lg font-semibold">Requests</h2>
       {requests.isLoading && <p className="text-sm text-muted-foreground/70">Loading…</p>}
+      {requests.error && <p className="text-sm text-destructive">Could not load requests.</p>}
       {requests.data && requests.data.data.length === 0 && (
         <EmptyState
           icon={InboxIcon}
@@ -231,6 +260,7 @@ function UserRequestsList({ requests, username }: { requests: UserRequests; user
         />
       )}
       {requests.data && requests.data.data.length > 0 && (
+        <>
         <ul className="flex flex-col gap-2">
           {requests.data.data.map((r) => {
             const failureReason = requestFailureReason(r);
@@ -254,6 +284,14 @@ function UserRequestsList({ requests, username }: { requests: UserRequests; user
             );
           })}
         </ul>
+        <PagedListFooter
+          loaded={requests.data.data.length}
+          total={requests.data.total}
+          limit={limit}
+          isFetching={requests.isFetching}
+          onLoadMore={onLoadMore}
+        />
+        </>
       )}
     </div>
   );

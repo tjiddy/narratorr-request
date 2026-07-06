@@ -12,7 +12,6 @@ const pidParams = z.object({ publicId: prefixedId('rq') });
 const userPidParams = z.object({ publicId: prefixedId('us') });
 const requestListSchema = listEnvelope(requestDtoSchema);
 const userListSchema = listEnvelope(userDtoSchema);
-const DEFAULT_LIMIT = 50;
 
 export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
   const a = app.withTypeProvider<ZodTypeProvider>();
@@ -25,8 +24,8 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
       requireAdmin(request);
       return deps.requests.list({
         ...(request.query.status !== undefined ? { status: request.query.status } : {}),
-        limit: request.query.limit ?? DEFAULT_LIMIT,
-        offset: request.query.offset ?? 0,
+        limit: request.query.limit,
+        offset: request.query.offset,
       });
     },
   );
@@ -90,8 +89,8 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AppDeps): void {
       return deps.requests.list({
         userId: user.id,
         ...(request.query.status !== undefined ? { status: request.query.status } : {}),
-        limit: request.query.limit ?? DEFAULT_LIMIT,
-        offset: request.query.offset ?? 0,
+        limit: request.query.limit,
+        offset: request.query.offset,
       });
     },
   );

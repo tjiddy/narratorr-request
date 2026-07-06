@@ -257,4 +257,22 @@ describe('makeOidcMapper', () => {
     const custom = makeOidcMapper('Custom', { usernameClaim: 'login' });
     expect(custom({ sub: 'X1' }, { login: 'fromUserinfo' })).toMatchObject({ username: 'fromUserinfo' });
   });
+
+  // issue #120: the email claim is now routed through the shared deliverability gate so a
+  // hostile/misconfigured IdP can never seed a garbage address the availability path would send to.
+  describe('email claim deliverability gate (issue #120)', () => {
+    it('maps a malformed email claim to null (never a stored garbage address)', () => {
+      expect(map({ sub: 'abc', email: 'not-an-email' }, null).email).toBeNull();
+    });
+
+    it('maps an over-length (>254) email claim to null', () => {
+      const over = `${'a'.repeat(250)}@example.com`; // 262 chars
+      expect(over.length).toBeGreaterThan(254);
+      expect(map({ sub: 'abc', email: over }, null).email).toBeNull();
+    });
+
+    it('normalizes a valid mixed-case/padded email claim (trim + lowercase)', () => {
+      expect(map({ sub: 'abc', email: '  T@X.COM ' }, null).email).toBe('t@x.com');
+    });
+  });
 });

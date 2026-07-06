@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { DEFAULT_LIMIT, MAX_LIMIT } from './v1/common.js';
 
 // =============================================================================
 // coverUrl SSRF guard. A request-supplied coverUrl is rendered as <img src> in
@@ -104,8 +105,9 @@ function isInternalHost(hostname: string): boolean {
   return false; // a regular DNS name — public (DNS rebinding is a known residual gap)
 }
 
-/** https scheme + non-internal host. Unparseable input fails the refine (never throws). */
-function isPublicHttpsUrl(value: string): boolean {
+/** https scheme + non-internal host. Unparseable input fails the refine (never throws).
+ *  Exported so the client can pre-drop a non-conforming cover instead of failing the create. */
+export function isPublicHttpsUrl(value: string): boolean {
   let url: URL;
   try {
     url = new URL(value);
@@ -135,8 +137,8 @@ export type RequestStatus = z.infer<typeof requestStatusSchema>;
 
 /**
  * "Open" = still occupying a quota slot and still de-duplicated against new
- * requests for the same book. `failed` is excluded here (refunded) unless it
- * was user-caused — that nuance lives in the quota query, not this list.
+ * requests for the same book. `failed` is excluded here (refunded) — a failed
+ * request never counts toward quota.
  */
 export const OPEN_REQUEST_STATUSES = ['pending', 'approved', 'acquiring', 'available'] as const;
 
@@ -180,10 +182,13 @@ export const decisionBodySchema = z
   .strict();
 export type DecisionBody = z.infer<typeof decisionBodySchema>;
 
+// The page-size default is single-sourced from common.ts (DEFAULT_LIMIT) and applied
+// HERE, so a list request that omits `limit`/`offset` parses to the 50/0 default and the
+// routes no longer carry their own fallback constants. `limit` stays bounded at MAX_LIMIT.
 export const requestListQuerySchema = z.object({
   status: requestStatusSchema.optional(),
-  limit: z.coerce.number().int().min(1).max(500).optional(),
-  offset: z.coerce.number().int().min(0).optional(),
+  limit: z.coerce.number().int().min(1).max(MAX_LIMIT).default(DEFAULT_LIMIT),
+  offset: z.coerce.number().int().min(0).default(0),
 });
 export type RequestListQuery = z.infer<typeof requestListQuerySchema>;
 

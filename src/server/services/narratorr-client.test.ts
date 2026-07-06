@@ -1,3 +1,5 @@
+import { createServer, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
 import { http, HttpResponse, delay } from 'msw';
 import { setupServer } from 'msw/node';
@@ -116,6 +118,46 @@ describe('NarratorrClient error handling', () => {
     expect(err).toBeInstanceOf(NarratorrError);
     expect((err as NarratorrError).upstreamCode).toBe('NETWORK');
     expect((err as NarratorrError).message).toMatch(/timed out$/);
+  });
+
+  it('times out a response whose body stalls past the timeout (not just its headers)', async () => {
+    // A real socket over native fetch is required here. MSW honors an abort only while its
+    // handler resolver is pending (the header-stall case above), and it re-buffers passthrough
+    // responses — so under MSW the abort always lands during `fetch()`, which can't tell the
+    // body-read path apart. We take MSW out of the loop for this one request.
+    //
+    // The timings are picked so the deadline splits the header read from the body read:
+    // headers + a partial body flush immediately (well under the 100ms `timeoutMs`, even with
+    // localhost connection setup), then the rest of the body lands at 400ms — past the deadline.
+    // Post-fix the abort lands inside `res.text()` at ~100ms → NETWORK/timed out. Pre-fix the
+    // timer was cleared once headers arrived, so the body read ran unbounded and would resolve
+    // the full JSON at 400ms → `searchMetadata` returns `[]` and the NarratorrError assertion
+    // fails. Auto-completing the body (rather than stalling forever) keeps that pre-fix failure
+    // a fast, controlled resolve instead of a hang against the test timeout.
+    let bodyTimer: ReturnType<typeof setTimeout> | undefined;
+    const stallServer = await new Promise<Server>((resolve) => {
+      const s = createServer((_req, res) => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.write('{"data":'); // headers + partial body flushed now; the rest is delayed
+        bodyTimer = setTimeout(() => res.end('[],"total":0}'), 400);
+      });
+      s.listen(0, '127.0.0.1', () => resolve(s));
+    });
+    const { port } = stallServer.address() as AddressInfo;
+    const stallBaseUrl = `http://127.0.0.1:${port}`;
+
+    server.close(); // restore native fetch so undici's real body-read abort applies
+    try {
+      const slow = new NarratorrClient({ baseUrl: stallBaseUrl, apiKey: 'test-key', timeoutMs: 100 });
+      const err = await slow.searchMetadata('x').catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(NarratorrError);
+      expect((err as NarratorrError).upstreamCode).toBe('NETWORK');
+      expect((err as NarratorrError).message).toMatch(/timed out$/);
+    } finally {
+      server.listen({ onUnhandledRequest: 'error' }); // re-arm MSW for the remaining tests
+      if (bodyTimer) clearTimeout(bodyTimer);
+      await new Promise<void>((resolve) => stallServer.close(() => resolve()));
+    }
   });
 
   it('rejects a 200 with a non-JSON body as NON_JSON', async () => {

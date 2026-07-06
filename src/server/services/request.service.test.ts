@@ -1,12 +1,14 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { and, eq } from 'drizzle-orm';
-import { RequestService, type RequestPolicy, type RequestFailureNotifyDeps } from './request.service.js';
+import { RequestService, sanitizeAutoApproveRoles, type RequestPolicy, type RequestFailureNotifyDeps } from './request.service.js';
 import { NarratorrError, type INarratorrClient } from './narratorr-client.js';
 import { UserService } from './user.service.js';
 import type { Notifier, NotificationPayload } from './notifications/index.js';
 import type { NotifierLogger } from './notifications/types.js';
+import type { RequesterEmailArgs, RequesterEmailSender, RequesterEmailOutcome } from './notifications/requester-email.js';
 import { createTestDb, insertUser } from '../test-support/db.js';
-import { requests } from '../../db/schema.js';
+import { requests, users } from '../../db/schema.js';
+import type { NotifiableTransition } from '../../shared/schemas/user.js';
 import type { Db } from '../../db/client.js';
 import type { V1Book } from '../../shared/schemas/v1/books.js';
 import type { V1System } from '../../shared/schemas/v1/system.js';
@@ -143,6 +145,81 @@ describe('list — admin queue status filter', () => {
   });
 });
 
+describe('list — offset paging + tie-stability (AC1/AC4)', () => {
+  /** Insert one request row directly (single statement — :memory: libSQL breaks across
+   *  db.transaction() per CLAUDE.md). `requestedAt` is settable to force second-resolution ties. */
+  const seedRequest = (userId: number, asin: string, requestedAt?: Date) =>
+    db.insert(requests).values({
+      publicId: `rq_${asin}`,
+      userId,
+      asin,
+      title: asin,
+      status: 'pending',
+      ...(requestedAt ? { requestedAt } : {}),
+    });
+
+  it('default page returns 50 rows with total = the full seeded count (unfiltered by the page limit)', async () => {
+    const user = await insertUser(db, { role: 'user' });
+    for (let i = 0; i < 55; i++) await seedRequest(user.id, `b${i}`);
+    const svc = new RequestService(db, client, policy());
+
+    const first = await svc.list({ userId: user.id, limit: 50, offset: 0 });
+    expect(first.data).toHaveLength(50);
+    expect(first.total).toBe(55); // total counts all matching rows, not just the page
+  });
+
+  it('adjacent offset pages cover the whole set with no overlap and no missing rows', async () => {
+    const user = await insertUser(db, { role: 'user' });
+    for (let i = 0; i < 55; i++) await seedRequest(user.id, `b${i}`);
+    const svc = new RequestService(db, client, policy());
+
+    const page1 = await svc.list({ userId: user.id, limit: 50, offset: 0 });
+    const page2 = await svc.list({ userId: user.id, limit: 50, offset: 50 });
+    expect(page2.data).toHaveLength(5); // last page = the remainder
+
+    const ids = [...page1.data, ...page2.data].map((r) => r.publicId);
+    expect(new Set(ids).size).toBe(55); // no duplicate publicId across the pages
+  });
+
+  it('tie stability: rows sharing a requestedAt second page in the exact desc(id) tiebreak order', async () => {
+    const user = await insertUser(db, { role: 'user' });
+    // All 12 rows share the SAME requestedAt second. Insert t0..t11 in order, so their
+    // autoincrement ids ascend with the suffix. The secondary sort key desc(requests.id)
+    // must therefore produce the strict reverse: t11, t10, …, t0.
+    const tied = new Date('2026-01-01T00:00:00.000Z');
+    for (let i = 0; i < 12; i++) await seedRequest(user.id, `t${i}`, tied);
+    const svc = new RequestService(db, client, policy());
+
+    const seen: string[] = [];
+    for (let offset = 0; offset < 12; offset += 5) {
+      const page = await svc.list({ userId: user.id, limit: 5, offset });
+      seen.push(...page.data.map((r) => r.publicId));
+    }
+    // Assert the CONCRETE tiebreak order, not just the distinct set: if desc(requests.id)
+    // were dropped, SQLite would fall back to ascending rowid (t0…t11) among the ties and
+    // this exact sequence would fail — so the assertion is mutation-sensitive to AC4's key.
+    const expected = Array.from({ length: 12 }, (_, i) => `rq_t${11 - i}`);
+    expect(seen).toEqual(expected);
+    // And, as a corollary, the pages neither drop nor duplicate a tied row.
+    expect(new Set(seen).size).toBe(12);
+  });
+
+  it('total respects the status filter — it counts filtered rows, not the table grand total', async () => {
+    const user = await insertUser(db, { role: 'user' });
+    // 3 rows in the approved lifecycle (APPROVED_REQUEST_STATUSES) + 2 pending.
+    await db.insert(requests).values({ publicId: 'rq_a', userId: user.id, asin: 'a', title: 'a', status: 'approved' });
+    await db.insert(requests).values({ publicId: 'rq_b', userId: user.id, asin: 'b', title: 'b', status: 'acquiring' });
+    await db.insert(requests).values({ publicId: 'rq_c', userId: user.id, asin: 'c', title: 'c', status: 'available' });
+    await db.insert(requests).values({ publicId: 'rq_d', userId: user.id, asin: 'd', title: 'd', status: 'pending' });
+    await db.insert(requests).values({ publicId: 'rq_e', userId: user.id, asin: 'e', title: 'e', status: 'pending' });
+    const svc = new RequestService(db, client, policy());
+
+    const approved = await svc.list({ userId: user.id, status: 'approved', limit: 50, offset: 0 });
+    expect(approved.total).toBe(3); // only the APPROVED_REQUEST_STATUSES rows, not all 5
+    expect(approved.data).toHaveLength(3);
+  });
+});
+
 describe('insert-time unique-violation race', () => {
   // The preflight findActiveDuplicate() at create():154 returns before insertRequest(),
   // so a pre-seeded duplicate alone only retests preflight dedupe and never reaches the
@@ -240,19 +317,19 @@ describe('quota enforcement (rolling window)', () => {
     await expect(svc.create(user.id, body('B2'))).resolves.toBeTruthy(); // no cap despite default of 1
   });
 
-  it('does not count denied or non-user-caused failures, but does count user-caused failures', async () => {
+  it('does not count denied or failed requests toward quota', async () => {
     const user = await insertUser(db, { role: 'user' });
     const svc = new RequestService(db, client, policy({ defaultQuota: { mode: 'limited', limit: 10 } }));
     // Seed four requests in various terminal states.
     await db.insert(requests).values([
       { publicId: 'rq_open', userId: user.id, asin: 'A1', title: 't', status: 'pending' },
       { publicId: 'rq_denied', userId: user.id, asin: 'A2', title: 't', status: 'denied' },
-      { publicId: 'rq_failrefund', userId: user.id, asin: 'A3', title: 't', status: 'failed', userCausedFailure: false },
-      { publicId: 'rq_failcharged', userId: user.id, asin: 'A4', title: 't', status: 'failed', userCausedFailure: true },
+      { publicId: 'rq_fail1', userId: user.id, asin: 'A3', title: 't', status: 'failed' },
+      { publicId: 'rq_fail2', userId: user.id, asin: 'A4', title: 't', status: 'failed' },
     ]);
     const usage = await svc.quotaUsage(user.id, { mode: 'limited', limit: 10 });
-    expect(usage.used).toBe(2); // pending + user-caused failure only
-    expect(usage.remaining).toBe(8);
+    expect(usage.used).toBe(1); // only the pending row; denied + both failed refund
+    expect(usage.remaining).toBe(9);
   });
 
   it('reports unlimited for auto-approve roles (limit & remaining null)', async () => {
@@ -393,7 +470,6 @@ describe('admin decisions + handoff', () => {
     await expect(svc.create(admin.id, body('B1'))).rejects.toBeInstanceOf(NarratorrError);
     const [row] = await db.select().from(requests).where(eq(requests.asin, 'B1'));
     expect(row?.status).toBe('failed');
-    expect(row?.userCausedFailure).toBe(false);
   });
 
   it('leaves a request `approved` on a TRANSIENT handoff error (5xx) for the poller to retry', async () => {
@@ -427,7 +503,6 @@ describe('handoff failure reasons (friendly per-code add-handoff errors)', () =>
       const [row] = await db.select().from(requests).where(eq(requests.asin, 'B1'));
       expect(row?.status).toBe('failed');
       expect(row?.failureReason).toBe(expected);
-      expect(row?.userCausedFailure).toBe(false);
       expect(row?.narratorrBookId).toBeNull();
     });
   }
@@ -440,7 +515,6 @@ describe('handoff failure reasons (friendly per-code add-handoff errors)', () =>
     const [row] = await db.select().from(requests).where(eq(requests.asin, 'B1'));
     expect(row?.status).toBe('failed');
     expect(row?.failureReason).toBe('some_new_code: a brand new reason');
-    expect(row?.userCausedFailure).toBe(false);
   });
 
   it('uses the generic fallback reason for a non-NarratorrError terminal throw', async () => {
@@ -451,7 +525,6 @@ describe('handoff failure reasons (friendly per-code add-handoff errors)', () =>
     const [row] = await db.select().from(requests).where(eq(requests.asin, 'B1'));
     expect(row?.status).toBe('failed');
     expect(row?.failureReason).toBe('handoff failed');
-    expect(row?.userCausedFailure).toBe(false);
   });
 
   it('writes a friendly reason when the added book itself comes back failed/missing', async () => {
@@ -819,5 +892,314 @@ describe('applyBook (poller reconciliation)', () => {
     const [fresh] = await db.select().from(requests).where(eq(requests.id, row!.id));
     expect(fresh?.status).toBe('acquiring');
     expect(fresh?.narratorrBookId).toBe('bk_new'); // late id persisted despite the null return
+  });
+});
+
+describe('sanitizeAutoApproveRoles — storage-boundary narrowing (tier 5)', () => {
+  it('passes a valid role array through unchanged, with no warn', () => {
+    const warn = vi.fn();
+    expect(sanitizeAutoApproveRoles(['admin', 'user'], { warn })).toEqual(['admin', 'user']);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('degrades a non-array to ["admin"] + exactly one warn', () => {
+    const warn = vi.fn();
+    expect(sanitizeAutoApproveRoles(42, { warn })).toEqual(['admin']);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it('degrades a non-array string to ["admin"] + exactly one warn', () => {
+    const warn = vi.fn();
+    expect(sanitizeAutoApproveRoles('admin', { warn })).toEqual(['admin']);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it('degrades an array containing an unrecognized role to ["admin"] + exactly one warn', () => {
+    const warn = vi.fn();
+    expect(sanitizeAutoApproveRoles(['nope'], { warn })).toEqual(['admin']);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('durable requester availability email sweep (#50/#121)', () => {
+  // A fake sender captures the send-one-email calls (default outcome: delivered); the SMTP-source/
+  // render internals are unit-tested separately in requester-email.test.ts. These assert the #121
+  // sweep contract: the sweep is the SOLE sender, at-most-once per request (durable marker), opt-in
+  // + contact gated, typed-outcome driven (delivered settles, skipped-no-config stays replayable),
+  // observable per-outcome without ever logging the recipient, and never throwing into the flow.
+  function availHarness() {
+    const send = vi.fn(async (_a: RequesterEmailArgs): Promise<RequesterEmailOutcome> => 'delivered');
+    const info = vi.fn();
+    const warn = vi.fn();
+    const debug = vi.fn();
+    const logger: NotifierLogger = { info, warn, error() {}, debug };
+    const deps = (over: Partial<RequesterEmailSender> = {}): RequestFailureNotifyDeps => ({
+      getNotifier: () => ({ notify: async () => {} } as unknown as Notifier),
+      users: new UserService(db),
+      requesterEmail: { send: over.send ?? send },
+      logger,
+    });
+    return { send, info, warn, debug, deps };
+  }
+
+  /** Opt a seeded user into `available` (or a given set) and set their contact email (nullable). */
+  async function optIn(id: number, email: string | null, on: NotifiableTransition[] = ['available']) {
+    await db.update(users).set({ email, notifyOn: on }).where(eq(users.id, id));
+  }
+
+  /** The durable settle marker for a request row, or null if still owed. */
+  async function markerOf(id: number): Promise<Date | null> {
+    const [row] = await db.select().from(requests).where(eq(requests.id, id));
+    return row?.availableNotifiedAt ?? null;
+  }
+
+  const importedBook: V1Book = { id: 'bk_1', title: 't', authors: [], narrators: [], status: 'imported' };
+
+  /** Seed a request row directly in a given status (bypasses create so tests target one edge). */
+  async function seedRequest(userId: number, status: RequestStatus, extra: Record<string, unknown> = {}) {
+    const [row] = await db
+      .insert(requests)
+      .values({ publicId: `rq_${status}_${userId}`, userId, asin: 'B1', title: 'A Book', author: 'Author', status, ...extra })
+      .returning();
+    return row!;
+  }
+
+  it('AC3 the transition edges no longer send directly — applyBook/handoff/recoverHandoff defer to the sweep', async () => {
+    const h = availHarness();
+    client.status = 'imported';
+    const svc = new RequestService(db, client, policy(), h.deps());
+
+    // poll edge: acquiring → available
+    const u1 = await insertUser(db, { role: 'user', username: 'a' });
+    await optIn(u1.id, 'a@example.com');
+    const acq = await seedRequest(u1.id, 'acquiring', { narratorrBookId: 'bk_1' });
+    expect(await svc.applyBook(acq, importedBook)).toBe('available');
+
+    // handoff immediate-available: approved → available on an already-imported book
+    const u2 = await insertUser(db, { role: 'admin', username: 'b' });
+    await optIn(u2.id, 'b@example.com');
+    const { row: handed } = await svc.create(u2.id, body('B2'));
+    expect(handed.status).toBe('available');
+
+    // recoverHandoff on a stranded approved row
+    const u3 = await insertUser(db, { role: 'user', username: 'c' });
+    await optIn(u3.id, 'c@example.com');
+    const stranded = await seedRequest(u3.id, 'approved', { asin: 'B3' });
+    expect(await svc.recoverHandoff(stranded)).toBe('recovered');
+
+    // None of the three transition edges sent — the sweep is the sole sender.
+    await new Promise((r) => setTimeout(r, 20));
+    expect(h.send).not.toHaveBeenCalled();
+
+    // The sweep now delivers all three owed availability emails, to the requester with user-facing copy.
+    await svc.sweepAvailableNotifications();
+    expect(h.send).toHaveBeenCalledTimes(3);
+    expect(h.send.mock.calls.map((c) => c[0]!.to).sort()).toEqual(['a@example.com', 'b@example.com', 'c@example.com']);
+    expect(h.send.mock.calls[0]![0]).toMatchObject({ transition: 'available', request: { title: 'A Book' } });
+  });
+
+  it('AC2 delivers a row committed available with a null marker (crash between commit and send) and settles it', async () => {
+    const h = availHarness();
+    const user = await insertUser(db, { role: 'user', username: 'todd' });
+    await optIn(user.id, 'todd@example.com');
+    const svc = new RequestService(db, client, policy(), h.deps());
+    const row = await seedRequest(user.id, 'available', { narratorrBookId: 'bk_1' });
+
+    await svc.sweepAvailableNotifications();
+    expect(h.send).toHaveBeenCalledTimes(1);
+    expect(h.send.mock.calls[0]![0]).toMatchObject({ to: 'todd@example.com', transition: 'available' });
+    expect(await markerOf(row.id)).not.toBeNull();
+  });
+
+  it('AC1 a transient SMTP failure leaves the marker null; a later sweep delivers exactly once, then settles', async () => {
+    const h = availHarness();
+    let down = true;
+    const send = vi.fn(async (): Promise<RequesterEmailOutcome> => {
+      if (down) throw new Error('smtp down');
+      return 'delivered';
+    });
+    const user = await insertUser(db, { role: 'user', username: 'todd' });
+    await optIn(user.id, 'todd@example.com');
+    const svc = new RequestService(db, client, policy(), h.deps({ send }));
+    const row = await seedRequest(user.id, 'available', { narratorrBookId: 'bk_1' });
+
+    await svc.sweepAvailableNotifications(); // SMTP down → attempt throws
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(await markerOf(row.id)).toBeNull(); // stays null → replayable
+
+    down = false;
+    await svc.sweepAvailableNotifications(); // SMTP recovered → delivers, settles
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(await markerOf(row.id)).not.toBeNull();
+
+    await svc.sweepAvailableNotifications(); // settled → not re-attempted
+    expect(send).toHaveBeenCalledTimes(2); // exactly one DELIVERED send across the ticks
+  });
+
+  it('AC3 a delivered/settled row is not re-loaded or re-sent on the next sweep (atomic marker)', async () => {
+    const h = availHarness();
+    const user = await insertUser(db, { role: 'user', username: 'todd' });
+    await optIn(user.id, 'todd@example.com');
+    const svc = new RequestService(db, client, policy(), h.deps());
+    const row = await seedRequest(user.id, 'available', { narratorrBookId: 'bk_1' });
+
+    await svc.sweepAvailableNotifications();
+    expect(h.send).toHaveBeenCalledTimes(1);
+    expect(await svc.findAvailableAwaitingNotify()).toHaveLength(0); // settled → out of the backlog
+
+    await svc.sweepAvailableNotifications();
+    expect(h.send).toHaveBeenCalledTimes(1); // no second send
+    expect(await markerOf(row.id)).not.toBeNull();
+  });
+
+  it('AC3 a pre-settled row (marker already set) is never loaded by the finder or sent', async () => {
+    const h = availHarness();
+    const user = await insertUser(db, { role: 'user', username: 'todd' });
+    await optIn(user.id, 'todd@example.com');
+    const svc = new RequestService(db, client, policy(), h.deps());
+    await seedRequest(user.id, 'available', { narratorrBookId: 'bk_1', availableNotifiedAt: new Date() });
+
+    expect(await svc.findAvailableAwaitingNotify()).toHaveLength(0);
+    await svc.sweepAvailableNotifications();
+    expect(h.send).not.toHaveBeenCalled();
+  });
+
+  it('AC4 skipped-no-config leaves the marker null (replayable); a later sweep delivers once configured', async () => {
+    const h = availHarness();
+    let configured = false;
+    const send = vi.fn(async (): Promise<RequesterEmailOutcome> => (configured ? 'delivered' : 'skipped-no-config'));
+    const user = await insertUser(db, { role: 'user', username: 'todd' });
+    await optIn(user.id, 'todd@example.com');
+    const svc = new RequestService(db, client, policy(), h.deps({ send }));
+    const row = await seedRequest(user.id, 'available', { narratorrBookId: 'bk_1' });
+
+    await svc.sweepAvailableNotifications(); // no usable email notifier → skipped-no-config
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(await markerOf(row.id)).toBeNull(); // NOT settled — the backlog waits for config
+
+    configured = true;
+    await svc.sweepAvailableNotifications(); // now delivers, settles
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(await markerOf(row.id)).not.toBeNull();
+  });
+
+  it('AC4 permanent no-ops settle without a send (not opted in / opted-in with null email) and drop out of the backlog', async () => {
+    const h = availHarness();
+    const optedOut = await insertUser(db, { role: 'user', username: 'x' });
+    await optIn(optedOut.id, 'x@example.com', []); // has email, opted into nothing
+    const nullEmail = await insertUser(db, { role: 'user', username: 'y' });
+    await optIn(nullEmail.id, null); // opted in, but no contact
+    const svc = new RequestService(db, client, policy(), h.deps());
+    const r1 = await seedRequest(optedOut.id, 'available', { narratorrBookId: 'bk_1' });
+    const r2 = await seedRequest(nullEmail.id, 'available', { narratorrBookId: 'bk_2' });
+
+    await svc.sweepAvailableNotifications();
+    expect(h.send).not.toHaveBeenCalled();
+    expect(await markerOf(r1.id)).not.toBeNull(); // settled (no email owed)
+    expect(await markerOf(r2.id)).not.toBeNull();
+    expect(await svc.findAvailableAwaitingNotify()).toHaveLength(0); // cannot crowd the capped batch
+  });
+
+  it('AC5 logs a distinguishable, publicId-keyed breadcrumb per outcome and never logs the recipient', async () => {
+    const h = availHarness();
+    // Outcome is keyed off the recipient so one sweep exercises delivered / skipped / failed at once.
+    const send = vi.fn(async (a: RequesterEmailArgs): Promise<RequesterEmailOutcome> => {
+      if (a.to === 'skip@example.com') return 'skipped-no-config';
+      if (a.to === 'fail@example.com') throw new Error('smtp handshake reset');
+      return 'delivered';
+    });
+    const uD = await insertUser(db, { role: 'user', username: 'd' });
+    await optIn(uD.id, 'deliver@example.com');
+    const uS = await insertUser(db, { role: 'user', username: 's' });
+    await optIn(uS.id, 'skip@example.com');
+    const uF = await insertUser(db, { role: 'user', username: 'f' });
+    await optIn(uF.id, 'fail@example.com');
+    const svc = new RequestService(db, client, policy(), h.deps({ send }));
+    await seedRequest(uD.id, 'available', { narratorrBookId: 'bk_d', publicId: 'rq_deliver' });
+    await seedRequest(uS.id, 'available', { narratorrBookId: 'bk_s', publicId: 'rq_skip' });
+    await seedRequest(uF.id, 'available', { narratorrBookId: 'bk_f', publicId: 'rq_fail' });
+
+    await svc.sweepAvailableNotifications();
+
+    const keyed = (calls: [unknown, unknown][], pid: string, re: RegExp) =>
+      calls.some((c) => (c[0] as { request?: string }).request === pid && re.test(String(c[1])));
+    // Every eligible row logs an `attempted` breadcrumb before the send (AC5 fourth outcome), keyed
+    // on publicId — so an in-flight/interrupted attempt is distinguishable from one never reached.
+    // Mutation-sensitive: dropping the pre-send log fails these three regardless of the terminal one.
+    for (const pid of ['rq_deliver', 'rq_skip', 'rq_fail']) {
+      expect(keyed(h.info.mock.calls as [unknown, unknown][], pid, /attempting/i)).toBe(true);
+    }
+    expect(keyed(h.info.mock.calls as [unknown, unknown][], 'rq_deliver', /delivered/i)).toBe(true);
+    expect(keyed(h.warn.mock.calls as [unknown, unknown][], 'rq_skip', /skipped/i)).toBe(true);
+    expect(keyed(h.warn.mock.calls as [unknown, unknown][], 'rq_fail', /attempt failed/i)).toBe(true);
+
+    // The recipient address is never present on ANY log line (obj or message), on any outcome.
+    for (const call of [...h.info.mock.calls, ...h.warn.mock.calls]) {
+      expect(JSON.stringify(call)).not.toContain('@example.com');
+    }
+  });
+
+  it('AC6 a per-row send rejection never throws out of the sweep; the marker stays null and later rows still run', async () => {
+    const h = availHarness();
+    const send = vi.fn(async (): Promise<RequesterEmailOutcome> => {
+      throw new Error('smtp down');
+    });
+    const u1 = await insertUser(db, { role: 'user', username: 'a' });
+    await optIn(u1.id, 'a@example.com');
+    const u2 = await insertUser(db, { role: 'user', username: 'b' });
+    await optIn(u2.id, 'b@example.com');
+    const svc = new RequestService(db, client, policy(), h.deps({ send }));
+    const r1 = await seedRequest(u1.id, 'available', { narratorrBookId: 'bk_1' });
+    const r2 = await seedRequest(u2.id, 'available', { narratorrBookId: 'bk_2' });
+
+    await expect(svc.sweepAvailableNotifications()).resolves.toBeUndefined();
+    expect(send).toHaveBeenCalledTimes(2); // both attempted despite the first throwing
+    expect(await markerOf(r1.id)).toBeNull();
+    expect(await markerOf(r2.id)).toBeNull();
+  });
+
+  it('issue #120 a legacy row with an UNPARSEABLE email is a silent no-op: no send, settled, status unchanged, no throw', async () => {
+    const h = availHarness();
+    const user = await insertUser(db, { role: 'user', username: 'todd' });
+    await optIn(user.id, 'not-an-email'); // opted in, but a persisted garbage contact
+    const svc = new RequestService(db, client, policy(), h.deps());
+    const row = await seedRequest(user.id, 'available', { narratorrBookId: 'bk_1' });
+
+    await expect(svc.sweepAvailableNotifications()).resolves.toBeUndefined();
+    expect(h.send).not.toHaveBeenCalled(); // never delivers to a non-deliverable contact
+    expect(await markerOf(row.id)).not.toBeNull(); // settled — drops out of the capped backlog
+    const [after] = await db.select().from(requests).where(eq(requests.id, row.id));
+    expect(after!.status).toBe('available'); // request status unchanged
+    // A redacted, publicId-keyed debug breadcrumb records the drop; the recipient is never logged.
+    expect(h.debug).toHaveBeenCalled();
+    for (const call of h.debug.mock.calls as [unknown, unknown][]) {
+      expect(JSON.stringify(call)).not.toContain('not-an-email');
+    }
+  });
+
+  it('issue #120 a legacy PADDED/mixed-case email is sent as its normalized form (not the raw stored string)', async () => {
+    const h = availHarness();
+    const user = await insertUser(db, { role: 'user', username: 'todd' });
+    await optIn(user.id, '  User@X.COM '); // parseable but not normalized at rest
+    const svc = new RequestService(db, client, policy(), h.deps());
+    const row = await seedRequest(user.id, 'available', { narratorrBookId: 'bk_1' });
+
+    await svc.sweepAvailableNotifications();
+    expect(h.send).toHaveBeenCalledTimes(1);
+    expect(h.send.mock.calls[0]![0]!.to).toBe('user@x.com'); // normalized value delivered, not the raw
+    expect(await markerOf(row.id)).not.toBeNull();
+  });
+
+  it('the sweep is a no-op when no requesterEmail dep is wired (failed-only construction unaffected)', async () => {
+    const user = await insertUser(db, { role: 'user', username: 'todd' });
+    await optIn(user.id, 'todd@example.com');
+    // notify deps present but no requesterEmail sender.
+    const svc = new RequestService(db, client, policy(), {
+      getNotifier: () => ({ notify: async () => {} } as unknown as Notifier),
+      users: new UserService(db),
+    });
+    const row = await seedRequest(user.id, 'available', { narratorrBookId: 'bk_1' });
+    await expect(svc.sweepAvailableNotifications()).resolves.toBeUndefined();
+    expect(await markerOf(row.id)).toBeNull(); // untouched — no sender to owe
   });
 });

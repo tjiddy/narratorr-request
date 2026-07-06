@@ -1,8 +1,8 @@
 # CLAUDE.md — narratorr-requests
 
 Operating notes for working in this codebase. The user-facing pitch + run instructions are in
-[`README.md`](README.md); this file is the conventions/gotchas an agent or contributor needs to
-not break things.
+[`README.md`](README.md); this file is the conventions/gotchas a contributor needs to not break
+things.
 
 ## What it is
 
@@ -97,7 +97,7 @@ up yet. narratorr is exercised via the MSW fixture.
 
 ## Cross-repo coordination
 
-narratorr (sibling repo, `develop`-based flow) owns the `/api/v1` contract; we vendor the subset we
-consume. Handoff/ask docs are **not** committed here (gitignored: `*HANDOFF*.md`, `*PLAN.md`,
-`REVIEW.md`) — they live in the narratorr repo or as issues. The durable spec on our side is the
-vendored Zod under `src/shared/schemas/v1/`.
+narratorr (the sibling project this app plugs into) owns the `/api/v1` contract; we vendor the
+subset we consume. The durable spec on our side is the vendored Zod under `src/shared/schemas/v1/`
+(it mirrors narratorr's own layout so it can lift into a shared `@narratorr/api-contract` package
+later). Planning and review scratch docs are kept out of the repo (see `.gitignore`).

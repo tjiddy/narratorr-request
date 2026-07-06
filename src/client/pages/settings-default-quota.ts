@@ -36,9 +36,6 @@ export const initDefaultQuota = (q: ConnectorSettingsDto['defaultQuota']): Defau
   unit: DAYS_UNIT[q.windowDays] ?? 'month',
 });
 
-/** The concrete rolling-window days for a unit (day=1, week=7, month=30). */
-export const unitToDays = (unit: QuotaUnit): number => UNIT_DAYS[unit];
-
 /** The `= N days` hint rendered next to the unit dropdown (e.g. month → `= 30 days`). */
 export const daysLabel = (unit: QuotaUnit): string => `= ${UNIT_DAYS[unit]} days`;
 

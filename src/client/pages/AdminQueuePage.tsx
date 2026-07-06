@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import type { RequestDto, RequestStatus } from '@shared/schemas/request';
 import { REQUEST_STATUSES } from '@shared/schemas/request';
+import { DEFAULT_LIMIT } from '@shared/schemas/v1/common';
 import { useAdminQueue, useDecide } from '../hooks';
 import { StatusBadge } from '../components/StatusBadge';
 import { REQUEST_STATUS_LABELS } from '../components/status';
@@ -8,6 +9,8 @@ import { EmptyState } from '../components/EmptyState';
 import { InboxIcon, HeadphonesIcon } from '../components/icons';
 import { Button } from '../components/Button';
 import { requestFailureReason } from '../components/request-failure';
+import { PagedListFooter } from '../components/PagedListFooter';
+import { nextLimit } from '../components/paging';
 
 function QueueRow({ r }: { r: RequestDto }) {
   const decide = useDecide();
@@ -113,7 +116,8 @@ function QueueRow({ r }: { r: RequestDto }) {
 
 export function AdminQueuePage() {
   const [filter, setFilter] = useState<RequestStatus | 'all'>('pending');
-  const { data, isLoading } = useAdminQueue(filter === 'all' ? undefined : filter);
+  const [limit, setLimit] = useState(DEFAULT_LIMIT);
+  const { data, isLoading, isFetching, error } = useAdminQueue(filter === 'all' ? undefined : filter, limit);
 
   return (
     <div>
@@ -121,7 +125,11 @@ export function AdminQueuePage() {
         <h1 className="font-display text-2xl font-semibold tracking-tight sm:text-3xl">Request queue</h1>
         <select
           value={filter}
-          onChange={(e) => setFilter(e.target.value as RequestStatus | 'all')}
+          onChange={(e) => {
+            // A new filter is a different list — reset the growing-limit back to the first page.
+            setFilter(e.target.value as RequestStatus | 'all');
+            setLimit(DEFAULT_LIMIT);
+          }}
           className="ml-auto rounded-xl border border-border bg-card px-2.5 py-1.5 text-sm text-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
         >
           <option value="all">All</option>
@@ -133,6 +141,7 @@ export function AdminQueuePage() {
         </select>
       </div>
       {isLoading && <p className="text-sm text-muted-foreground/70">Loading…</p>}
+      {error && <p className="text-sm text-destructive">Could not load the request queue.</p>}
       {data && data.data.length === 0 && (
         <EmptyState
           icon={InboxIcon}
@@ -141,11 +150,20 @@ export function AdminQueuePage() {
         />
       )}
       {data && data.data.length > 0 && (
-        <ul className="flex flex-col gap-3">
-          {data.data.map((r) => (
-            <QueueRow key={r.publicId} r={r} />
-          ))}
-        </ul>
+        <>
+          <ul className="flex flex-col gap-3">
+            {data.data.map((r) => (
+              <QueueRow key={r.publicId} r={r} />
+            ))}
+          </ul>
+          <PagedListFooter
+            loaded={data.data.length}
+            total={data.total}
+            limit={limit}
+            isFetching={isFetching}
+            onLoadMore={() => setLimit(nextLimit)}
+          />
+        </>
       )}
     </div>
   );

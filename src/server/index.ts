@@ -12,12 +12,13 @@ import { runMigrations } from '../db/migrate.js';
 import { createDb } from '../db/client.js';
 import { UserService } from './services/user.service.js';
 import { SettingsService } from './services/settings.service.js';
-import { RequestService, resolveRequestPolicy } from './services/request.service.js';
+import { RequestService, resolveRequestPolicy, sanitizeAutoApproveRoles } from './services/request.service.js';
 import { SearchService } from './services/search.service.js';
 import { StatusPoller } from './services/status-poller.js';
 import { NarratorrClient } from './services/narratorr-client.js';
 import { OidcService, makeOidcMapper, type OidcProfile } from './services/oidc.service.js';
 import { buildNotifier } from './services/notifications/index.js';
+import { RequesterEmailService } from './services/notifications/requester-email.js';
 import { ConnectorSettingsService } from './services/connector-settings.service.js';
 import { NarratorrClientHolder } from './services/narratorr-client-holder.js';
 import { SecretCodec, deriveSettingsKey } from './util/secret-codec.js';
@@ -28,7 +29,6 @@ import { buildHelmetOptions } from './plugins/helmet-options.js';
 import { registerRoutes } from './routes/index.js';
 import { errorBody } from '../shared/schemas/v1/common.js';
 import type { AppDeps } from './services/deps.js';
-import type { Role } from '../shared/schemas/user.js';
 import './types.js';
 
 async function main(): Promise<void> {
@@ -71,14 +71,19 @@ async function main(): Promise<void> {
   // narrowed values — a legacy/corrupt out-of-set window or non-positive limit degrades identically
   // on both paths. The seam is unit-tested (connector-settings.service.test.ts) so a regression to
   // the raw row fails a test rather than silently re-diverging.
+  // Requester-facing `available` email (issue #50). Reads the LIVE decrypted notifier config at
+  // send time (accessor, not captured) so it selects the current first-usable email notifier as
+  // its SMTP source after any Settings save. Never routes through the admin notifier/EmailChannel.
+  const requesterEmail = new RequesterEmailService(() => connectorSettings.getNotificationsConfig());
   const requests = new RequestService(
     db,
     narratorr,
-    await resolveRequestPolicy(connectorSettings, settingsRow.autoApproveRoles as Role[]),
+    await resolveRequestPolicy(connectorSettings, sanitizeAutoApproveRoles(settingsRow.autoApproveRoles, app.log)),
     // Live-notifier accessor (NOT a captured instance): the settings route reassigns
     // deps.notifier on every notifier-config save, so read it at dispatch time. The app
-    // logger makes a lost request.failed (rejected lookup/dispatch) diagnosable.
-    { getNotifier: () => deps.notifier, users, logger: app.log },
+    // logger makes a lost request.failed (rejected lookup/dispatch) diagnosable. `requesterEmail`
+    // adds the issue #50 available email — fire-and-forget, email-only, requester-scoped.
+    { getNotifier: () => deps.notifier, users, requesterEmail, logger: app.log },
   );
   const search = new SearchService(narratorr);
   // One OidcService per configured provider, keyed by id. Authorization is the approval

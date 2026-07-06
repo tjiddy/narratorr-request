@@ -1,5 +1,6 @@
 import * as oidc from 'openid-client';
 import { badGateway, badRequest } from '../util/errors.js';
+import { normalizeContactEmail } from '../../shared/schemas/user.js';
 
 export interface OidcServiceConfig {
   issuer: string;
@@ -187,7 +188,12 @@ export function makeOidcMapper(
     return {
       subject,
       username,
-      email: pick(mapping.emailClaim, ['email']) ?? null,
+      // Route the email claim through the shared deliverability gate: a malformed/over-length
+      // claim maps to null (never a stored garbage address the availability path would try to
+      // deliver to), and a valid claim is stored trimmed + lowercased (issue #120). An invalid
+      // *present* claim thus reaches `upsertFromOidc`'s `profile.email ?? existing.email` coalesce
+      // exactly like an absent claim — a returning user's last-known-good value is preserved.
+      email: normalizeContactEmail(pick(mapping.emailClaim, ['email'])),
       thumb: str(claims['picture']) ?? str(claims['thumb']) ?? str(ui['picture']) ?? null,
     };
   };

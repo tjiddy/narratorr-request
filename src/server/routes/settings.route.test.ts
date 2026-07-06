@@ -11,7 +11,11 @@ const { sendMail, createTransport } = vi.hoisted(() => {
 });
 vi.mock('nodemailer', () => ({ default: { createTransport } }));
 
+import { eq } from 'drizzle-orm';
 import { createTestDb } from '../test-support/db.js';
+import { appSettings } from '../../db/schema.js';
+import type { Db } from '../../db/client.js';
+import type { StoredConnectors } from '../../shared/schemas/connectors.js';
 import { SettingsService } from '../services/settings.service.js';
 import { ConnectorSettingsService } from '../services/connector-settings.service.js';
 import { SecretCodec, deriveSettingsKey } from '../util/secret-codec.js';
@@ -31,11 +35,12 @@ const USER: AuthUser = { id: 2, publicId: 'us_user', username: 'user', role: 'us
 
 let app: FastifyInstance;
 let deps: AppDeps;
+let db: Db;
 let connectorSettings: ConnectorSettingsService;
 let narratorr: NarratorrClientHolder;
 
 async function buildApp(): Promise<FastifyInstance> {
-  const db = await createTestDb();
+  db = await createTestDb();
   await new SettingsService(db).ensure();
   connectorSettings = new ConnectorSettingsService(db, codec);
   narratorr = new NarratorrClientHolder(null);
@@ -136,6 +141,21 @@ describe('settings routes — GET/PUT connectors', () => {
   it('PUT rejects the old ntfy/email/webhook slots (top-level .strict)', async () => {
     const res = await app.inject({ method: 'PUT', url: CONNECTORS_URL, headers: asAdmin, payload: { ntfy: { url: 'https://ntfy.sh', topic: 't' } } });
     expect(res.statusCode).toBe(400);
+  });
+
+  it('GET degrades a malformed stored connectors blob to 200 with notifiers: [] instead of 500ing (#93)', async () => {
+    // Seed a blob the envelope schema rejects (notifiers not an array) directly into the DB the
+    // harness built — the write path would never persist this, but a corrupt/hand-edited row can.
+    // The route boundary (ConnectorSettingsService.getDto → settings GET) must degrade, not 500.
+    await db
+      .update(appSettings)
+      .set({ connectors: { publicUrl: null, narratorr: null, notifiers: 42 } as unknown as StoredConnectors })
+      .where(eq(appSettings.id, 1));
+    const res = await app.inject({ method: 'GET', url: CONNECTORS_URL, headers: asAdmin });
+    expect(res.statusCode).toBe(200);
+    const dto = res.json();
+    expect(dto.narratorr).toBeNull();
+    expect(dto.notifiers).toEqual([]);
   });
 });
 

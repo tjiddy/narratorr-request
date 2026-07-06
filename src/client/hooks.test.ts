@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { RequestDto } from '@shared/schemas/request';
-import type { UserDto } from '@shared/schemas/user';
+import type { UserDto, MeDto } from '@shared/schemas/user';
 import type { ConnectorSettingsDto, TestConnectorResult } from '@shared/schemas/connectors';
 // Type-only namespace imports (erased at runtime, so they don't fight the mocks below) —
 // give importActual its return type without an inline `import()` annotation.
@@ -14,9 +14,17 @@ import type * as ReactModule from 'react';
 // is spied so we can assert the surfaced text.
 const hoisted = vi.hoisted(() => ({
   qc: { invalidateQueries: vi.fn(), setQueryData: vi.fn() },
-  // Spies for the local-auth boundary functions; the rest of `./api` is preserved
-  // (importActual) so `ApiError` and unrelated exports stay real.
-  api: { localLogin: vi.fn(), localSignup: vi.fn() },
+  // Spies for the local-auth boundary functions and the three request-list wrappers
+  // (so a paged hook's queryFn can be driven and its args asserted); the rest of `./api`
+  // is preserved (importActual) so `ApiError` and unrelated exports stay real.
+  api: {
+    localLogin: vi.fn(),
+    localSignup: vi.fn(),
+    listMyRequests: vi.fn(),
+    listAdminQueue: vi.fn(),
+    listUserRequests: vi.fn(),
+    updateMe: vi.fn(),
+  },
   // A module-scoped slot backing the test-only `react` useState mock so a re-invoked
   // `useTheme()` observes the value a prior `toggleTheme()` wrote.
   react: { slot: undefined as unknown, initialized: false },
@@ -26,6 +34,9 @@ vi.mock('@tanstack/react-query', () => ({
   useMutation: (options: unknown) => options,
   useQuery: (options: unknown) => options,
   useQueryClient: () => hoisted.qc,
+  // The paged hooks now pass a scoped `keepSameListData(key)` function rather than this
+  // sentinel (#115), but keep the export mocked so any incidental import still resolves.
+  keepPreviousData: (prev: unknown) => prev,
 }));
 vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 
@@ -33,7 +44,15 @@ vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 // only the two local-auth boundary functions with spies.
 vi.mock('./api', async (importActual) => {
   const actual = await importActual<typeof ApiModule>();
-  return { ...actual, localLogin: hoisted.api.localLogin, localSignup: hoisted.api.localSignup };
+  return {
+    ...actual,
+    localLogin: hoisted.api.localLogin,
+    localSignup: hoisted.api.localSignup,
+    listMyRequests: hoisted.api.listMyRequests,
+    listAdminQueue: hoisted.api.listAdminQueue,
+    listUserRequests: hoisted.api.listUserRequests,
+    updateMe: hoisted.api.updateMe,
+  };
 });
 
 // Test-only `react` mock: minimal stateful useState/useEffect so `useTheme()` runs
@@ -63,8 +82,11 @@ vi.mock('react', async (importActual) => {
 import { toast } from 'sonner';
 import {
   qk,
+  samePagedList,
+  keepSameListData,
   useRequestBook,
   useUpdateUser,
+  useUpdateMe,
   useDecide,
   useUpdateConnectors,
   useTestConnector,
@@ -73,6 +95,14 @@ import {
   useDeleteNotifier,
   useTestNotifier,
   useSearch,
+  useMyRequests,
+  useMyRequestsPaged,
+  useAdminQueue,
+  useUserRequests,
+  useUsers,
+  useConnectorSettings,
+  useSystemInfo,
+  useAuthProviders,
   useLocalAuth,
   useTheme,
 } from './hooks';
@@ -96,12 +126,21 @@ interface MutationOptions {
 }
 const mut = (hook: unknown): MutationOptions => hook as MutationOptions;
 
-// `useQuery` now returns the raw options too — read the derived enabled/queryKey.
+// `useQuery` now returns the raw options too — read the derived enabled/queryKey plus the
+// paging wiring (queryFn / refetchInterval / placeholderData) the paged hooks set.
 interface QueryOptions {
   enabled: boolean;
   queryKey: unknown;
+  queryFn: () => unknown;
+  refetchInterval?: number;
+  placeholderData?: unknown;
 }
 const query = (hook: unknown): QueryOptions => hook as QueryOptions;
+
+// The scoped `placeholderData` is a function `(prev, prevQuery) => data`. Cast it out of the
+// `unknown` slot so a test can drive it directly (node-only — no render harness).
+type PlaceholderFn = (prev: unknown, prevQuery?: { queryKey: readonly unknown[] }) => unknown;
+const placeholder = (q: QueryOptions): PlaceholderFn => q.placeholderData as PlaceholderFn;
 
 // Minimal cast helpers — the callbacks only read the few fields we set.
 const req = (over: Partial<RequestDto>): RequestDto => ({ title: 'Dune', status: 'pending', ...over } as RequestDto);
@@ -128,6 +167,178 @@ describe('qk query-key builders', () => {
   it('collapses an absent admin-queue status to "all"', () => {
     expect(qk.adminQueue(undefined)).toEqual(['admin', 'requests', 'all']);
     expect(qk.adminQueue('pending')).toEqual(['admin', 'requests', 'pending']);
+  });
+
+  // Registry stability (AC5): each moved key's serialized value must equal its former
+  // inline literal, so the centralization refactor churns no cache keys.
+  it('preserves the serialized value of every centralized key (no cache-key churn)', () => {
+    expect(qk.adminRequests).toEqual(['admin', 'requests']);
+    expect(qk.users).toEqual(['admin', 'users']);
+    expect(qk.connectors).toEqual(['admin', 'settings', 'connectors']);
+    expect(qk.system).toEqual(['admin', 'system']);
+    expect(qk.authProviders).toEqual(['auth', 'providers']);
+  });
+});
+
+// F2 — pin the AC-critical paged hook wiring so a future edit can't silently drop the
+// limit-keyed cache, the `{ limit }` pass-through, the polling interval, or the scoped
+// placeholder. The mocked useQuery returns its raw options, so we read queryKey/queryFn/etc.
+// directly and drive queryFn against the mocked api spies (node-only — no jsdom/component
+// modality).
+describe('paged request list hooks — key isolation, limit pass-through, polling, scoped placeholder', () => {
+  it('useMyRequestsPaged keys by limit, passes { limit }, polls at 4s, scopes the placeholder', async () => {
+    const q = query(useMyRequestsPaged(100));
+    expect(q.queryKey).toEqual(qk.myRequestsPaged(100));
+    expect(q.queryKey).toEqual(['requests', 'mine', 'paged', 100]);
+    // Nests under the bare `['requests','mine']` prefix a request mutation invalidates,
+    // so invalidating that prefix still refetches every loaded page.
+    expect((q.queryKey as unknown[]).slice(0, 2)).toEqual(qk.myRequests);
+    expect(q.refetchInterval).toBe(4000);
+    // No longer the bare keepPreviousData sentinel — a scoped function closing over the key.
+    expect(typeof q.placeholderData).toBe('function');
+    await q.queryFn();
+    expect(hoisted.api.listMyRequests).toHaveBeenCalledWith({ limit: 100 });
+  });
+
+  it('bare useMyRequests (Search) stays on the bare key and requests the bare API — no limit (AC5)', async () => {
+    const q = query(useMyRequests());
+    expect(q.queryKey).toEqual(qk.myRequests);
+    expect(q.refetchInterval).toBe(4000);
+    await q.queryFn();
+    expect(hoisted.api.listMyRequests).toHaveBeenCalledWith(); // no args → bare /api/requests
+  });
+
+  it('useAdminQueue keys by status+limit, passes status+{ limit }, polls at 5s, scopes the placeholder', async () => {
+    const q = query(useAdminQueue('pending', 100));
+    expect(q.queryKey).toEqual(qk.adminQueuePaged('pending', 100));
+    expect(q.queryKey).toEqual(['admin', 'requests', 'pending', 100]);
+    expect(q.refetchInterval).toBe(5000);
+    expect(typeof q.placeholderData).toBe('function');
+    await q.queryFn();
+    expect(hoisted.api.listAdminQueue).toHaveBeenCalledWith('pending', { limit: 100 });
+  });
+
+  it('useAdminQueue collapses an absent status to the "all" key and nests under the admin-requests prefix', async () => {
+    const q = query(useAdminQueue(undefined, 50));
+    expect(q.queryKey).toEqual(['admin', 'requests', 'all', 50]);
+    expect((q.queryKey as unknown[]).slice(0, 2)).toEqual(['admin', 'requests']);
+    await q.queryFn();
+    expect(hoisted.api.listAdminQueue).toHaveBeenCalledWith(undefined, { limit: 50 });
+  });
+
+  it('useUserRequests keys by user+limit, passes { limit }, scopes the placeholder', async () => {
+    const q = query(useUserRequests('us_abc', 150));
+    expect(q.queryKey).toEqual(qk.userRequests('us_abc', 150));
+    expect(q.queryKey).toEqual(['admin', 'users', 'us_abc', 'requests', 150]);
+    expect(typeof q.placeholderData).toBe('function');
+    await q.queryFn();
+    expect(hoisted.api.listUserRequests).toHaveBeenCalledWith('us_abc', { limit: 150 });
+  });
+});
+
+// #115 — the scoped placeholder comparator. `keepPreviousData` was over-applied: a filter
+// or user switch (a non-limit key-segment change) briefly rendered the prior list's rows as
+// current instead of "Loading…". `samePagedList` / `keepSameListData` restrict the retention
+// to a growing-limit page of the *same* list. Pure logic — driven directly (node-only).
+describe('samePagedList — retain only across a limit change of the same list', () => {
+  it('is true when the keys differ only in the trailing (limit) element', () => {
+    expect(samePagedList(['admin', 'requests', 'pending', 50], ['admin', 'requests', 'pending', 100])).toBe(true);
+  });
+
+  it('is false when a non-limit segment differs (filter switch)', () => {
+    expect(samePagedList(['admin', 'requests', 'pending', 50], ['admin', 'requests', 'active', 50])).toBe(false);
+  });
+
+  it('is false when a non-limit segment differs (user switch)', () => {
+    expect(
+      samePagedList(['admin', 'users', 'us_a', 'requests', 50], ['admin', 'users', 'us_b', 'requests', 50]),
+    ).toBe(false);
+  });
+
+  it('is false when the key lengths differ', () => {
+    expect(samePagedList(['admin', 'requests', 'pending', 50], ['admin', 'requests', 'pending'])).toBe(false);
+  });
+});
+
+describe('keepSameListData — drop the placeholder across a filter/user switch, keep it on limit growth', () => {
+  const prevData = [{ title: 'Dune' }];
+
+  it('returns the prev data when the prior query is the same list at a different limit', () => {
+    const fn = keepSameListData(['admin', 'requests', 'pending', 100]);
+    expect(fn(prevData, { queryKey: ['admin', 'requests', 'pending', 50] })).toBe(prevData);
+  });
+
+  it('returns undefined when a non-limit segment differs (loading returns)', () => {
+    const fn = keepSameListData(['admin', 'requests', 'pending', 50]);
+    expect(fn(prevData, { queryKey: ['admin', 'requests', 'active', 50] })).toBeUndefined();
+  });
+
+  it('returns undefined when there is no prior data', () => {
+    const fn = keepSameListData(['admin', 'requests', 'pending', 100]);
+    expect(fn(undefined, { queryKey: ['admin', 'requests', 'pending', 50] })).toBeUndefined();
+  });
+
+  it('returns undefined when the prior query is absent', () => {
+    const fn = keepSameListData(['admin', 'requests', 'pending', 100]);
+    expect(fn(prevData, undefined)).toBeUndefined();
+  });
+});
+
+// AC1/AC2/AC3/AC4 — drive each hook's actual `placeholderData` function with a prior query to
+// prove the wired-in behavior: filter/user switch drops the placeholder (loading returns),
+// limit growth of the same list keeps it (Load-more retention preserved).
+describe('paged hooks scope the placeholder to same-list limit growth', () => {
+  const prevData = [{ title: 'Dune' }];
+
+  it('useAdminQueue drops the placeholder on a filter switch but keeps it on limit growth', () => {
+    const fn = placeholder(query(useAdminQueue('pending', 100)));
+    // Prior page was the `active` filter → different list → loading returns.
+    expect(fn(prevData, { queryKey: ['admin', 'requests', 'active', 50] })).toBeUndefined();
+    // Prior page was the same `pending` filter at a smaller limit → retain the rows.
+    expect(fn(prevData, { queryKey: ['admin', 'requests', 'pending', 50] })).toBe(prevData);
+  });
+
+  it('useUserRequests drops the placeholder on a user switch but keeps it on limit growth', () => {
+    const fn = placeholder(query(useUserRequests('us_b', 150)));
+    // Prior page was a different user → loading returns.
+    expect(fn(prevData, { queryKey: ['admin', 'users', 'us_a', 'requests', 50] })).toBeUndefined();
+    // Prior page was the same user at a smaller limit → retain the rows.
+    expect(fn(prevData, { queryKey: ['admin', 'users', 'us_b', 'requests', 50] })).toBe(prevData);
+  });
+
+  it('useMyRequestsPaged (limit-only key) still keeps the prev data across a limit change (AC3/AC4)', () => {
+    const fn = placeholder(query(useMyRequestsPaged(100)));
+    expect(fn(prevData, { queryKey: ['requests', 'mine', 'paged', 50] })).toBe(prevData);
+  });
+});
+
+// AC1/AC3 — the query hooks whose keys moved into `qk` must read from the registry entry,
+// and the two broad invalidations (users, admin-requests) must stay prefixes of the paged
+// keys they refresh. Reading `.queryKey` off the mocked useQuery options (no jsdom).
+describe('centralized read-site keys + prefix guards', () => {
+  it('useUsers keys on qk.users, a prefix of qk.userRequests', () => {
+    expect(query(useUsers()).queryKey).toEqual(qk.users);
+    // Broad invalidate of qk.users still refreshes every per-user request list.
+    expect(qk.userRequests('us_abc', 150).slice(0, qk.users.length)).toEqual(qk.users);
+  });
+
+  it('qk.adminRequests is a prefix of both admin-queue key variants', () => {
+    expect(qk.adminQueue('pending').slice(0, qk.adminRequests.length)).toEqual(qk.adminRequests);
+    expect(qk.adminQueue(undefined).slice(0, qk.adminRequests.length)).toEqual(qk.adminRequests);
+    expect(qk.adminQueuePaged('pending', 100).slice(0, qk.adminRequests.length)).toEqual(qk.adminRequests);
+    expect(qk.adminQueuePaged(undefined, 50).slice(0, qk.adminRequests.length)).toEqual(qk.adminRequests);
+  });
+
+  it('useConnectorSettings keys on qk.connectors', () => {
+    expect(query(useConnectorSettings()).queryKey).toEqual(qk.connectors);
+  });
+
+  it('useSystemInfo keys on qk.system', () => {
+    expect(query(useSystemInfo()).queryKey).toEqual(qk.system);
+  });
+
+  it('useAuthProviders keys on qk.authProviders', () => {
+    expect(query(useAuthProviders()).queryKey).toEqual(qk.authProviders);
   });
 });
 
@@ -163,9 +374,11 @@ describe('useDecide', () => {
     expect(success).toHaveBeenCalledWith('Approved “Dune”');
     h.onSuccess(req({ title: 'Dune' }), { action: 'deny' });
     expect(success).toHaveBeenCalledWith('Denied “Dune”');
-    // DRY-1 guard: the hardcoded invalidation tuple must match qk.adminQueue's prefix.
-    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['admin', 'requests'] });
-    expect(qk.adminQueue(undefined).slice(0, 2)).toEqual(['admin', 'requests']);
+    // DRY-1 guard: the invalidation keys on qk.adminRequests, which stays a prefix of
+    // both admin-queue key variants so every loaded queue page still refetches.
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.adminRequests });
+    expect(qk.adminQueue(undefined).slice(0, qk.adminRequests.length)).toEqual(qk.adminRequests);
+    expect(qk.adminQueuePaged('pending', 100).slice(0, qk.adminRequests.length)).toEqual(qk.adminRequests);
   });
 
   it('surfaces ApiError message, else "Action failed", on error', () => {
@@ -183,7 +396,7 @@ describe('useUpdateUser', () => {
   it('toasts the saved username and invalidates admin/users', () => {
     cb(useUpdateUser()).onSuccess(user);
     expect(success).toHaveBeenCalledWith('Saved changes to todd');
-    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['admin', 'users'] });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.users });
   });
 
   it('surfaces ApiError message, else "Failed to update user", on error', () => {
@@ -195,12 +408,41 @@ describe('useUpdateUser', () => {
   });
 });
 
+describe('useUpdateMe — requester opt-in save (#50)', () => {
+  // F2 — the mutation owns observable behavior beyond the pure toggle helpers: it dispatches
+  // the PATCH via `updateMe`, writes the returned MeDto straight into the `qk.me` cache (so the
+  // control + nudge reflect the new set immediately), and surfaces success/error toasts. Node-only
+  // (mocked useMutation returns raw options), mirroring the other mutation-hook tests here.
+  const dto = { notifyOn: ['available'], emailNotifyAvailable: true } as unknown as MeDto;
+
+  it('dispatches updateMe with the exact opt-in body', () => {
+    mut(useUpdateMe()).mutationFn({ notifyOn: ['available'] } as never);
+    expect(hoisted.api.updateMe).toHaveBeenCalledWith({ notifyOn: ['available'] });
+  });
+
+  it('writes the returned DTO into the me cache directly (not invalidate) and toasts success', () => {
+    cb(useUpdateMe()).onSuccess(dto);
+    expect(hoisted.qc.setQueryData).toHaveBeenCalledWith(qk.me, dto);
+    expect(hoisted.qc.setQueryData).toHaveBeenCalledWith(['me'], dto); // key verbatim, no drift
+    expect(success).toHaveBeenCalledWith('Notification preferences saved');
+    expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalled();
+  });
+
+  it('surfaces ApiError message, else "Could not save preferences", on error', () => {
+    const h = cb(useUpdateMe());
+    h.onError(new ApiError(400, 'B', 'bad opt-in'));
+    expect(error).toHaveBeenCalledWith('bad opt-in');
+    h.onError(new Error('x'));
+    expect(error).toHaveBeenCalledWith('Could not save preferences');
+  });
+});
+
 describe('useUpdateConnectors', () => {
   const dto = { publicUrl: null } as ConnectorSettingsDto;
 
   it('writes the connectors cache directly (not invalidate) and toasts "Settings saved"', () => {
     cb(useUpdateConnectors()).onSuccess(dto);
-    expect(hoisted.qc.setQueryData).toHaveBeenCalledWith(['admin', 'settings', 'connectors'], dto);
+    expect(hoisted.qc.setQueryData).toHaveBeenCalledWith(qk.connectors, dto);
     expect(success).toHaveBeenCalledWith('Settings saved');
     expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalled();
   });
@@ -235,12 +477,12 @@ describe('useTestConnector', () => {
 describe('notifier mutation hooks — cache invalidation + toast contract', () => {
   // The notifier list is carried by the connectors query, so create/update/delete must
   // invalidate that exact key (not setQueryData) to refetch the committed list + reset
-  // freshly-masked secrets. Pin the verbatim key so a drift would fail here.
-  const CONNECTORS_KEY = ['admin', 'settings', 'connectors'];
+  // freshly-masked secrets. All three assert the shared qk.connectors entry, so a drift
+  // between the four connectors sites would fail here.
 
   it('useCreateNotifier invalidates the connectors key and toasts "Notifier added"', () => {
     cb(useCreateNotifier()).onSuccess();
-    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: CONNECTORS_KEY });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
     expect(hoisted.qc.setQueryData).not.toHaveBeenCalled();
     expect(success).toHaveBeenCalledWith('Notifier added');
   });
@@ -255,7 +497,7 @@ describe('notifier mutation hooks — cache invalidation + toast contract', () =
 
   it('useUpdateNotifier invalidates the connectors key and toasts "Notifier saved"', () => {
     cb(useUpdateNotifier()).onSuccess();
-    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: CONNECTORS_KEY });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
     expect(success).toHaveBeenCalledWith('Notifier saved');
   });
 
@@ -269,7 +511,7 @@ describe('notifier mutation hooks — cache invalidation + toast contract', () =
 
   it('useDeleteNotifier invalidates the connectors key and toasts "Notifier deleted"', () => {
     cb(useDeleteNotifier()).onSuccess();
-    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: CONNECTORS_KEY });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
     expect(success).toHaveBeenCalledWith('Notifier deleted');
   });
 

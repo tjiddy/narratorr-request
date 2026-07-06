@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { UserService } from './user.service.js';
-import type { OidcProfile } from './oidc.service.js';
+import { makeOidcMapper, type OidcProfile } from './oidc.service.js';
 import { createTestDb, insertUser } from '../test-support/db.js';
 import type { Db } from '../../db/client.js';
 
@@ -96,6 +96,41 @@ describe('UserService OIDC upsert + approval queue', () => {
     expect(again.created).toBe(false); // returning login — not a new signup, no notification
     expect(again.user.id).toBe(created.user.id);
     expect(again.user).toMatchObject({ username: 'new-name', email: 'new@x.com' });
+  });
+
+  // issue #120: an OIDC email claim now passes through the deliverability gate in the mapper
+  // before reaching upsert. These pin the mapper→upsert chain: a garbage/over-length claim maps
+  // to null, and null routes through the existing coalesce exactly like an absent claim.
+  describe('email deliverability at OIDC storage (issue #120)', () => {
+    const map = makeOidcMapper('Test');
+
+    it('a returning identity whose IdP now emits a malformed claim keeps its last-known-good email', async () => {
+      const created = await svc.upsertFromOidc('plex', prof('p1', 'todd', 'good@x.com'));
+      // A later login where the IdP emits garbage → mapper yields email: null → coalesce preserves.
+      const reauth = await svc.upsertFromOidc('plex', map({ sub: 'p1', email: 'not-an-email' }, null));
+      expect(reauth.user.id).toBe(created.user.id);
+      expect(reauth.user.email).toBe('good@x.com'); // preserved, never overwritten with garbage
+    });
+
+    it('a returning identity whose IdP now emits an over-length claim keeps its last-known-good email', async () => {
+      await svc.upsertFromOidc('plex', prof('p1', 'todd', 'good@x.com'));
+      const over = `${'a'.repeat(250)}@example.com`;
+      const reauth = await svc.upsertFromOidc('plex', map({ sub: 'p1', email: over }, null));
+      expect(reauth.user.email).toBe('good@x.com');
+    });
+
+    it('a NEW identity whose first claim is malformed is stored with a null email (no garbage persisted)', async () => {
+      await svc.upsertFromOidc('plex', prof('first', 'admin')); // first user, becomes admin
+      const created = await svc.upsertFromOidc('plex', map({ sub: 'p2', preferred_username: 'bob', email: 'garbage' }, null));
+      expect(created.created).toBe(true);
+      expect(created.user.email).toBeNull();
+    });
+
+    it('a NEW identity with a valid mixed-case/padded claim stores the normalized address', async () => {
+      await svc.upsertFromOidc('plex', prof('first', 'admin'));
+      const created = await svc.upsertFromOidc('plex', map({ sub: 'p3', preferred_username: 'sam', email: '  Sam@X.COM ' }, null));
+      expect(created.user.email).toBe('sam@x.com');
+    });
   });
 
   it('freezes profile metadata for a rejected user on re-login', async () => {

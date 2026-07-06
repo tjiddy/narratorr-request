@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { buildRouteApp, type RouteHarness } from '../test-support/route-harness.js';
 import { registerHealthRoutes } from './health.js';
 
-// The readiness probe leia/Portainer polls — both the db:ok → 200 and db:down → 503 branches
+// The readiness probe a container orchestrator / load balancer polls — both the db:ok → 200 and db:down → 503 branches
 // matter, and `narratorrConfigured`/`authMode` must be top-level fields the probe can read.
 let h: RouteHarness;
 beforeEach(async () => {

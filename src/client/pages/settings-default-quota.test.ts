@@ -1,7 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
   UNIT_DAYS,
-  unitToDays,
   daysLabel,
   buildDefaultQuota,
   initDefaultQuota,
@@ -14,9 +13,6 @@ const state = (over: Partial<DefaultQuotaState> = {}): DefaultQuotaState => ({ m
 
 describe('unit ↔ days mapping', () => {
   it('maps each unit to its fixed day count (day=1, week=7, month=30)', () => {
-    expect(unitToDays('day')).toBe(1);
-    expect(unitToDays('week')).toBe(7);
-    expect(unitToDays('month')).toBe(30);
     expect(UNIT_DAYS).toEqual({ day: 1, week: 7, month: 30 });
   });
 

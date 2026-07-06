@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { createRequestBodySchema, decisionBodySchema } from './request.js';
+import { createRequestBodySchema, decisionBodySchema, requestListQuerySchema } from './request.js';
+import { DEFAULT_LIMIT, MAX_LIMIT } from './v1/common.js';
 
 describe('createRequestBodySchema', () => {
   const valid = { asin: 'B08GB58KD5', title: 'Project Hail Mary' };
@@ -148,6 +149,38 @@ describe('createRequestBodySchema', () => {
     it('rejects an unknown key', () => {
       expect(createRequestBodySchema.safeParse({ ...valid, extra: 1 }).success).toBe(false);
     });
+  });
+});
+
+describe('requestListQuerySchema — single-sourced default + bounds (AC3)', () => {
+  it('applies the shared DEFAULT_LIMIT / offset 0 when omitted', () => {
+    const parsed = requestListQuerySchema.parse({});
+    expect(parsed.limit).toBe(DEFAULT_LIMIT);
+    expect(parsed.offset).toBe(0);
+    expect(parsed.status).toBeUndefined();
+  });
+
+  it('round-trips an explicit limit/offset — including offset 0', () => {
+    expect(requestListQuerySchema.parse({ limit: 5, offset: 2 })).toMatchObject({ limit: 5, offset: 2 });
+    expect(requestListQuerySchema.parse({ limit: 10, offset: 0 }).offset).toBe(0);
+  });
+
+  it('coerces string inputs (querystring values) to numbers', () => {
+    const parsed = requestListQuerySchema.parse({ limit: '25', offset: '100' });
+    expect(parsed).toMatchObject({ limit: 25, offset: 100 });
+  });
+
+  it('accepts the status filter', () => {
+    expect(requestListQuerySchema.parse({ status: 'pending' }).status).toBe('pending');
+    expect(requestListQuerySchema.safeParse({ status: 'bogus' }).success).toBe(false);
+  });
+
+  it('rejects out-of-range paging: limit 0, limit > MAX_LIMIT, negative offset', () => {
+    expect(requestListQuerySchema.safeParse({ limit: 0 }).success).toBe(false);
+    expect(requestListQuerySchema.safeParse({ limit: MAX_LIMIT + 1 }).success).toBe(false);
+    expect(requestListQuerySchema.safeParse({ offset: -1 }).success).toBe(false);
+    // The MAX_LIMIT boundary itself is accepted.
+    expect(requestListQuerySchema.parse({ limit: MAX_LIMIT }).limit).toBe(MAX_LIMIT);
   });
 });
 

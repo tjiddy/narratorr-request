@@ -5,8 +5,11 @@ import { FakeNarratorrClient } from '../test-support/route-harness.js';
 import { SettingsService } from './settings.service.js';
 import { ConnectorSettingsService } from './connector-settings.service.js';
 import { RequestService, resolveRequestPolicy } from './request.service.js';
+import { buildNotifier } from './notifications/index.js';
+import type { NotifierLogger } from './notifications/types.js';
 import { SecretCodec, deriveSettingsKey } from '../util/secret-codec.js';
-import { appSettings } from '../../db/schema.js';
+import { appSettings, users } from '../../db/schema.js';
+import { insertUser } from '../test-support/db.js';
 import { connectorSettingsDtoSchema } from '../../shared/schemas/connectors.js';
 import type { Db } from '../../db/client.js';
 import type { CreateNotifierBody, KnownNotifierDto, StoredConnectors } from '../../shared/schemas/connectors.js';
@@ -529,5 +532,234 @@ describe('ConnectorSettingsService — atomic settings write + single-read getDt
     expect(dto.publicUrl).toBe('https://app.example.com');
     expect(dto.notifiers).toHaveLength(1);
     expect(dto.defaultQuota).toEqual({ mode: 'limited', limit: 6, windowDays: 1 });
+  });
+});
+
+describe('ConnectorSettingsService — stored connectors envelope guard (#93)', () => {
+  // Write an ARBITRARY connectors blob (bypassing the write path's validation) so the read path
+  // can be exercised against corrupt / hand-edited / legacy shapes it must survive.
+  const seedConnectors = (raw: unknown) =>
+    db.update(appSettings).set({ connectors: raw as unknown as StoredConnectors }).where(eq(appSettings.id, 1));
+
+  const ntfyEnvelope = (config: Record<string, unknown>) => ({
+    id: 'nf_x',
+    name: 'Phone',
+    type: 'ntfy',
+    events: ['request.created'],
+    config,
+  });
+
+  // ---- Tier 1: absent / null → quiet EMPTY, NO warn -------------------------
+  it('tier 1: a fresh (null connectors) row returns the empty state on all readers and never warns', async () => {
+    const warn = vi.fn();
+    const logged = new ConnectorSettingsService(db, codec, { warn });
+    const dto = await logged.getDto();
+    expect(dto.narratorr).toBeNull();
+    expect(dto.notifiers).toEqual([]);
+    expect(await logged.getNarratorrConfig()).toBeNull();
+    expect(await logged.getNotificationsConfig()).toEqual({ publicUrl: null, notifiers: [] });
+    expect(warn).not.toHaveBeenCalled(); // the normal fresh-install path must be silent
+  });
+
+  // ---- Tier 2: malformed ENVELOPE → whole-blob EMPTY + exactly one warn -----
+  it.each([
+    ['a non-object blob', 42],
+    ['notifiers not an array', { publicUrl: null, narratorr: null, notifiers: 42 }],
+    ['narratorr url non-string', { publicUrl: null, narratorr: { url: 5, apiKey: 'x' }, notifiers: [] }],
+    ['publicUrl neither null nor string', { publicUrl: 5, narratorr: null, notifiers: [] }],
+    ['a notifier row that is not an object', { publicUrl: null, narratorr: null, notifiers: ['nope'] }],
+    ['a notifier row lacking a string id', { publicUrl: null, narratorr: null, notifiers: [{ name: 'n', type: 'ntfy', events: [], config: {} }] }],
+    ['a notifier row with a non-object config', { publicUrl: null, narratorr: null, notifiers: [{ id: 'nf_x', name: 'n', type: 'ntfy', events: [], config: 7 }] }],
+  ])('tier 2: %s degrades the whole blob to EMPTY + one warn, no throw', async (_label, raw) => {
+    await seedConnectors(raw);
+    const warn = vi.fn();
+    const logged = new ConnectorSettingsService(db, codec, { warn });
+    const dto = await logged.getDto(); // must not throw
+    expect(dto.narratorr).toBeNull();
+    expect(dto.notifiers).toEqual([]);
+    expect(await logged.getStored()).toEqual({ publicUrl: null, narratorr: null, notifiers: [] });
+    // getDto + getStored each read/degrade once → one warn apiece; assert the per-read unit warns exactly once.
+    warn.mockClear();
+    await logged.getDto();
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  // ---- Tier 3: shape-valid blob, non-string SECRET → unconfigured on BOTH surfaces, silent ----
+  it('tier 3: a notifier secret that is a non-string reveals as null AND masks has-secret false, silently', async () => {
+    await seedConnectors({
+      publicUrl: null,
+      narratorr: null,
+      notifiers: [ntfyEnvelope({ url: 'https://ntfy.sh', topic: 't', token: 99, priority: null })],
+    });
+    const warn = vi.fn();
+    const logged = new ConnectorSettingsService(db, codec, { warn });
+
+    const runtime = (await logged.getNotificationsConfig()).notifiers[0]!;
+    expect(runtime.config.token).toBeNull(); // reveal(99) → null
+
+    const dto = (await logged.getDto()).notifiers[0] as KnownNotifierDto;
+    expect(dto).toMatchObject({ type: 'ntfy', config: { hasToken: false } }); // mask predicate agrees
+    expect(warn).not.toHaveBeenCalled(); // no whole-blob degrade, no per-read warn
+  });
+
+  it('tier 3: a narratorr apiKey that is a non-string → getNarratorrConfig null AND hasApiKey false, silently', async () => {
+    await seedConnectors({ publicUrl: null, narratorr: { url: 'https://n:3000', apiKey: 99 }, notifiers: [] });
+    const warn = vi.fn();
+    const logged = new ConnectorSettingsService(db, codec, { warn });
+
+    expect(await logged.getNarratorrConfig()).toBeNull(); // reveal(99) → null → unconfigured
+    expect((await logged.getDto()).narratorr).toEqual({ url: 'https://n:3000', hasApiKey: false });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  // ---- Tier 4: row-local corruption stays row-local (no whole-blob reset) ----
+  it('tier 4: a bad-events row degrades row-locally while a healthy notifier AND narratorr stay loaded', async () => {
+    const goodToken = codec.encrypt('live-token');
+    await seedConnectors({
+      publicUrl: null,
+      narratorr: { url: 'https://n:3000', apiKey: codec.encrypt('live-key') },
+      notifiers: [
+        ntfyEnvelope({ url: 'https://ntfy.sh', topic: 'bad', priority: null }), // events invalid below
+        { id: 'nf_ok', name: 'Good', type: 'ntfy', events: ['request.created'], config: { url: 'https://ntfy.sh', topic: 'ok', token: goodToken, priority: null } },
+      ],
+    });
+    // Corrupt only the first row's events to a non-literal — still a string array, so the envelope
+    // passes (events loosened to unknown); safeEvents() owns the row-local degrade.
+    await seedConnectors({
+      publicUrl: null,
+      narratorr: { url: 'https://n:3000', apiKey: codec.encrypt('live-key') },
+      notifiers: [
+        { id: 'nf_bad', name: 'Bad', type: 'ntfy', events: ['nope.invalid'], config: { url: 'https://ntfy.sh', topic: 'bad', priority: null } },
+        { id: 'nf_ok', name: 'Good', type: 'ntfy', events: ['request.created'], config: { url: 'https://ntfy.sh', topic: 'ok', token: goodToken, priority: null } },
+      ],
+    });
+    const warn = vi.fn();
+    const logged = new ConnectorSettingsService(db, codec, { warn });
+
+    const dto = await logged.getDto();
+    // The bad row degraded to events: [] (row-local), NOT a whole-blob EMPTY reset:
+    expect(dto.notifiers).toHaveLength(2);
+    expect(dto.notifiers[0]).toMatchObject({ id: 'nf_bad', events: [] });
+    expect(dto.notifiers[1]).toMatchObject({ id: 'nf_ok', config: { hasToken: true } });
+    expect(dto.narratorr).toEqual({ url: 'https://n:3000', hasApiKey: true }); // narratorr survived
+    // The healthy notifier's secret still reveals at runtime.
+    expect((await logged.getNotificationsConfig()).notifiers.find((n) => n.id === 'nf_ok')!.config.token).toBe('live-token');
+  });
+
+  // ---- Runtime-path degrade: a NON-ITERABLE events value must not crash boot (#113) ----
+  // Tier 4 uses `['nope.invalid']` (an iterable string array), which does NOT reproduce the
+  // boot crash — `new Set(['nope.invalid'])` is fine. The crash vector is a non-iterable value
+  // (`events: 42`), where `new Set(42)` throws `TypeError: 42 is not iterable` inside buildOne,
+  // OUTSIDE its try/catch. safeEvents() must own the degrade on the runtime path too, not only DTO.
+  const silentLog: NotifierLogger = { info() {}, warn() {}, error() {}, debug() {} };
+
+  it('#113: a non-iterable events value degrades row-locally on the RUNTIME path and boot survives', async () => {
+    await seedConnectors({
+      publicUrl: null,
+      narratorr: { url: 'https://n:3000', apiKey: codec.encrypt('live-key') },
+      notifiers: [{ id: 'nf_bad', name: 'Bad', type: 'ntfy', events: 42, config: { url: 'https://ntfy.sh', topic: 'bad', priority: null } }],
+    });
+    const warn = vi.fn();
+    const logged = new ConnectorSettingsService(db, codec, { warn });
+
+    const cfg = await logged.getNotificationsConfig(); // must not throw
+    expect(cfg.notifiers[0]).toMatchObject({ id: 'nf_bad', events: [] });
+    expect(warn).toHaveBeenCalledTimes(1); // the row-local safeEvents warn
+
+    // Previously `new Set(42)` threw here and crash-looped boot.
+    expect(() => buildNotifier(cfg, silentLog)).not.toThrow();
+  });
+
+  it('#113: DTO and runtime surfaces agree on the degraded events for a non-iterable value', async () => {
+    await seedConnectors({
+      publicUrl: null,
+      narratorr: null,
+      notifiers: [{ id: 'nf_bad', name: 'Bad', type: 'ntfy', events: 42, config: { url: 'https://ntfy.sh', topic: 'bad', priority: null } }],
+    });
+    const logged = new ConnectorSettingsService(db, codec, { warn: vi.fn() });
+
+    expect((await logged.getDto()).notifiers[0]).toMatchObject({ id: 'nf_bad', events: [] });
+    expect((await logged.getNotificationsConfig()).notifiers[0]).toMatchObject({ id: 'nf_bad', events: [] });
+  });
+
+  it('#113: an unknown-type row with a non-iterable events value degrades too (both toRuntimeNotifier branches)', async () => {
+    await seedConnectors({
+      publicUrl: null,
+      narratorr: null,
+      notifiers: [{ id: 'nf_x', name: 'Apprise', type: 'apprise', events: 42, config: { url: 'https://example.com' } }],
+    });
+    const warn = vi.fn();
+    const logged = new ConnectorSettingsService(db, codec, { warn });
+
+    const cfg = await logged.getNotificationsConfig(); // must not throw on the !isKnownNotifierType branch
+    expect(cfg.notifiers[0]).toMatchObject({ id: 'nf_x', type: 'apprise', events: [] });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(() => buildNotifier(cfg, silentLog)).not.toThrow();
+  });
+
+  it('#113: a healthy events array round-trips unchanged on both surfaces with no warn', async () => {
+    const goodToken = codec.encrypt('live-token');
+    await seedConnectors({
+      publicUrl: null,
+      narratorr: null,
+      notifiers: [{ id: 'nf_ok', name: 'Good', type: 'ntfy', events: ['request.created', 'request.failed'], config: { url: 'https://ntfy.sh', topic: 'ok', token: goodToken, priority: null } }],
+    });
+    const warn = vi.fn();
+    const logged = new ConnectorSettingsService(db, codec, { warn });
+
+    expect((await logged.getDto()).notifiers[0]).toMatchObject({ events: ['request.created', 'request.failed'] });
+    expect((await logged.getNotificationsConfig()).notifiers[0]).toMatchObject({ events: ['request.created', 'request.failed'] });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  // ---- AC6: healthy blob round-trips unchanged, silent ----------------------
+  it('AC6: a fully-healthy blob round-trips byte-identical with no warn', async () => {
+    await svc.update({ narratorr: { url: 'https://n.example.com:443', apiKey: 'real-key' } });
+    await svc.createNotifier(ntfyBody({ config: { url: 'https://ntfy.sh', topic: 'reqs', token: 'real-token' } }));
+
+    const warn = vi.fn();
+    const logged = new ConnectorSettingsService(db, codec, { warn });
+    const dto = await logged.getDto();
+    expect(dto.narratorr).toEqual({ url: 'https://n.example.com:443', hasApiKey: true });
+    expect(dto.notifiers[0]).toMatchObject({ type: 'ntfy', config: { hasToken: true } });
+    expect(await logged.getNarratorrConfig()).toEqual({ url: 'https://n.example.com:443', apiKey: 'real-key' });
+    expect((await logged.getNotificationsConfig()).notifiers[0]!.config.token).toBe('real-token');
+    expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+describe('getDto — requesterEmailWarning (#50 admin-visible warning)', () => {
+  const emailBody = (): CreateNotifierBody => ({
+    name: 'Mail',
+    type: 'email',
+    events: ['request.created'],
+    config: { host: 'smtp.example.com', port: 587, secure: false, user: 'u', pass: 'p', from: 'ops@example.com', to: 'admin@example.com' },
+  });
+
+  it('is false when nobody has opted in (even without an email notifier)', async () => {
+    expect((await svc.getDto()).requesterEmailWarning).toBe(false);
+  });
+
+  it('is false for a corrupt/legacy notify_on that sanitizes to empty (agrees with the send path)', async () => {
+    const u = await insertUser(db, {});
+    // Simulate legacy/hand-edited data outside NOTIFIABLE_TRANSITIONS via raw SQL — the typed
+    // column is `NotifiableTransition[]`, so a typed write of `['bogus']` wouldn't compile. This
+    // row is `<> '[]'` (survives the coarse prefilter) but `hasNotifyOn` rejects it, so it must
+    // NOT fire the warning, mirroring that the send path never emails it.
+    db.run(sql`UPDATE users SET notify_on = '["bogus"]' WHERE id = ${u.id}`);
+    expect((await svc.getDto()).requesterEmailWarning).toBe(false);
+  });
+
+  it('is true when a user opted in but no usable email notifier exists', async () => {
+    const u = await insertUser(db, {});
+    await db.update(users).set({ notifyOn: ['available'] }).where(eq(users.id, u.id));
+    expect((await svc.getDto()).requesterEmailWarning).toBe(true);
+  });
+
+  it('is false when a user opted in AND a usable email notifier exists', async () => {
+    const u = await insertUser(db, {});
+    await db.update(users).set({ notifyOn: ['available'] }).where(eq(users.id, u.id));
+    await svc.createNotifier(emailBody());
+    expect((await svc.getDto()).requesterEmailWarning).toBe(false);
   });
 });

@@ -33,6 +33,77 @@ export type RequestQuota = z.infer<typeof requestQuotaSchema>;
 export const REQUEST_QUOTA_MODES = ['inherit', 'unlimited', 'limited', 'blocked'] as const;
 export type RequestQuotaMode = (typeof REQUEST_QUOTA_MODES)[number];
 
+// --- Requester notification opt-in -------------------------------------------
+// The transitions a requester can opt into being emailed about. A DEDICATED const — NOT
+// the 6-value RequestStatus — because only transitions with a real emit site belong here
+// (pending/approved/acquiring never email anyone, so reusing RequestStatus would ship
+// checkboxes that can never fire). This is the single source of truth for the opt-in Zod
+// schema, the client control, and emit-site coverage. v1 ships `available` only; the
+// `denied`/`failed` entries land in the follow-up ALONGSIDE their emit sites, so the const
+// never lists a transition that can't fire (issue #50).
+export const NOTIFIABLE_TRANSITIONS = ['available'] as const;
+export type NotifiableTransition = (typeof NOTIFIABLE_TRANSITIONS)[number];
+export const notifiableTransitionSchema = z.enum(NOTIFIABLE_TRANSITIONS);
+
+/**
+ * Narrow a stored/legacy `notify_on` JSON value into a clean `NotifiableTransition[]`. A
+ * corrupt / hand-edited / legacy blob (non-array, or an entry outside the current const)
+ * DEGRADES TO EMPTY rather than throwing — mirroring the `autoApproveRoles`/`connectors`
+ * degrade-and-continue discipline (a bad opt-in must never brick a read or a send). Duplicate
+ * values are collapsed. Pure, so it's shared by the DB read path, the DTO, and the client.
+ */
+export function sanitizeNotifyOn(raw: unknown): NotifiableTransition[] {
+  const parsed = z.array(notifiableTransitionSchema).safeParse(raw);
+  if (!parsed.success) return [];
+  return [...new Set(parsed.data)];
+}
+
+/**
+ * Whether a stored/legacy `notify_on` value represents ANY real opt-in — true iff
+ * {@link sanitizeNotifyOn} yields a non-empty set (so a corrupt/legacy value outside the const,
+ * or `'[]'`, is `false`). The SINGLE authoritative opt-in-existence predicate: the admin
+ * "requester emails enabled but no source" warning decides "has anyone opted in?" with THIS, and
+ * the send path derives its per-transition decision from the same {@link sanitizeNotifyOn} +
+ * `NOTIFIABLE_TRANSITIONS`, so the warning can't drift from whether a send would fire. Kept
+ * transition-agnostic on purpose — the `available` sweep tests `sanitizeNotifyOn(...).includes('available')`
+ * so a future `denied`/`failed` opt-in never mis-fires an availability email (issue #50).
+ */
+export function hasNotifyOn(raw: unknown): boolean {
+  return sanitizeNotifyOn(raw).length > 0;
+}
+
+// --- Contact email: the single deliverability shape + predicate ---------------
+// One schema for "a deliverable contact address": trim + lowercase, then a valid email
+// bounded at 254. Reused as the local-login identity (`localCredentialsSchema.email`), the
+// OIDC email-claim gate (`makeOidcMapper`), and the availability-send predicate — so the
+// "has usable email" decision can never drift between the UI (`emailNotifyAvailable`) and the
+// poller sweep (issue #120). Non-`.strict()` domain schema; the error string only surfaces for
+// the local-login form (OIDC/sweep use the normalizing helper below and ignore it).
+export const contactEmailSchema = z
+  .string()
+  .trim()
+  .toLowerCase()
+  .pipe(z.email('enter a valid email address').max(254));
+
+/**
+ * Normalize an arbitrary stored/claimed email into a deliverable address, or `null`. Trims +
+ * lowercases and enforces the `contactEmailSchema` bound; an empty, whitespace-only, malformed,
+ * or over-length value (or `null`/`undefined`) collapses to `null` rather than throwing. This is
+ * the SINGLE SOURCE OF TRUTH for both the value we deliver to and the predicate that gates the
+ * send — the OIDC mapper stores its result, the sweep sends its result, and the UI/sweep gate on
+ * {@link hasDeliverableContact}, so the "available" signal and the address delivered can't diverge.
+ */
+export function normalizeContactEmail(email: string | null | undefined): string | null {
+  if (email == null) return null;
+  const parsed = contactEmailSchema.safeParse(email);
+  return parsed.success ? parsed.data : null;
+}
+
+/** Whether a stored/claimed email parses as a deliverable contact. Derived from {@link normalizeContactEmail}. */
+export function hasDeliverableContact(email: string | null | undefined): boolean {
+  return normalizeContactEmail(email) !== null;
+}
+
 // Shape returned to the client for a user.
 export const userDtoSchema = z.object({
   publicId: z.string(),
@@ -74,8 +145,27 @@ export const meDtoSchema = userDtoSchema.extend({
     remaining: z.number().int().nullable(), // null for unlimited
     windowDays: quotaWindowDaysSchema,
   }),
+  // The caller's own requester-notification opt-in set (issue #50). Self-scoped — NOT on the
+  // admin `userDtoSchema`, so no admin surface exposes another user's preferences.
+  notifyOn: z.array(notifiableTransitionSchema),
+  // True IFF the caller has a non-null email AND the operator has a usable email-notifier SMTP
+  // source. Drives the opt-in control's enabled state and the one-time discoverability nudge;
+  // opt-in STORAGE is permissive (may outlive a contact), but DELIVERY + the UI gate on this.
+  emailNotifyAvailable: z.boolean(),
 });
 export type MeDto = z.infer<typeof meDtoSchema>;
+
+// `PATCH /api/me` — the self-scoped opt-in write. Body carries ONLY `notifyOn`; each element
+// must be in `NOTIFIABLE_TRANSITIONS` (v1: `available`) or Zod rejects it (400). Strict so a
+// stray key (e.g. an attempt to smuggle `role`) is refused — this endpoint can never mutate
+// anything but the caller's own opt-in set. The set is stored as-is regardless of email/SMTP
+// state (storage-permissive; no 403 on enable-without-contact).
+export const updateMeBodySchema = z
+  .object({
+    notifyOn: z.array(notifiableTransitionSchema),
+  })
+  .strict();
+export type UpdateMeBody = z.infer<typeof updateMeBodySchema>;
 
 // --- Auth: login screen + local auth ----------------------------------------
 
@@ -92,7 +182,7 @@ export type AuthProvidersDto = z.infer<typeof authProvidersDtoSchema>;
 // the cheap, effective lever).
 export const localCredentialsSchema = z
   .object({
-    email: z.string().trim().toLowerCase().pipe(z.email('enter a valid email address').max(254)),
+    email: contactEmailSchema,
     password: z.string().min(8, 'password must be at least 8 characters').max(200),
   })
   .strict();

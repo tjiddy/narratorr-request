@@ -1,7 +1,7 @@
 name: Build & Push Docker Image
 run-name: Docker build for ${{ github.ref_name }}
 
-# Two channels, build/publish only — no deploy. Mirrors Narratorr's pipeline:
+# Two channels, build/publish only — no deploy:
 #   - push to `develop`              → :develop on Docker Hub + GHCR (bleeding edge; pull manually)
 #   - semver tag `vX.Y.Z` on main    → :latest + :X.Y.Z + :X.Y on Docker Hub + GHCR, plus a GitHub Release
 #   - manual run (workflow_dispatch)  → :develop (same dev channel)

@@ -20,10 +20,9 @@
     "types": ["node"],
     "paths": {
       "@/*": ["./src/client/*"],
-      "@core/*": ["./src/core/*"],
       "@shared/*": ["./src/shared/*"]
     }
   },
-  "include": ["src/**/*", "scripts/**/*"],
+  "include": ["src/**/*"],
   "exclude": ["node_modules", "dist"]
 }

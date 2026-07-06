@@ -1,6 +1,6 @@
 import { sqliteTable, text, integer, index, uniqueIndex, check } from 'drizzle-orm/sqlite-core';
 import { sql } from 'drizzle-orm';
-import { USER_ROLES, USER_STATUSES, REQUEST_QUOTA_MODES } from '../shared/schemas/user.js';
+import { USER_ROLES, USER_STATUSES, REQUEST_QUOTA_MODES, type Role, type NotifiableTransition } from '../shared/schemas/user.js';
 import { REQUEST_STATUSES, ACTIVE_REQUEST_STATUSES } from '../shared/schemas/request.js';
 import type { StoredConnectors } from '../shared/schemas/connectors.js';
 
@@ -41,6 +41,17 @@ export const users = sqliteTable(
     // Per-user auto-approve: this user's requests skip the pending queue. Orthogonal
     // to quota — an auto-approved user's requests still count against their limit.
     autoApprove: integer('auto_approve', { mode: 'boolean' }).notNull().default(false),
+    // Requester-notification opt-in (issue #50): the transitions this user asked to be
+    // emailed about, as a JSON array keyed to `NOTIFIABLE_TRANSITIONS` (v1: ['available']).
+    // Default empty (off); a corrupt/legacy value degrades to empty on read via
+    // `sanitizeNotifyOn` — matching the autoApproveRoles/connectors JSON-on-a-row precedent.
+    // NO opt-in↔contact DB CHECK: opt-in may legitimately outlive a contact, and a
+    // JSON-array-vs-nullable-column CHECK hits the sqlite-check-null-is-satisfied trap (see
+    // the request_quota check below); contact is gated at send time, not by a constraint.
+    notifyOn: text('notify_on', { mode: 'json' })
+      .notNull()
+      .$type<NotifiableTransition[]>()
+      .default(sql`'[]'`),
     createdAt: integer('created_at', { mode: 'timestamp' })
       .notNull()
       .default(sql`(unixepoch())`),
@@ -81,15 +92,19 @@ export const requests = sqliteTable(
     // (nullable until approved + handed off).
     narratorrBookId: text('narratorr_book_id'), // bk_...
     note: text('note'),
-    // Quota accounting: a `failed` request is normally refunded, EXCEPT when the
-    // failure was the user's fault (PLAN decision #5). Defaults false.
-    userCausedFailure: integer('user_caused_failure', { mode: 'boolean' }).notNull().default(false),
     failureReason: text('failure_reason'),
     requestedAt: integer('requested_at', { mode: 'timestamp' })
       .notNull()
       .default(sql`(unixepoch())`),
     decidedAt: integer('decided_at', { mode: 'timestamp' }),
     decidedBy: integer('decided_by').references(() => users.id, { onDelete: 'set null' }),
+    // Durable "requester availability email settled" marker (issue #121). Nullable: null means the
+    // availability email still owes an attempt; a timestamp means a TERMINAL per-row outcome was
+    // reached (delivered, or a permanent no-op — not opted in / null email) and no further attempt
+    // is needed. The poller sweep is the SOLE writer, setting it atomically
+    // (`… WHERE available_notified_at IS NULL RETURNING`); a global no-config skip / transient SMTP
+    // failure leaves it null so the row is re-attempted next tick.
+    availableNotifiedAt: integer('available_notified_at', { mode: 'timestamp' }),
   },
   (table) => [
     index('idx_requests_user_id').on(table.userId),
@@ -125,7 +140,7 @@ export const appSettings = sqliteTable(
   // Which roles are auto-approved on request create. MVP: ['admin'].
   autoApproveRoles: text('auto_approve_roles', { mode: 'json' })
     .notNull()
-    .$type<string[]>()
+    .$type<Role[]>()
     .default(sql`'["admin"]'`),
   // Legacy placeholder, never written — superseded by `connectors` below. Kept so the
   // migration diff stays a clean ADD COLUMN (dropping it makes drizzle-kit prompt).

@@ -345,3 +345,40 @@ describe('GET /api/admin/users/:publicId/requests', () => {
     }
   });
 });
+
+// AC3 — both admin list routes apply the schema's 50/0 default when limit/offset are
+// omitted and pass an explicit limit/offset through to the service. Enumerated per-route
+// (not "any route") so a regression in one admin handler can't hide behind the other.
+describe('admin list routes — paging default + pass-through', () => {
+  it('GET /api/admin/requests: omitted → 50/0 default, explicit limit/offset passed through', async () => {
+    const admin = await insertUser(h.db, { role: 'admin', status: 'active' });
+    const cookie = h.cookieFor(admin);
+    const listSpy = vi.spyOn(h.requests, 'list').mockResolvedValue({ data: [], total: 0 });
+
+    await h.app.inject({ method: 'GET', url: '/api/admin/requests', cookies: cookie });
+    expect(listSpy).toHaveBeenLastCalledWith({ limit: 50, offset: 0 });
+
+    await h.app.inject({ method: 'GET', url: '/api/admin/requests?status=approved&limit=10&offset=20', cookies: cookie });
+    expect(listSpy).toHaveBeenLastCalledWith({ status: 'approved', limit: 10, offset: 20 });
+  });
+
+  it('GET /api/admin/users/:publicId/requests: omitted → 50/0 default, explicit passed through', async () => {
+    const admin = await insertUser(h.db, { role: 'admin', status: 'active' });
+    const target = await insertUser(h.db, { role: 'user', status: 'active', username: 'target' });
+    const cookie = h.cookieFor(admin);
+    const url = `/api/admin/users/${target.publicId}/requests`;
+    const listSpy = vi.spyOn(h.requests, 'list').mockResolvedValue({ data: [], total: 0 });
+
+    await h.app.inject({ method: 'GET', url, cookies: cookie });
+    expect(listSpy).toHaveBeenLastCalledWith({ userId: target.id, limit: 50, offset: 0 });
+
+    await h.app.inject({ method: 'GET', url: `${url}?limit=7&offset=14`, cookies: cookie });
+    expect(listSpy).toHaveBeenLastCalledWith({ userId: target.id, limit: 7, offset: 14 });
+  });
+
+  it('GET /api/admin/requests: limit=0 → 400 (query schema rejects before the handler)', async () => {
+    const admin = await insertUser(h.db, { role: 'admin', status: 'active' });
+    const res = await h.app.inject({ method: 'GET', url: '/api/admin/requests?limit=0', cookies: h.cookieFor(admin) });
+    expect(res.statusCode).toBe(400);
+  });
+});

@@ -1,10 +1,10 @@
-import { and, desc, eq, gte, inArray, or, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, sql } from 'drizzle-orm';
+import { z } from 'zod';
 import type { Db } from '../../db/client.js';
 import { requests, users, type RequestRow } from '../../db/schema.js';
-import type { Notifier } from './notifications/index.js';
+import { emitFailed, type RequestFailureNotifyDeps } from './request-notifications.js';
+export type { RequestFailureNotifyDeps } from './request-notifications.js';
 import { redact } from './notifications/redact.js';
-import type { NotifierLogger } from './notifications/types.js';
-import type { UserService } from './user.service.js';
 import type {
   CreateRequestBody,
   DecisionBody,
@@ -12,11 +12,18 @@ import type {
   RequestStatus,
 } from '../../shared/schemas/request.js';
 import { OPEN_REQUEST_STATUSES, ACTIVE_REQUEST_STATUSES, APPROVED_REQUEST_STATUSES } from '../../shared/schemas/request.js';
-import type { Role, RequestQuotaMode } from '../../shared/schemas/user.js';
+import { roleSchema, sanitizeNotifyOn, normalizeContactEmail, type Role, type RequestQuotaMode } from '../../shared/schemas/user.js';
 import type { DefaultQuota, QuotaWindowDays } from '../../shared/schemas/connectors.js';
-import { ADD_BOOK_ERROR_CODES, type V1Book } from '../../shared/schemas/v1/books.js';
+import type { V1Book } from '../../shared/schemas/v1/books.js';
 import type { INarratorrClient } from './narratorr-client.js';
-import { NarratorrError } from './narratorr-client.js';
+import {
+  isTerminalHandoffError,
+  handoffFailureReason,
+  bookStatusFailureReason,
+} from './request-failure-reasons.js';
+// Re-exported so `status-poller` (+ its test) keep importing it from here — the poller's 404 path
+// writes it via `markFailed`, so its home stays alongside the service it's used with.
+export { BOOK_VANISHED_REASON } from './request-failure-reasons.js';
 import { publicId } from '../util/ids.js';
 import { conflict, notFound, quotaBlocked, tooManyRequests } from '../util/errors.js';
 import { isUniqueViolation } from '../util/db.js';
@@ -70,6 +77,18 @@ export async function resolveRequestPolicy(
   return { defaultQuota: toDefaultEffective(quota), windowDays: quota.windowDays, autoApproveRoles };
 }
 
+/**
+ * Narrow stored `auto_approve_roles` JSON into a `Role[]` so a legacy / hand-edited / non-array value
+ * can't ride an unvalidated `as Role[]` cast into the boot policy. Mirrors the connector/quota
+ * degrade-and-warn discipline: any failure (non-array, or an unknown role) warns exactly ONCE and
+ * falls back to `['admin']`; a valid array passes through. Exported so it's spy-logger testable.
+ */
+export function sanitizeAutoApproveRoles(raw: unknown, logger: { warn(obj: unknown, msg?: string): void }): Role[] {
+  const parsed = z.array(roleSchema).safeParse(raw);
+  if (!parsed.success) logger.warn({ raw }, 'auto_approve_roles failed the role schema — falling back to ["admin"]');
+  return parsed.success ? parsed.data : ['admin'];
+}
+
 /** Effective rolling-window usage for the `/api/me` quota badge. `mode` is authoritative:
  *  `unlimited` → limit/remaining null; `limited` → positive limit + clamped remaining; `blocked`
  *  → limit null, remaining 0. `used` is always the real in-window count. */
@@ -80,31 +99,6 @@ export interface QuotaUsage {
   remaining: number | null;
   windowDays: QuotaWindowDays;
 }
-
-/**
- * Wiring for the admin-facing `request.failed` notification (issue #60). Optional — when
- * absent the service simply doesn't emit (existing call-sites that don't care about
- * notifications keep their 3-arg construction).
- */
-export interface RequestFailureNotifyDeps {
-  /**
-   * Reads the CURRENT notifier at call time. MUST be an accessor, not a captured
-   * instance: the live notifier is rebuilt and reassigned on every notifier-settings
-   * change, so capturing it would dispatch failed-notifications through a stale channel set.
-   */
-  getNotifier: () => Notifier;
-  /** Resolves `requester.username`; an absent row falls back to a stable placeholder. */
-  users: Pick<UserService, 'getById'>;
-  /**
-   * Optional log sink for fire-and-forget emission faults (a requester lookup that rejects, or a
-   * notifier dispatch that rejects). Without it a lost `request.failed` is undiagnosable; the
-   * emission stays non-blocking either way — these are breadcrumbs, never thrown to the caller.
-   */
-  logger?: NotifierLogger;
-}
-
-/** Username used when the requester row is gone (e.g. deleted account) — the admin still hears it failed. */
-const UNKNOWN_REQUESTER = '(unknown requester)';
 
 export class RequestService {
   constructor(
@@ -143,7 +137,10 @@ export class RequestService {
       .from(requests)
       .innerJoin(users, eq(requests.userId, users.id))
       .where(where)
-      .orderBy(desc(requests.requestedAt))
+      // `requested_at` is second-resolution (unixepoch()), so rows created in the same
+      // second tie. Add the monotonic PK as a unique secondary key to make the total order
+      // deterministic — otherwise adjacent offset pages over tied rows could skip/duplicate.
+      .orderBy(desc(requests.requestedAt), desc(requests.id))
       .limit(opts.limit)
       .offset(opts.offset);
 
@@ -216,20 +213,15 @@ export class RequestService {
   /**
    * Rolling-window usage (PLAN decision #5): count requests created in the last
    * `windowDays` whose status still occupies a slot — `pending`/`approved`/
-   * `acquiring`/`available`, plus `failed` ONLY when the failure was user-caused
-   * (otherwise `failed` is refunded). `denied` is never counted. Shapes the count into the
+   * `acquiring`/`available`. `failed` and `denied` are never counted. Shapes the count into the
    * effective-mode badge contract: `limited` clamps remaining at 0; `blocked` reports
    * remaining 0 (limit null); `unlimited` reports both null.
    */
   async quotaUsage(userId: number, effective: EffectiveQuota): Promise<QuotaUsage> {
     const used = await this.countInWindow(userId);
     const windowDays = this.policy.windowDays;
-    if (effective.mode === 'limited') {
-      return { mode: 'limited', limit: effective.limit, used, remaining: Math.max(0, effective.limit - used), windowDays };
-    }
-    if (effective.mode === 'blocked') {
-      return { mode: 'blocked', limit: null, used, remaining: 0, windowDays };
-    }
+    if (effective.mode === 'limited') return { mode: 'limited', limit: effective.limit, used, remaining: Math.max(0, effective.limit - used), windowDays };
+    if (effective.mode === 'blocked') return { mode: 'blocked', limit: null, used, remaining: 0, windowDays };
     return { mode: 'unlimited', limit: null, used, remaining: null, windowDays };
   }
 
@@ -243,10 +235,7 @@ export class RequestService {
         and(
           eq(requests.userId, userId),
           gte(requests.requestedAt, cutoff),
-          or(
-            inArray(requests.status, [...OPEN_REQUEST_STATUSES]),
-            and(eq(requests.status, 'failed'), eq(requests.userCausedFailure, true)),
-          ),
+          inArray(requests.status, [...OPEN_REQUEST_STATUSES]),
         ),
       );
     return used;
@@ -398,10 +387,17 @@ export class RequestService {
         });
         return failed ?? row;
       }
+      // Atomically claim the OBSERVED `approved` edge (mirrors transitionToFailed): the real race
+      // is handler-vs-poller — create()'s in-flight handoff vs recoverHandoff firing a second
+      // handoff on the same `(approved, bookId NULL)` row. Both call addBook (idempotent by ASIN),
+      // then both reach here; the `WHERE status = row.status` guard lets exactly ONE land the edge.
+      // The loser matches zero rows. The requester availability email is NOT emitted here (issue
+      // #121): the `available` commit lands, and the poller sweep is the SOLE sender — it re-attempts
+      // the durable `available_notified_at IS NULL` backlog, surviving a crash between commit and send.
       const [updated] = await this.db
         .update(requests)
         .set({ narratorrBookId: book.id, status: next })
-        .where(eq(requests.id, row.id))
+        .where(and(eq(requests.id, row.id), eq(requests.status, row.status)))
         .returning();
       return updated ?? row;
     } catch (err) {
@@ -453,68 +449,12 @@ export class RequestService {
   ): Promise<RequestRow | null> {
     const [updated] = await this.db
       .update(requests)
-      .set({ status: 'failed', userCausedFailure: false, failureReason: reason, ...extra })
+      .set({ status: 'failed', failureReason: reason, ...extra })
       .where(and(eq(requests.id, row.id), eq(requests.status, row.status)))
       .returning();
     if (!updated) return null;
-    this.emitFailed(updated, reason);
+    emitFailed(this.notifyDeps, updated, reason);
     return updated;
-  }
-
-  /**
-   * Fire-and-forget `request.failed` emission. NEVER throws into the request/poll path:
-   * the failed transition is already committed, so a missing requester or a dispatch
-   * hiccup must not unwind it. Resolves the requester via the live UserService and
-   * dispatches through the LIVE notifier (read at call time). A missing requester row
-   * still emits with a stable placeholder username — the admin needs to hear it failed.
-   */
-  private emitFailed(row: RequestRow, reason: string | null): void {
-    const deps = this.notifyDeps;
-    if (!deps) return;
-    void (async () => {
-      // A requester lookup fault (DB fault) must NOT lose the notification — the admin still
-      // needs to hear it failed. Log a redacted breadcrumb and fall back to the placeholder.
-      let requester: { username: string } | undefined;
-      try {
-        requester = await deps.users.getById(row.userId);
-      } catch (err) {
-        // redact() before logging: a lookup fault's error text could embed a secret-bearing
-        // value, and the breadcrumb must never carry one raw (URL-pattern scrub; no per-channel
-        // secrets to exact-match here — those live inside the dispatcher).
-        deps.logger?.warn(
-          { err: redact(err), request: row.publicId },
-          'request.failed: requester lookup failed; emitting with placeholder username',
-        );
-      }
-      try {
-        await deps.getNotifier().notify({
-          event: 'request.failed',
-          request: {
-            publicId: row.publicId,
-            title: row.title,
-            author: row.author,
-            asin: row.asin,
-            coverUrl: row.coverUrl,
-          },
-          requester: { username: requester?.username ?? UNKNOWN_REQUESTER },
-          reason,
-        });
-      } catch (err) {
-        // A lost notification must be diagnosable — without this breadcrumb a dropped
-        // request.failed is invisible. The failed transition already committed; never propagate.
-        // redact() before logging: a dispatch error can embed a capability webhook URL or a
-        // token-in-path (the very reason the dispatcher redacts), so scrub it here too.
-        deps.logger?.warn(
-          { err: redact(err), request: row.publicId },
-          'request.failed: notifier dispatch failed; notification lost',
-        );
-      }
-    })().catch((err) => {
-      // Final backstop: both awaits above are individually guarded, so this only fires on a
-      // truly unexpected throw. The failed transition already landed; swallow into a (redacted)
-      // breadcrumb.
-      deps.logger?.warn({ err: redact(err), request: row.publicId }, 'request.failed: emission failed unexpectedly');
-    });
   }
 
   // --- reconciliation (poller) ----------------------------------------------
@@ -547,9 +487,30 @@ export class RequestService {
   }
 
   /**
+   * The durable requester-availability-email backlog (issue #121): `available` rows whose
+   * `available_notified_at` marker is still null — i.e. the email hasn't reached a terminal outcome
+   * (delivered, or a permanent no-op). Joins the requester's `notify_on` + `email` so the sweep can
+   * decide opted-in-vs-settled without an N+1 lookup. Ordered oldest-first and SQL-capped like
+   * {@link findAcquiring}, so a tick never does an unbounded read and the oldest owed emails are
+   * always serviced. `innerJoin` is safe: `requests.userId` is NOT NULL and cascade-deletes with the
+   * user, so an `available` row always has its requester.
+   */
+  async findAvailableAwaitingNotify(
+    limit = 100,
+  ): Promise<Array<{ request: RequestRow; notifyOn: unknown; email: string | null }>> {
+    return this.db
+      .select({ request: requests, notifyOn: users.notifyOn, email: users.email })
+      .from(requests)
+      .innerJoin(users, eq(requests.userId, users.id))
+      .where(and(eq(requests.status, 'available'), sql`${requests.availableNotifiedAt} IS NULL`))
+      .orderBy(requests.requestedAt)
+      .limit(limit);
+  }
+
+  /**
    * Apply a freshly-polled book to a request. Returns the new status if it changed,
-   * else null (so the poller logs only on transitions — there is no requester
-   * notification today; see #50). We mirror narratorr's
+   * else null (so the poller logs only on transitions). The requester availability
+   * email is NOT sent here (issue #121) — the poller sweep owns it durably. We mirror narratorr's
    * lifecycle and never invent a terminal state on a timer: a request stays `acquiring`
    * for as long as the book is pre-`imported` (a not-found book legitimately sits
    * `wanted` until narratorr's next scheduled search) and only goes terminal when
@@ -568,10 +529,17 @@ export class RequestService {
       });
       return failed ? 'failed' : null;
     }
-    await this.db
+    // Claim the OBSERVED (`acquiring`) edge atomically — the same `WHERE status = <observed>
+    // … .returning()` guard as the failed edge. This is the normal `acquiring → available` write.
+    // The requester availability email is NOT emitted here (issue #121): the commit lands and the
+    // poller sweep is the SOLE sender, re-attempting the durable `available_notified_at IS NULL`
+    // backlog so a crash between this commit and the send never loses the notification.
+    const [updated] = await this.db
       .update(requests)
       .set({ status: next, narratorrBookId: bookId })
-      .where(eq(requests.id, row.id));
+      .where(and(eq(requests.id, row.id), eq(requests.status, row.status)))
+      .returning();
+    if (!updated) return null; // lost the claim — the row already moved off the observed status
     return next === row.status ? null : next;
   }
 
@@ -585,6 +553,103 @@ export class RequestService {
     return (await this.transitionToFailed(row, reason)) !== null;
   }
 
+  /**
+   * Atomically settle a row's requester-availability-email marker (issue #121). Sets
+   * `available_notified_at` ONLY while it's still null (`… WHERE available_notified_at IS NULL
+   * RETURNING`), mirroring the atomic `.returning()` claims elsewhere in this service. Returns
+   * whether THIS call wrote the marker; a second attempt on an already-settled row claims zero rows
+   * and returns false, so the sweep can never double-settle or re-send.
+   */
+  private async settleAvailableNotified(id: number): Promise<boolean> {
+    const [settled] = await this.db
+      .update(requests)
+      .set({ availableNotifiedAt: new Date() })
+      .where(and(eq(requests.id, id), sql`${requests.availableNotifiedAt} IS NULL`))
+      .returning();
+    return settled !== undefined;
+  }
+
+  /**
+   * Durable requester-availability-email sweep (issue #121) — the SOLE sender of the "your audiobook
+   * is ready" email. Runs one serialized pass under the poller's `Cron { protect: true }`, so sends
+   * never overlap in-process and no pre-send lease is needed. For each owed `available` row (marker
+   * still null):
+   *   • not opted into `available`, OR opted in with a null email → a permanent no-op: settle the
+   *     marker (no email owed) so the row drops out of the capped batch and can't accumulate;
+   *   • opted in with an email → log an `attempted` breadcrumb, then attempt the send:
+   *       – `delivered`         → settle the marker;
+   *       – `skipped-no-config` → GLOBAL, replayable: leave the marker null (backlog delivers once
+   *                               the admin configures a usable email notifier), log the skip;
+   *       – a throw (transient SMTP failure, or a marker-write fault after delivery) → leave the
+   *         marker null and retry next tick (the standard at-least-once residual: a rare duplicate).
+   * Fire-and-forget isolation (AC6): a per-row send/settle fault is caught and logged (never unwinds
+   * the pass), mirroring `emitFailed`'s fire-and-forget guard-and-swallow. A sweep-level DB READ fault (the
+   * finder) propagates to the poller tick's guard, which backs off like any other poll error. No
+   * requester-email dep wired → no-op. Per-outcome logs are keyed on `request.publicId` and NEVER
+   * carry the recipient address (PII).
+   */
+  async sweepAvailableNotifications(limit = 100): Promise<void> {
+    const sender = this.notifyDeps?.requesterEmail;
+    if (!sender) return; // no requester-email sender wired → nothing to sweep
+    const logger = this.notifyDeps?.logger;
+    const owed = await this.findAvailableAwaitingNotify(limit);
+    for (const { request: row, notifyOn, email } of owed) {
+      try {
+        await this.notifyOneAvailable(row, notifyOn, email, sender, logger);
+      } catch (err) {
+        // Transient SMTP failure (send threw) or a post-delivery marker-write fault. Never unwind the
+        // sweep; leave the marker null so the row is re-attempted. redact() before logging: a send
+        // fault can embed SMTP credentials.
+        logger?.warn({ err: redact(err), request: row.publicId }, 'request.available: requester email attempt failed; will retry next sweep');
+      }
+    }
+  }
+
+  /**
+   * Settle-or-send one owed `available` row (issue #121 sweep body, extracted so the loop stays
+   * within the complexity budget). The caller wraps this in the per-row fire-and-forget guard; a
+   * throw here (transient SMTP failure, or a marker-write fault after delivery) leaves the marker
+   * null so the row is re-attempted next tick.
+   */
+  private async notifyOneAvailable(
+    row: RequestRow,
+    notifyOn: unknown,
+    email: string | null,
+    sender: NonNullable<RequestFailureNotifyDeps['requesterEmail']>,
+    logger: RequestFailureNotifyDeps['logger'],
+  ): Promise<void> {
+    // Normalize once (issue #120): the SAME `hasDeliverableContact` predicate the UI gates on,
+    // yielding the exact address we deliver to — so a padded/mixed-case legacy value is sent
+    // clean, and an unparseable one can never diverge the "available" signal from the send gate.
+    const to = normalizeContactEmail(email);
+    const optedIn = sanitizeNotifyOn(notifyOn).includes('available');
+    // Permanent no-op — not opted in, or no deliverable contact (null / empty / malformed /
+    // over-length legacy value). Settle so the row leaves the capped backlog (AC4); a redacted
+    // breadcrumb records an opted-in-but-undeliverable drop without ever logging the recipient.
+    if (!optedIn || !to) {
+      if (optedIn) {
+        logger?.debug({ request: row.publicId }, 'request.available: no deliverable contact email; settling as no-op');
+      }
+      await this.settleAvailableNotified(row.id);
+      return;
+    }
+    // Pre-send ATTEMPTED breadcrumb (AC5): the fourth distinguishable outcome. Lets an operator
+    // tell an eligible row that was attempted (send in flight, terminal log pending) apart from
+    // one that was never reached — without it, an in-flight/interrupted attempt is invisible.
+    // Keyed on publicId, NEVER the recipient; paired at `info` with the `delivered` breadcrumb.
+    logger?.info({ request: row.publicId }, 'request.available: attempting requester email');
+    const outcome = await sender.send({ to, transition: 'available', request: { title: row.title, author: row.author } });
+    if (outcome === 'skipped-no-config') {
+      // GLOBAL, replayable: leave the marker null so a later sweep delivers once SMTP is set up.
+      logger?.warn({ request: row.publicId }, 'request.available: requester email skipped — no usable email notifier configured');
+      return;
+    }
+    // delivered: record the prod-visible success breadcrumb, then settle the marker. A settle
+    // fault here throws into the caller's catch → marker stays null → a rare duplicate next tick.
+    logger?.info({ request: row.publicId }, 'request.available: requester email delivered');
+    await this.settleAvailableNotified(row.id);
+  }
+
   private mapBookStatus(status: V1Book['status']): RequestStatus {
     switch (status) {
       case 'imported':
@@ -595,59 +660,5 @@ export class RequestService {
       default:
         return 'acquiring'; // wanted | searching | downloading | importing
     }
-  }
-}
-
-/**
- * Whether a handoff error is terminal (retrying can't fix it → fail the request) vs.
- * transient (429 rate-limit / 5xx / network → leave `approved` for the poller to
- * retry). A non-Narratorr error (e.g. a DB fault) is terminal so it can't loop forever.
- */
-function isTerminalHandoffError(err: unknown): boolean {
-  if (!(err instanceof NarratorrError)) return true;
-  // 400 malformed, 409 with no usable existingId, 422 unresolvable ASIN.
-  return err.upstreamStatus === 400 || err.upstreamStatus === 409 || err.upstreamStatus === 422;
-}
-
-// --- Friendly failure reasons ------------------------------------------------
-// Once a `failureReason` is surfaced to users/admins it must read as plain English,
-// not a raw upstream code. These map every terminal failure cause to a friendly string.
-// Branch on the upstream CODE (narratorr #1545), never the human message text.
-
-/** Per-code friendly text for the add-handoff terminal errors. */
-const HANDOFF_FAILURE_REASONS: Record<string, string> = {
-  [ADD_BOOK_ERROR_CODES.editionRejected]: "This edition is excluded by the library's filters.",
-  [ADD_BOOK_ERROR_CODES.asinNotResolved]: "Couldn't find this book in the catalog.",
-  [ADD_BOOK_ERROR_CODES.invalidRecord]: 'Incomplete book data from the provider.',
-};
-
-/** "The book is gone upstream" reason — written by the poller's 404 path (status-poller). */
-export const BOOK_VANISHED_REASON = 'This book is no longer available upstream.';
-
-/**
- * Friendly reason for a TERMINAL handoff error. A recognized `NarratorrError` code maps
- * to its per-code message; an unknown terminal code falls back to the readable
- * `${code}: ${message}` shape; a non-`NarratorrError` throw is a generic 'handoff failed'.
- */
-export function handoffFailureReason(err: unknown): string {
-  if (err instanceof NarratorrError) {
-    return HANDOFF_FAILURE_REASONS[err.upstreamCode] ?? `${err.upstreamCode}: ${err.message}`;
-  }
-  return 'handoff failed';
-}
-
-/**
- * Friendly reason for a book whose status maps to `failed` (`failed` / `missing`). Any
- * other status shouldn't reach here (only `failed`/`missing` collapse to a failed request),
- * but it degrades to a readable `book ${status}` string rather than throwing.
- */
-export function bookStatusFailureReason(status: V1Book['status']): string {
-  switch (status) {
-    case 'failed':
-      return 'Download failed upstream.';
-    case 'missing':
-      return 'No source found upstream.';
-    default:
-      return `book ${status}`;
   }
 }

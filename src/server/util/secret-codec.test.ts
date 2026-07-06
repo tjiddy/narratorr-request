@@ -19,13 +19,6 @@ describe('SecretCodec', () => {
     expect(codec.decrypt(b)).toBe('same');
   });
 
-  it('encryptIfNeeded is idempotent on an already-encrypted value', () => {
-    const once = codec.encryptIfNeeded('x');
-    const twice = codec.encryptIfNeeded(once);
-    expect(twice).toBe(once);
-    expect(codec.decrypt(twice)).toBe('x');
-  });
-
   it('decrypt returns null for non-blobs (plaintext)', () => {
     expect(codec.decrypt('not-encrypted')).toBeNull();
   });

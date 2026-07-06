@@ -1,4 +1,4 @@
-import { NavLink, Outlet, useNavigate } from 'react-router-dom';
+import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import type { ComponentType } from 'react';
@@ -6,6 +6,7 @@ import type { MeDto } from '@shared/schemas/user';
 import { logout } from '../api';
 import { useTheme } from '../hooks';
 import { Button } from './Button';
+import { ErrorBoundary } from './ErrorBoundary';
 import { SunIcon, MoonIcon, HeadphonesIcon, SearchIcon, InboxIcon, ActivityIcon, UsersIcon, SettingsIcon } from './icons';
 
 type NavItem = {
@@ -35,6 +36,7 @@ const navLinkClass = ({ isActive }: { isActive: boolean }) =>
 
 export function Layout({ me }: { me: MeDto }) {
   const navigate = useNavigate();
+  const location = useLocation();
   const qc = useQueryClient();
   const { theme, toggleTheme } = useTheme();
 
@@ -97,7 +99,17 @@ export function Layout({ me }: { me: MeDto }) {
         </div>
       </header>
       <main className="mx-auto max-w-5xl px-4 py-8">
-        <Outlet />
+        {/*
+          Reset the boundary on navigation. We key on the full `pathname` (params included),
+          so a param-only move like `/users/:publicId` also clears a broken detail page. We
+          pass `resetKey` (state reset in getDerivedStateFromProps) rather than `key={pathname}`
+          (subtree remount) deliberately: `key=` would tear down and rebuild the healthy Outlet
+          subtree on every param change, and — being a React reconciliation behaviour — has no
+          pure seam to node-test (AC 3). `resetKey` clears only the boundary's own error state.
+        */}
+        <ErrorBoundary resetKey={location.pathname}>
+          <Outlet />
+        </ErrorBoundary>
       </main>
     </div>
   );

@@ -8,18 +8,17 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': path.resolve(__dirname, 'src/client'),
-      '@core': path.resolve(__dirname, 'src/core'),
       '@shared': path.resolve(__dirname, 'src/shared'),
     },
   },
   test: {
-    passWithNoTests: true,
     environment: 'node',
     include: ['src/{server,shared,db,client}/**/*.test.ts'],
     coverage: {
       provider: 'v8',
       reportsDirectory: 'coverage',
-      exclude: ['src/server/index.ts', 'src/client/**'],
+      // Components (.tsx) have no jsdom project yet; client pure-logic .ts files ARE covered.
+      exclude: ['src/server/index.ts', 'src/client/**/*.tsx'],
     },
   },
 });

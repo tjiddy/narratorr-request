@@ -117,6 +117,32 @@ export interface StoredConnectors {
   notifiers: StoredNotifier[];
 }
 
+/**
+ * Container/ENVELOPE guard for the whole stored `connectors` blob — NOT a strict content validator.
+ * It asserts only the structural shape the readers need to stay crash-safe (object/array/string at
+ * the envelope level), so a corrupt/hand-edited/legacy blob degrades to a clean reset instead of
+ * throwing `value.startsWith is not a function` out of a boot/settings read. It deliberately keeps
+ * the layers that already have their own never-brick degrade paths as `unknown`:
+ *   • Secret VALUES (`narratorr.apiKey`, notifier `config` secret fields) stay `unknown` — a
+ *     non-string secret passes the envelope and is treated as "unconfigured" at runtime by
+ *     `reveal()` + the shared usable-secret mask predicate, NOT a whole-blob reset.
+ *   • Notifier `events` is loosened to `unknown` — malformed events keep degrading ROW-LOCALLY via
+ *     `safeEvents()` on BOTH read surfaces (the DTO path in `toNotifierDto` AND the runtime path in
+ *     `toRuntimeNotifier`, so a non-iterable value like `events: 42` can never reach `new Set()` at
+ *     boot), NOT a whole-blob reset (composing `storedNotifierSchema` verbatim would turn a
+ *     bad-events row into a tier-2 wipe).
+ * A blob that fails THIS schema (bad envelope: not an object; `notifiers` not an array; `narratorr`
+ * neither null nor `{ url: string, … }`; `publicUrl` neither null nor a string; a notifier row that
+ * is not an object / lacks a string `id`/`name`/`type` / has a non-object `config`) is what the read
+ * path degrades wholesale to EMPTY + one warn. Non-`.strict()` per CLAUDE.md — the stored boundary
+ * tolerates extra keys, and an out-of-registry notifier `type` must still round-trip.
+ */
+export const storedConnectorsSchema = z.object({
+  publicUrl: z.string().nullable(),
+  narratorr: z.object({ url: z.string(), apiKey: z.unknown() }).nullable(),
+  notifiers: z.array(storedNotifierSchema.omit({ events: true }).extend({ events: z.unknown() })),
+});
+
 // ---- Masked notifier DTO (GET) ----------------------------------------------
 // Discriminated so an unknown stored type is PRESERVED end-to-end, not 500'd:
 //   • Known: { id, name, type: <registry key>, events, config: <masked> }
@@ -177,6 +203,11 @@ export const connectorSettingsDtoSchema = z.object({
     .nullable(),
   notifiers: z.array(notifierDtoSchema),
   defaultQuota: defaultQuotaSchema,
+  // Admin-visible warning (issue #50): true when one or more users have opted into requester
+  // emails but NO usable email-notifier SMTP source is configured — so those opt-ins deliver
+  // nothing. Rendered on the Notifications settings section. False when there's a usable email
+  // source OR nobody has opted in (nothing to warn about).
+  requesterEmailWarning: z.boolean(),
 });
 /** Hand-written (the runtime schema's `notifiers` infers `unknown[]`; this keeps it typed). */
 export interface ConnectorSettingsDto {
@@ -184,6 +215,7 @@ export interface ConnectorSettingsDto {
   narratorr: { url: string; hasApiKey: boolean } | null;
   notifiers: NotifierDto[];
   defaultQuota: DefaultQuota;
+  requesterEmailWarning: boolean;
 }
 
 // ---- narratorr connector (shared by PUT + Test) -----------------------------

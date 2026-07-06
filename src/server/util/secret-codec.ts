@@ -43,11 +43,6 @@ export class SecretCodec {
     return PREFIX + Buffer.concat([iv, tag, ct]).toString('base64');
   }
 
-  /** Encrypt unless the value is already an `enc:v1:` blob — idempotent on stored data. */
-  encryptIfNeeded(value: string): string {
-    return this.isEncrypted(value) ? value : this.encrypt(value);
-  }
-
   /** Decrypt an `enc:v1:` blob. Returns null for non-blobs or any failure (wrong key,
    *  tampered ciphertext) — callers treat null as "secret unavailable". */
   decrypt(value: string): string | null {

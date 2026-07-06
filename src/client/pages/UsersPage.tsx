@@ -33,6 +33,7 @@ export function UsersPage() {
       </div>
 
       {users.isLoading && <p className="text-sm text-muted-foreground/70">Loading…</p>}
+      {users.error && <p className="text-sm text-destructive">Could not load users.</p>}
       {users.data && rows.length === 0 && (
         <EmptyState icon={InboxIcon} title="No users yet" subtitle="Users appear here after they first sign in." />
       )}
