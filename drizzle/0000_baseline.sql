@@ -7,7 +7,7 @@ CREATE TABLE `app_settings` (
 	`notify_config` text,
 	`connectors` text,
 	`updated_at` integer DEFAULT (unixepoch()) NOT NULL,
-	CONSTRAINT "default_quota_mode_limit" CHECK((`app_settings`.`default_quota_mode` = 'limited') = (`app_settings`.`default_quota_limit` IS NOT NULL) AND (`app_settings`.`default_quota_limit` IS NULL OR `app_settings`.`default_quota_limit` > 0))
+	CONSTRAINT "default_quota_mode_limit" CHECK(("app_settings"."default_quota_mode" = 'limited') = ("app_settings"."default_quota_limit" IS NOT NULL) AND ("app_settings"."default_quota_limit" IS NULL OR "app_settings"."default_quota_limit" > 0))
 );
 --> statement-breakpoint
 CREATE TABLE `requests` (
@@ -22,11 +22,11 @@ CREATE TABLE `requests` (
 	`status` text DEFAULT 'pending' NOT NULL,
 	`narratorr_book_id` text,
 	`note` text,
-	`user_caused_failure` integer DEFAULT false NOT NULL,
 	`failure_reason` text,
 	`requested_at` integer DEFAULT (unixepoch()) NOT NULL,
 	`decided_at` integer,
 	`decided_by` integer,
+	`available_notified_at` integer,
 	FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON UPDATE no action ON DELETE cascade,
 	FOREIGN KEY (`decided_by`) REFERENCES `users`(`id`) ON UPDATE no action ON DELETE set null
 );
@@ -50,8 +50,9 @@ CREATE TABLE `users` (
 	`request_quota_mode` text DEFAULT 'inherit' NOT NULL,
 	`request_quota_limit` integer,
 	`auto_approve` integer DEFAULT false NOT NULL,
+	`notify_on` text DEFAULT '[]' NOT NULL,
 	`created_at` integer DEFAULT (unixepoch()) NOT NULL,
-	CONSTRAINT "request_quota_mode_limit" CHECK((`users`.`request_quota_mode` = 'limited') = (`users`.`request_quota_limit` IS NOT NULL) AND (`users`.`request_quota_limit` IS NULL OR `users`.`request_quota_limit` > 0))
+	CONSTRAINT "request_quota_mode_limit" CHECK(("users"."request_quota_mode" = 'limited') = ("users"."request_quota_limit" IS NOT NULL) AND ("users"."request_quota_limit" IS NULL OR "users"."request_quota_limit" > 0))
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX `users_public_id_unique` ON `users` (`public_id`);--> statement-breakpoint
