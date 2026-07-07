@@ -1,6 +1,6 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
-import { useMe } from './hooks';
+import { useMe, useInstanceBadge } from './hooks';
 import { ApiError, logout } from './api';
 import { Layout } from './components/Layout';
 import { SearchPage } from './pages/SearchPage';
@@ -12,6 +12,10 @@ import { SettingsPage } from './pages/SettingsPage';
 import { LoginPage } from './pages/LoginPage';
 
 export function App() {
+  // Apply the instance badge (favicon recolor + title prefix) for both signed-in and signed-out
+  // tabs — must run before the auth/loading branches below so it isn't gated on auth state.
+  useInstanceBadge();
+
   const me = useMe();
 
   if (me.isLoading) {

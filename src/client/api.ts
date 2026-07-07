@@ -14,6 +14,7 @@ import type {
   NotifierTestBody,
 } from '@shared/schemas/connectors';
 import type { SystemInfoDto } from '@shared/schemas/system';
+import type { PublicConfigDto } from '@shared/schemas/config';
 
 export class ApiError extends Error {
   constructor(
@@ -47,6 +48,9 @@ async function parse<T>(res: Response): Promise<T> {
 const opts = (init?: RequestInit): RequestInit => ({ credentials: 'same-origin', ...init });
 
 export const getMe = () => fetch('/api/me', opts()).then(parse<MeDto>);
+
+/** Public, pre-auth config surface (instance badge). Reachable by both signed-in and signed-out tabs. */
+export const getPublicConfig = () => fetch('/api/config', opts()).then(parse<PublicConfigDto>);
 
 /** Update the caller's own requester-notification opt-in set. Self-scoped (PATCH /api/me). */
 export const updateMe = (body: UpdateMeBody) =>
