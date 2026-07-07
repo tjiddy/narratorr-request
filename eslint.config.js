@@ -20,6 +20,9 @@ export default tseslint.config(
       // Static browser bootstrap assets — served as-is, not part of the typed
       // source graph (tsconfig doesn't include them, so type-checked parsing can't).
       '**/src/client/public/**',
+      // One-shot operator scripts (plain CJS run inside the prod container) —
+      // outside the typed source graph for the same reason.
+      'scripts/**',
     ],
   },
 
