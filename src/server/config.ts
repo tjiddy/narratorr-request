@@ -132,6 +132,19 @@ const envSchema = z.object({
   // The default request quota (limit + rolling window) is no longer env-configured — it's
   // admin-editable in the Settings UI and stored in app_settings. A fresh DB seeds a sane
   // default (10 requests / rolling 30 days) via SettingsService.ensure().
+
+  // Display-only tab badge to tell a dev instance apart from prod when many tabs are open
+  // (favicon accent recolor + `[<badge>] ` title prefix, applied client-side). Free-form string
+  // (e.g. "dev"). This is the ONE display-only var in an otherwise auth+secrets env surface; it
+  // holds NO secret and is served publicly via `GET /api/config`. Unset / blank = prod = zero
+  // behavior change. Blank/whitespace collapses to undefined; a non-empty value is trimmed.
+  INSTANCE_BADGE: z
+    .string()
+    .optional()
+    .transform((v) => {
+      const t = v?.trim();
+      return t !== undefined && t !== '' ? t : undefined;
+    }),
 });
 
 const parsed = envSchema.safeParse(process.env);
@@ -310,6 +323,9 @@ export const config = {
   localAuth,
   oidcProviders,
   bootstrapAdmin,
+  // Optional (exactOptionalPropertyTypes): present only when configured, omitted when unset —
+  // so `AppConfig.instanceBadge` is `string | undefined` and the public route omits the field.
+  ...(env.INSTANCE_BADGE !== undefined && { instanceBadge: env.INSTANCE_BADGE }),
 };
 
 export type AppConfig = typeof config;

@@ -26,6 +26,7 @@ const GUARD_RE = /require(User|ActiveUser|Admin)\b/;
  */
 const PUBLIC_ALLOWLIST: ReadonlyArray<{ method: string; url: string }> = [
   { method: 'GET', url: '/api/health' },
+  { method: 'GET', url: '/api/config' },
   { method: 'GET', url: '/api/auth/providers' },
   { method: 'POST', url: '/api/auth/local/signup' },
   { method: 'POST', url: '/api/auth/local/login' },

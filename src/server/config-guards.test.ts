@@ -284,6 +284,33 @@ describe('config — BEHIND_TLS derivation', () => {
   });
 });
 
+describe('config — INSTANCE_BADGE (display-only tab badge)', () => {
+  // AUTH_BYPASS is neutralized so the standard-mode boot doesn't trip another guard (LOCAL_AUTH
+  // defaults on, so there's always a way in). instanceBadge is optional: present only when a
+  // non-empty value is set, omitted (undefined) otherwise — matching exactOptionalPropertyTypes.
+  it('absent → instanceBadge undefined (prod, zero behavior change)', async () => {
+    vi.stubEnv('INSTANCE_BADGE', undefined as unknown as string);
+    const mod = await loadConfig({ NODE_ENV: 'test', AUTH_BYPASS: '' });
+    expect(mod.config.instanceBadge).toBeUndefined();
+  });
+
+  it('empty / whitespace-only → undefined (unset)', async () => {
+    expect((await loadConfig({ NODE_ENV: 'test', AUTH_BYPASS: '', INSTANCE_BADGE: '' })).config.instanceBadge).toBeUndefined();
+    vi.unstubAllEnvs();
+    expect(
+      (await loadConfig({ NODE_ENV: 'test', AUTH_BYPASS: '', INSTANCE_BADGE: '   ' })).config.instanceBadge,
+    ).toBeUndefined();
+  });
+
+  it('non-empty value is trimmed and set', async () => {
+    expect((await loadConfig({ NODE_ENV: 'test', AUTH_BYPASS: '', INSTANCE_BADGE: 'dev' })).config.instanceBadge).toBe('dev');
+    vi.unstubAllEnvs();
+    expect(
+      (await loadConfig({ NODE_ENV: 'test', AUTH_BYPASS: '', INSTANCE_BADGE: '  dev  ' })).config.instanceBadge,
+    ).toBe('dev');
+  });
+});
+
 describe('config — env coercion', () => {
   it('rejects a non-numeric PORT', async () => {
     await expect(loadConfig({ PORT: '60abc' })).rejects.toThrow(/Invalid environment config/);
