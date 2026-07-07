@@ -4,6 +4,7 @@ import { redact } from './notifications/redact.js';
 import type { NotifierLogger } from './notifications/types.js';
 import type { RequesterEmailSender } from './notifications/requester-email.js';
 import type { UserService } from './user.service.js';
+import { normalizeContactEmail, sanitizeNotifyOn } from '../../shared/schemas/user.js';
 
 /**
  * Fire-and-forget `request.failed` admin heads-up (issue #60), split out of the state machine in
@@ -85,5 +86,40 @@ export function emitFailed(deps: RequestFailureNotifyDeps | undefined, row: Requ
     // Final backstop: both awaits above are individually guarded, so this only fires on a truly
     // unexpected throw. The failed transition already landed; swallow into a (redacted) breadcrumb.
     deps.logger?.warn({ err: redact(err), request: row.publicId }, 'request.failed: emission failed unexpectedly');
+  });
+}
+
+/**
+ * Fire-and-forget requester DECISION email (issue #131) — the approve/deny counterpart to the
+ * `available` sweep, but sent inline at decision time (these are informational; NO durable marker,
+ * a deliberate deviation from #121's at-least-once — a rare missed decision email is acceptable
+ * where a missed availability email is not). Routes through the SAME `RequesterEmailSender` seam and
+ * predicates the availability path uses — NOT the admin `notifier` — so it never emits an admin
+ * `NotificationEvent` or reaches the admin `cfg.to`. Sends only when the requester opted into this
+ * transition (`sanitizeNotifyOn(...).includes`) AND has a deliverable contact (`normalizeContactEmail`,
+ * the #120 shared predicates). `reason` is the admin's decision note (denied copy only, never
+ * `row.note`), rendered when supplied. Per-attempt catch-and-log isolates a send fault from the
+ * committed decision; no deps/sender → no-op.
+ */
+export function emitDecisionEmail(
+  deps: RequestFailureNotifyDeps | undefined,
+  row: RequestRow,
+  transition: 'approved' | 'denied',
+  reason: string | null,
+): void {
+  const sender = deps?.requesterEmail;
+  if (!deps || !sender) return;
+  void (async () => {
+    const requester = await deps.users.getById(row.userId);
+    if (!requester) return; // deleted account — nobody to email
+    const to = normalizeContactEmail(requester.email);
+    const optedIn = sanitizeNotifyOn(requester.notifyOn).includes(transition);
+    if (!optedIn || !to) return; // not opted in, or no deliverable contact — a permanent no-op
+    // reason applies to the denied copy only; renderRequesterMessage ignores it for approved.
+    await sender.send({ to, transition, request: { title: row.title, author: row.author }, ...(reason !== null && { reason }) });
+  })().catch((err) => {
+    // The decision already committed — never propagate. redact() before logging: a send fault can
+    // embed SMTP credentials. Keyed on publicId, NEVER the recipient (PII).
+    deps.logger?.warn({ err: redact(err), request: row.publicId }, `request.${transition}: requester email failed`);
   });
 }

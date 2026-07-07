@@ -72,13 +72,21 @@ export function registerAuthRoutes(app: FastifyInstance, deps: AppDeps): void {
     return buildMeDto(row);
   });
 
-  // Update the caller's own requester-notification opt-in set. Self-scoped — no target id, cannot
-  // mutate another user (requireUser gates it; the manifest test asserts the guard). Storage-
-  // permissive: a value outside NOTIFIABLE_TRANSITIONS is a 400 (Zod), but enabling without a
-  // usable email/SMTP is NOT a 403 — the set is stored and delivery is gated at send time.
+  // Update the caller's own account preferences: requester-notification opt-in set AND/OR contact
+  // email (issue #131). Self-scoped — no target id, cannot mutate another user (requireUser gates it;
+  // the manifest test asserts the guard). Both fields are INDEPENDENT and OPTIONAL. `notifyOn`:
+  // storage-permissive — a value outside NOTIFIABLE_TRANSITIONS is a 400 (Zod), but enabling without
+  // a usable email/SMTP is NOT a 403 (delivery gates at send time). `email`: omitted = no change,
+  // `null` clears the contact, a non-empty value is normalized + deliverability-validated by
+  // `contactEmailSchema` (invalid / "" → 400). The write touches only `notify_on` / `email`, never
+  // the login `authSubject`. Apply each provided field, then re-read for a consistent DTO echo.
   a.patch('/api/me', { schema: { body: updateMeBodySchema, response: { 200: meDtoSchema } } }, async (request) => {
     const user = requireUser(request);
-    const row = await deps.users.setNotifyOn(user.id, request.body.notifyOn);
+    const { notifyOn, email } = request.body;
+    if (email !== undefined) await deps.users.setContactEmail(user.id, email);
+    if (notifyOn !== undefined) await deps.users.setNotifyOn(user.id, notifyOn);
+    const row = await deps.users.getById(user.id);
+    if (!row) throw badRequest('NO_USER', 'session user no longer exists');
     return buildMeDto(row);
   });
 

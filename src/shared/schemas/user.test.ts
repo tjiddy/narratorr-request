@@ -189,29 +189,32 @@ describe('contactEmailSchema / normalizeContactEmail / hasDeliverableContact (is
   });
 });
 
-describe('NOTIFIABLE_TRANSITIONS (v1) — requester opt-in (#50)', () => {
-  it('ships `available` ONLY — no transition that lacks an emit site', () => {
-    expect(NOTIFIABLE_TRANSITIONS).toEqual(['available']);
+describe('NOTIFIABLE_TRANSITIONS — requester opt-in (#50/#131)', () => {
+  it('ships approved/denied/available in lifecycle order — each has a live emit site', () => {
+    expect(NOTIFIABLE_TRANSITIONS).toEqual(['approved', 'denied', 'available']);
   });
 });
 
 describe('notifiableTransitionSchema', () => {
-  it('accepts an in-const value', () => {
-    expect(notifiableTransitionSchema.safeParse('available').success).toBe(true);
+  it('accepts every in-const value', () => {
+    for (const good of ['approved', 'denied', 'available']) {
+      expect(notifiableTransitionSchema.safeParse(good).success).toBe(true);
+    }
   });
   it('rejects a value outside the const (a RequestStatus with no emit site, or garbage)', () => {
-    for (const bad of ['denied', 'failed', 'pending', 'approved', 'acquiring', '']) {
+    for (const bad of ['failed', 'pending', 'acquiring', 'bogus', '']) {
       expect(notifiableTransitionSchema.safeParse(bad).success).toBe(false);
     }
   });
 });
 
 describe('sanitizeNotifyOn — degrade-to-empty on a corrupt/legacy read', () => {
-  it('passes a clean array through', () => {
+  it('passes a clean array through (including the new transitions, subset-of-const)', () => {
     expect(sanitizeNotifyOn(['available'])).toEqual(['available']);
+    expect(sanitizeNotifyOn(['approved', 'denied'])).toEqual(['approved', 'denied']);
   });
   it('degrades a non-array / legacy / unknown value to empty', () => {
-    for (const bad of [null, undefined, 42, 'available', {}, ['available', 'denied'], ['bogus']]) {
+    for (const bad of [null, undefined, 42, 'available', {}, ['available', 'failed'], ['bogus']]) {
       expect(sanitizeNotifyOn(bad)).toEqual([]);
     }
   });
@@ -220,6 +223,7 @@ describe('sanitizeNotifyOn — degrade-to-empty on a corrupt/legacy read', () =>
   });
   it('hasNotifyOn is true iff sanitizeNotifyOn yields a real opt-in', () => {
     expect(hasNotifyOn(['available'])).toBe(true);
+    expect(hasNotifyOn(['approved'])).toBe(true);
     expect(hasNotifyOn(['bogus'])).toBe(false); // outside the const → degrades to empty → no opt-in
     expect(hasNotifyOn([])).toBe(false);
     expect(hasNotifyOn('not-an-array')).toBe(false); // non-array degrades to empty, like sanitizeNotifyOn
@@ -227,18 +231,46 @@ describe('sanitizeNotifyOn — degrade-to-empty on a corrupt/legacy read', () =>
 });
 
 describe('updateMeBodySchema (PATCH /api/me)', () => {
-  it('accepts a valid notifyOn set (including empty)', () => {
+  it('accepts a valid notifyOn set (including the new approved/denied and empty)', () => {
     expect(updateMeBodySchema.safeParse({ notifyOn: ['available'] }).success).toBe(true);
+    expect(updateMeBodySchema.safeParse({ notifyOn: ['approved', 'denied'] }).success).toBe(true);
     expect(updateMeBodySchema.safeParse({ notifyOn: [] }).success).toBe(true);
   });
   it('rejects a value outside NOTIFIABLE_TRANSITIONS (→ 400)', () => {
-    expect(updateMeBodySchema.safeParse({ notifyOn: ['denied'] }).success).toBe(false);
     expect(updateMeBodySchema.safeParse({ notifyOn: ['failed'] }).success).toBe(false);
+    expect(updateMeBodySchema.safeParse({ notifyOn: ['pending'] }).success).toBe(false);
   });
   it('is strict — a stray key (e.g. smuggling role) is rejected', () => {
     expect(updateMeBodySchema.safeParse({ notifyOn: ['available'], role: 'admin' }).success).toBe(false);
   });
-  it('requires notifyOn', () => {
-    expect(updateMeBodySchema.safeParse({}).success).toBe(false);
+
+  describe('email — set / clear / omit contract (#131)', () => {
+    it('omitting email (notifyOn-only) is valid — no contact change', () => {
+      expect(updateMeBodySchema.safeParse({ notifyOn: ['available'] }).success).toBe(true);
+    });
+    it('an empty body is valid — email AND notifyOn are both optional (neither = no change)', () => {
+      expect(updateMeBodySchema.safeParse({}).success).toBe(true);
+    });
+    it('email null is valid — the clear sentinel', () => {
+      const parsed = updateMeBodySchema.safeParse({ email: null });
+      expect(parsed.success).toBe(true);
+      if (parsed.success) expect(parsed.data.email).toBeNull();
+    });
+    it('a valid email is normalized (trim + lowercase) by the shared contactEmailSchema', () => {
+      const parsed = updateMeBodySchema.safeParse({ email: '  Todd@Example.COM ' });
+      expect(parsed.success).toBe(true);
+      if (parsed.success) expect(parsed.data.email).toBe('todd@example.com');
+    });
+    it('email and notifyOn are independent — a body may carry both', () => {
+      expect(updateMeBodySchema.safeParse({ email: 'a@b.com', notifyOn: ['approved'] }).success).toBe(true);
+    });
+    it('email "" is a 400 (NOT a clear) — contactEmailSchema rejects the empty string', () => {
+      expect(updateMeBodySchema.safeParse({ email: '' }).success).toBe(false);
+    });
+    it('rejects an invalid / whitespace-only / over-254 email (→ 400)', () => {
+      expect(updateMeBodySchema.safeParse({ email: 'not-an-email' }).success).toBe(false);
+      expect(updateMeBodySchema.safeParse({ email: '   ' }).success).toBe(false);
+      expect(updateMeBodySchema.safeParse({ email: `${'a'.repeat(250)}@example.com` }).success).toBe(false);
+    });
   });
 });

@@ -48,17 +48,32 @@ export interface RequesterMessage {
  * Build the user-facing message for a requester transition. Distinct from the admin `render()`:
  * every link points at the requester's own My Requests page (`/requests`), never `/admin` or
  * `/users`. `baseUrl` is the app's public origin (no trailing slash) or null; a null base yields
- * a link-free message rather than a dead relative link. Switches on `transition` so a future
- * `denied`/`failed` entry is a compile error until it's given copy (v1: `available` only).
+ * a link-free message rather than a dead relative link. Switches on `transition` so a new
+ * `NotifiableTransition` is a compile error until it's given copy (approved/denied/available).
+ * `reason` is the admin's decision note, rendered as a second paragraph on a `denied` message ONLY
+ * when supplied — never the requester's own note (issue #131), never shown for other transitions.
  */
 export function renderRequesterMessage(
   transition: NotifiableTransition,
   request: { title: string; author: string | null },
   baseUrl: string | null,
+  reason?: string | null,
 ): RequesterMessage {
   const by = request.author ? ` by ${request.author}` : '';
-  const { title, body } = ((): { title: string; body: string } => {
+  const { title, body, detail } = ((): { title: string; body: string; detail?: string } => {
     switch (transition) {
+      case 'approved':
+        return {
+          title: 'Your request was approved',
+          body: `“${request.title}”${by} was approved and is on its way to your library.`,
+        };
+      case 'denied':
+        return {
+          title: 'Your request was declined',
+          body: `“${request.title}”${by} was declined.`,
+          // Only the admin's decision note surfaces here (never `row.note`), and only when supplied.
+          ...(reason ? { detail: `Reason: ${reason}` } : {}),
+        };
       case 'available':
         return {
           title: 'Your audiobook is ready',
@@ -73,14 +88,16 @@ export function renderRequesterMessage(
   })();
   const url = baseUrl ? `${baseUrl}/requests` : null;
   const linkLabel = 'Open My Requests';
-  // Escape EVERY interpolated value at the HTML boundary (href, label, body) rather than
-  // reasoning per-value about trust — mirrors the admin EmailChannel's uniform escaping so the
-  // message stays injection-proof if PUBLIC_URL (in the href) ever carries a metacharacter.
+  // Body plus an optional reason paragraph (denied only), then the link. Escape EVERY interpolated
+  // value at the HTML boundary (href, label, body, reason) rather than reasoning per-value about
+  // trust — mirrors the admin EmailChannel's uniform escaping so the message stays injection-proof
+  // if PUBLIC_URL (in the href) or an admin's note ever carries a metacharacter.
+  const paragraphs = detail ? [body, detail] : [body];
   const link = url ? `<p><a href="${escapeHtml(url)}">${escapeHtml(linkLabel)}</a></p>` : '';
   return {
     subject: title,
-    text: url ? `${body}\n\n${url}` : body,
-    html: `<p>${escapeHtml(body)}</p>${link}`,
+    text: [...paragraphs, ...(url ? [url] : [])].join('\n\n'),
+    html: `${paragraphs.map((p) => `<p>${escapeHtml(p)}</p>`).join('')}${link}`,
   };
 }
 
@@ -91,6 +108,12 @@ export interface RequesterEmailArgs {
   to: string;
   transition: NotifiableTransition;
   request: { title: string; author: string | null };
+  /**
+   * The admin's decision note for a `denied` transition (issue #131) — rendered as the denial reason.
+   * The ONLY reason source: threaded explicitly from `decision.note`, NEVER the requester's own
+   * `row.note`. Omitted for approved/available (no reason line).
+   */
+  reason?: string;
 }
 
 /**
@@ -131,7 +154,7 @@ export class RequesterEmailService implements RequesterEmailSender {
       // NEVER log `args.to` (the recipient is PII) — the sweep owns the operator-facing log.
       return 'skipped-no-config';
     }
-    const message = renderRequesterMessage(args.transition, args.request, cfg.publicUrl);
+    const message = renderRequesterMessage(args.transition, args.request, cfg.publicUrl, args.reason ?? null);
     const transport = buildRequesterTransport(source);
     await transport.sendMail({
       from: source.from,
