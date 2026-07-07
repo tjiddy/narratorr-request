@@ -89,13 +89,56 @@ describe('UserService OIDC upsert + approval queue', () => {
     expect((await svc.listAll()).length).toBe(2);
   });
 
-  it('refreshes display fields for a returning active user (and reports created=false)', async () => {
+  it('refreshes display fields for a returning active user but PRESERVES the stored contact email (#131 backfill-only)', async () => {
     const created = await svc.upsertFromOidc('plex', prof('p1', 'old-name', 'old@x.com'));
     expect(created.created).toBe(true);
     const again = await svc.upsertFromOidc('plex', prof('p1', 'new-name', 'new@x.com'));
     expect(again.created).toBe(false); // returning login — not a new signup, no notification
     expect(again.user.id).toBe(created.user.id);
-    expect(again.user).toMatchObject({ username: 'new-name', email: 'new@x.com' });
+    // username refreshes; the contact email is BACKFILL-ONLY, so a differing claim does NOT overwrite it.
+    expect(again.user).toMatchObject({ username: 'new-name', email: 'old@x.com' });
+  });
+
+  describe('contact-email precedence: manual wins until cleared (#131)', () => {
+    it('backfills the contact from the claim when the row has none', async () => {
+      const created = await svc.upsertFromOidc('plex', prof('p1', 'todd', null)); // first login, no email claim
+      expect(created.user.email).toBeNull();
+      const reauth = await svc.upsertFromOidc('plex', prof('p1', 'todd', 'claim@x.com')); // later login carries one
+      expect(reauth.user.email).toBe('claim@x.com'); // row had none → backfilled
+    });
+
+    it('a stored contact wins over a differing later claim (manual edit survives re-login)', async () => {
+      const created = await svc.upsertFromOidc('plex', prof('p1', 'todd', null));
+      await svc.setContactEmail(created.user.id, 'manual@x.com'); // user edits the account email
+      const reauth = await svc.upsertFromOidc('plex', prof('p1', 'todd', 'claim@x.com'));
+      expect(reauth.user.email).toBe('manual@x.com'); // stored wins, claim ignored
+    });
+
+    it('clearing the contact (null) re-enables provider backfill on the next login', async () => {
+      const created = await svc.upsertFromOidc('plex', prof('p1', 'todd', 'first@x.com'));
+      await svc.setContactEmail(created.user.id, null); // user clears it
+      const reauth = await svc.upsertFromOidc('plex', prof('p1', 'todd', 'claim@x.com'));
+      expect(reauth.user.email).toBe('claim@x.com'); // row now has none → backfilled again
+    });
+  });
+
+  describe('setContactEmail — self-scoped contact write (#131)', () => {
+    it('sets and clears the contact email without touching the login authSubject', async () => {
+      const created = await svc.upsertFromOidc('plex', prof('p1', 'todd', null));
+      const subject = created.user.authSubject;
+
+      const set = await svc.setContactEmail(created.user.id, 'contact@x.com');
+      expect(set.email).toBe('contact@x.com');
+      expect(set.authSubject).toBe(subject); // login identity untouched
+
+      const cleared = await svc.setContactEmail(created.user.id, null);
+      expect(cleared.email).toBeNull();
+      expect(cleared.authSubject).toBe(subject);
+    });
+
+    it('throws not-found for an unknown user id', async () => {
+      await expect(svc.setContactEmail(9999, 'x@x.com')).rejects.toMatchObject({ statusCode: 404 });
+    });
   });
 
   // issue #120: an OIDC email claim now passes through the deliverability gate in the mapper

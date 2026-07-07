@@ -87,6 +87,38 @@ describe('renderRequesterMessage (available)', () => {
   });
 });
 
+describe('renderRequesterMessage (approved/denied — #131)', () => {
+  it('approved: distinct subject + body, links to My Requests, ignores any reason', () => {
+    const msg = renderRequesterMessage('approved', { title: 'Dune', author: 'Herbert' }, 'https://reqs.example.com', 'ignored');
+    expect(msg.subject).toMatch(/approved/i);
+    expect(msg.text).toContain('Dune');
+    expect(msg.text).toContain('https://reqs.example.com/requests');
+    expect(msg.text).not.toContain('ignored'); // approved copy carries no reason line
+    expect(msg.text).not.toContain('/admin');
+  });
+
+  it('denied WITH an admin reason renders it as a second paragraph', () => {
+    const msg = renderRequesterMessage('denied', { title: 'Dune', author: 'Herbert' }, null, 'Not in budget');
+    expect(msg.subject).toMatch(/declined/i);
+    expect(msg.text).toContain('declined');
+    expect(msg.text).toContain('Reason: Not in budget');
+    expect(msg.html).toContain('<p>Reason: Not in budget</p>');
+  });
+
+  it('denied WITHOUT a reason renders no reason line (null and undefined alike)', () => {
+    for (const reason of [null, undefined]) {
+      const msg = renderRequesterMessage('denied', { title: 'Dune', author: null }, null, reason);
+      expect(msg.text).not.toMatch(/reason/i);
+      expect(msg.html).not.toMatch(/reason/i);
+    }
+  });
+
+  it('escapes an admin reason at the HTML boundary (injection-proof)', () => {
+    const msg = renderRequesterMessage('denied', { title: 'Dune', author: null }, null, 'A & <b>bad</b>');
+    expect(msg.html).toContain('Reason: A &amp; &lt;b&gt;bad&lt;/b&gt;');
+  });
+});
+
 describe('RequesterEmailService.send', () => {
   beforeEach(() => {
     sendMail.mockReset();

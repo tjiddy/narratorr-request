@@ -36,12 +36,14 @@ export type RequestQuotaMode = (typeof REQUEST_QUOTA_MODES)[number];
 // --- Requester notification opt-in -------------------------------------------
 // The transitions a requester can opt into being emailed about. A DEDICATED const — NOT
 // the 6-value RequestStatus — because only transitions with a real emit site belong here
-// (pending/approved/acquiring never email anyone, so reusing RequestStatus would ship
-// checkboxes that can never fire). This is the single source of truth for the opt-in Zod
-// schema, the client control, and emit-site coverage. v1 ships `available` only; the
-// `denied`/`failed` entries land in the follow-up ALONGSIDE their emit sites, so the const
-// never lists a transition that can't fire (issue #50).
-export const NOTIFIABLE_TRANSITIONS = ['available'] as const;
+// (pending/acquiring never email anyone, so reusing RequestStatus would ship checkboxes
+// that can never fire). This is the single source of truth for the opt-in Zod schema, the
+// client control, and emit-site coverage. Ordered approved → denied → available to match the
+// request lifecycle: each entry has a live emit site (decision-time sends in
+// `RequestService.decide`, availability via the poller sweep), so the const never lists a
+// transition that can't fire (issues #50, #131). `renderRequesterMessage`'s exhaustiveness
+// guard forces copy for every entry here at compile time.
+export const NOTIFIABLE_TRANSITIONS = ['approved', 'denied', 'available'] as const;
 export type NotifiableTransition = (typeof NOTIFIABLE_TRANSITIONS)[number];
 export const notifiableTransitionSchema = z.enum(NOTIFIABLE_TRANSITIONS);
 
@@ -155,14 +157,23 @@ export const meDtoSchema = userDtoSchema.extend({
 });
 export type MeDto = z.infer<typeof meDtoSchema>;
 
-// `PATCH /api/me` — the self-scoped opt-in write. Body carries ONLY `notifyOn`; each element
-// must be in `NOTIFIABLE_TRANSITIONS` (v1: `available`) or Zod rejects it (400). Strict so a
-// stray key (e.g. an attempt to smuggle `role`) is refused — this endpoint can never mutate
-// anything but the caller's own opt-in set. The set is stored as-is regardless of email/SMTP
-// state (storage-permissive; no 403 on enable-without-contact).
+// `PATCH /api/me` — the self-scoped account write. Carries the caller's own requester-notification
+// opt-in set AND/OR their contact email; both fields are INDEPENDENT and OPTIONAL, so a body may
+// set email only, notifyOn only, both, or neither.
+//   • `notifyOn` — each element must be in `NOTIFIABLE_TRANSITIONS` or Zod rejects it (400). Omitted
+//     leaves the stored set untouched. Stored as-is regardless of email/SMTP state
+//     (storage-permissive; no 403 on enable-without-contact).
+//   • `email` — the stored CONTACT address (never the login `authSubject`). Omitted = no change;
+//     `null` clears it (re-enabling OIDC backfill next login); a non-empty value is trimmed +
+//     lowercased + validated by the shared `contactEmailSchema` (#120), so an invalid /
+//     whitespace-only / over-254 value is a 400. Because `contactEmailSchema` rejects the empty
+//     string, `email: ""` is a 400 (NOT a clear) — clearing is `email: null` only.
+// Strict so a stray key (e.g. an attempt to smuggle `role`) is refused — this endpoint can never
+// mutate anything but the caller's own opt-in set and contact email.
 export const updateMeBodySchema = z
   .object({
-    notifyOn: z.array(notifiableTransitionSchema),
+    notifyOn: z.array(notifiableTransitionSchema).optional(),
+    email: contactEmailSchema.nullable().optional(),
   })
   .strict();
 export type UpdateMeBody = z.infer<typeof updateMeBodySchema>;

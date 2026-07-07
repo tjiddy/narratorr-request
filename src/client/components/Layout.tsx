@@ -1,11 +1,12 @@
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
-import type { ComponentType } from 'react';
+import { useState, type ComponentType } from 'react';
 import type { MeDto } from '@shared/schemas/user';
 import { logout } from '../api';
 import { useTheme } from '../hooks';
 import { Button } from './Button';
+import { AccountModal } from './AccountModal';
 import { ErrorBoundary } from './ErrorBoundary';
 import { SunIcon, MoonIcon, HeadphonesIcon, SearchIcon, InboxIcon, ActivityIcon, UsersIcon, SettingsIcon } from './icons';
 
@@ -39,6 +40,8 @@ export function Layout({ me }: { me: MeDto }) {
   const location = useLocation();
   const qc = useQueryClient();
   const { theme, toggleTheme } = useTheme();
+  const [accountOpen, setAccountOpen] = useState(false);
+  const accountInitial = me.username.charAt(0).toUpperCase() || '?';
 
   async function onLogout() {
     try {
@@ -80,10 +83,19 @@ export function Layout({ me }: { me: MeDto }) {
                 ))}
             </nav>
             <div className="ml-1 flex items-center gap-2 sm:gap-3 text-sm">
-              <span className="hidden text-muted-foreground sm:inline">
-                {me.username}
-                {me.role === 'admin' && <span className="ml-1 text-primary">★</span>}
-              </span>
+              {/* Account trigger — avatar + username, opens the account modal (#131). */}
+              <button
+                type="button"
+                onClick={() => setAccountOpen(true)}
+                aria-haspopup="dialog"
+                className="hidden items-center gap-2 rounded-xl px-2 py-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-ring sm:flex"
+              >
+                <span className="flex h-6 w-6 items-center justify-center rounded-full bg-gradient-to-br from-primary to-amber-500 text-xs font-semibold text-primary-foreground">
+                  {accountInitial}
+                </span>
+                <span>{me.username}</span>
+                {me.role === 'admin' && <span className="text-primary">★</span>}
+              </button>
               <Button
                 variant="ghost"
                 size="sm"
@@ -98,6 +110,7 @@ export function Layout({ me }: { me: MeDto }) {
           </div>
         </div>
       </header>
+      <AccountModal me={me} open={accountOpen} onClose={() => setAccountOpen(false)} />
       <main className="mx-auto max-w-5xl px-4 py-8">
         {/*
           Reset the boundary on navigation. We key on the full `pathname` (params included),
