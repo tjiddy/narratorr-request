@@ -6,6 +6,7 @@ import {
   providerLabel,
   isEmailDirty,
   emailPatchValue,
+  reconciledEmailDraft,
 } from './notify-prefs.js';
 import { NOTIFIABLE_TRANSITIONS } from '@shared/schemas/user';
 
@@ -101,5 +102,25 @@ describe('emailPatchValue — PATCH body email from the draft (#131)', () => {
   it('sends the trimmed value otherwise (server normalizes + validates)', () => {
     expect(emailPatchValue('  New@X.com ')).toBe('New@X.com');
     expect(emailPatchValue('new@x.com')).toBe('new@x.com');
+  });
+});
+
+describe('reconciledEmailDraft — post-save draft reset leaves Save clean (#131 F2)', () => {
+  it('adopts the server-normalized value so a case-normalized save is no longer dirty', () => {
+    // The user typed `New@Contact.COM`; the server returns it normalized as `new@contact.com`.
+    const saved = 'new@contact.com';
+    const draft = reconciledEmailDraft(saved);
+    expect(draft).toBe('new@contact.com'); // reconciled to the returned DTO value
+    expect(isEmailDirty(saved, draft)).toBe(false); // Save is no longer falsely amber/enabled
+  });
+  it('maps a cleared contact (null) to an empty draft that reads clean', () => {
+    const draft = reconciledEmailDraft(null);
+    expect(draft).toBe('');
+    expect(isEmailDirty(null, draft)).toBe(false);
+  });
+  it('reconciling the saved value is idempotent-clean for any returned contact', () => {
+    for (const saved of ['todd@x.com', null]) {
+      expect(isEmailDirty(saved, reconciledEmailDraft(saved))).toBe(false);
+    }
   });
 });

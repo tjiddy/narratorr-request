@@ -10,6 +10,7 @@ import {
   providerLabel,
   isEmailDirty,
   emailPatchValue,
+  reconciledEmailDraft,
 } from '../pages/notify-prefs';
 import { Dialog } from './Dialog';
 import { BellIcon } from './icons';
@@ -48,7 +49,12 @@ function AccountModalContent({ me, headingId }: { me: MeDto; headingId: string }
     setEmailError(null);
     save.mutate(
       { email: emailPatchValue(email) },
-      { onError: (err) => setEmailError(err instanceof ApiError ? err.message : 'Could not save email') },
+      {
+        // Reconcile the draft to the server-normalized contact so a case-normalized save (e.g.
+        // New@Contact.COM -> new@contact.com) doesn't leave Save falsely dirty (F2).
+        onSuccess: (dto) => setEmail(reconciledEmailDraft(dto.email)),
+        onError: (err) => setEmailError(err instanceof ApiError ? err.message : 'Could not save email'),
+      },
     );
   };
 

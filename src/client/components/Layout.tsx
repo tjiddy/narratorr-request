@@ -83,18 +83,21 @@ export function Layout({ me }: { me: MeDto }) {
                 ))}
             </nav>
             <div className="ml-1 flex items-center gap-2 sm:gap-3 text-sm">
-              {/* Account trigger — avatar + username, opens the account modal (#131). */}
+              {/* Account trigger — avatar + username, opens the account modal (#131). The avatar is
+                  always visible so the modal is reachable on mobile too (account preferences moved
+                  here off My Requests); the username + admin star show from `sm` up. */}
               <button
                 type="button"
                 onClick={() => setAccountOpen(true)}
                 aria-haspopup="dialog"
-                className="hidden items-center gap-2 rounded-xl px-2 py-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-ring sm:flex"
+                aria-label="Account"
+                className="flex items-center gap-2 rounded-xl px-1.5 py-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-ring sm:px-2"
               >
-                <span className="flex h-6 w-6 items-center justify-center rounded-full bg-gradient-to-br from-primary to-amber-500 text-xs font-semibold text-primary-foreground">
+                <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-primary to-amber-500 text-xs font-semibold text-primary-foreground">
                   {accountInitial}
                 </span>
-                <span>{me.username}</span>
-                {me.role === 'admin' && <span className="text-primary">★</span>}
+                <span className="hidden sm:inline">{me.username}</span>
+                {me.role === 'admin' && <span className="hidden text-primary sm:inline">★</span>}
               </button>
               <Button
                 variant="ghost"

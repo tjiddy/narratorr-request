@@ -79,3 +79,15 @@ export function emailPatchValue(draft: string): string | null {
   const trimmed = draft.trim();
   return trimmed === '' ? null : trimmed;
 }
+
+/**
+ * The email draft to adopt after a SUCCESSFUL save, reconciled to the server's returned contact
+ * (`MeDto.email`, already normalized: trimmed + lowercased, or `null` when cleared). Without this,
+ * a save of e.g. `New@Contact.COM` normalizes server-side to `new@contact.com` while the input keeps
+ * the pre-normalized draft, so {@link isEmailDirty} — a case-sensitive compare — would leave Save
+ * falsely amber. Resetting the draft to the returned value makes the row clean again. Composing this
+ * with `isEmailDirty(saved, reconciledEmailDraft(saved))` is always `false` — the tested invariant.
+ */
+export function reconciledEmailDraft(saved: string | null): string {
+  return saved ?? '';
+}
