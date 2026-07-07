@@ -21,3 +21,6 @@ PLAN-*.md
 *HANDOFF*.md
 ASSESSMENT.md
 audit-reports/
+
+# Local home for non-committing session artifacts (plans, reviews, assessments)
+/.scratch/
