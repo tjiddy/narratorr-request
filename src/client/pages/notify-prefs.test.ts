@@ -7,6 +7,7 @@ import {
   isEmailDirty,
   emailPatchValue,
   reconciledEmailDraft,
+  meSuccessToast,
 } from './notify-prefs.js';
 import { NOTIFIABLE_TRANSITIONS } from '@shared/schemas/user';
 
@@ -122,5 +123,25 @@ describe('reconciledEmailDraft — post-save draft reset leaves Save clean (#131
     for (const saved of ['todd@x.com', null]) {
       expect(isEmailDirty(saved, reconciledEmailDraft(saved))).toBe(false);
     }
+  });
+});
+
+describe('meSuccessToast — success feedback proportional to the payload (#134)', () => {
+  it('toasts "Email saved" when the body sets an email (explicit commit deserves an ack)', () => {
+    expect(meSuccessToast({ email: 'new@x.com' })).toBe('Email saved');
+  });
+  it('toasts "Email saved" when the body clears the email (email: null)', () => {
+    expect(meSuccessToast({ email: null })).toBe('Email saved');
+  });
+  it('is silent (null) for a notifyOn-only body — the persisted checkbox is the confirmation', () => {
+    expect(meSuccessToast({ notifyOn: ['available'] })).toBeNull();
+    expect(meSuccessToast({ notifyOn: [] })).toBeNull();
+  });
+  it('is silent (null) for an empty body (nothing changed)', () => {
+    expect(meSuccessToast({})).toBeNull();
+  });
+  it('prefers "Email saved" when both fields ride one body (the explicit-commit action wins)', () => {
+    expect(meSuccessToast({ email: 'new@x.com', notifyOn: ['available'] })).toBe('Email saved');
+    expect(meSuccessToast({ email: null, notifyOn: [] })).toBe('Email saved');
   });
 });
