@@ -1,4 +1,4 @@
-import { NOTIFIABLE_TRANSITIONS, type NotifiableTransition } from '@shared/schemas/user';
+import { NOTIFIABLE_TRANSITIONS, type NotifiableTransition, type UpdateMeBody } from '@shared/schemas/user';
 
 // Pure logic for the account modal (issue #131): the requester-notification opt-in checkboxes, the
 // contact-email save row, and the identity provider line. Extracted from the React component so
@@ -90,4 +90,21 @@ export function emailPatchValue(draft: string): string | null {
  */
 export function reconciledEmailDraft(saved: string | null): string {
   return saved ?? '';
+}
+
+/**
+ * The success toast for a `useUpdateMe` mutation, or `null` for none — feedback proportional to the
+ * action (#134). The account modal routes two shapes through one hook: an explicit email Save and
+ * instant-apply notification checkboxes.
+ *   • Any body carrying `email` (set OR `null`-clear) → "Email saved". An explicit commit button
+ *     deserves an acknowledgment, and the field looks identical before/after, so nothing else
+ *     confirms it. When BOTH fields ride one body the explicit-commit action wins.
+ *   • A `notifyOn`-only body → `null` (silent). The persisted checkbox is the confirmation (the
+ *     platform convention for instant-apply toggles), which also avoids toast-stacking when several
+ *     boxes are toggled.
+ * Keyed on the presence of the `email` KEY, not its value, so a `email: null` clear still toasts.
+ * Errors are handled separately in the hook and always toast, regardless of shape.
+ */
+export function meSuccessToast(body: UpdateMeBody): string | null {
+  return 'email' in body ? 'Email saved' : null;
 }
