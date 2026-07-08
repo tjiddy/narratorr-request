@@ -6,8 +6,10 @@ An [Overseerr](https://overseerr.dev/)-style request manager for
 search/browse audiobooks, and request them. New users land in an **approval queue** until an
 admin lets them in; an admin then approves each request (admins and auto-approve users skip the queue); approved
 requests hand off to Narratorr's `search → download → import` pipeline, and the requester tracks
-progress to **available** on their **My requests** page. Notifications are admin-facing — a new
-request to review, a new signup awaiting approval — not requester-facing.
+progress to **available** on their **My requests** page. Admins get notified (new request to
+review, new signup, failed acquisition) over any notifiers they add; requesters can opt in — via
+the account modal behind their username — to be emailed when their request is **approved**,
+**denied**, or **ready to listen**.
 
 It is a **plug-in sidecar** that talks to Narratorr only over its public `/api/v1` HTTP
 surface (API key). It has no other coupling. The Narratorr connection and the notifiers
@@ -69,7 +71,7 @@ Authentication (who you are) is **pluggable**; authorization (who may request) i
 The admin **Settings** page configures, and stores encrypted at rest:
 
 - **Narratorr connection** — base URL + API key (the lifeline; required for search/requests).
-- **Notifiers** — a list of destinations (ntfy, email/SMTP, generic/Discord webhook). Each has a name, an enabled toggle, the events it fires on (new request / new signup), and a **Test** button — add as many as you like, including several of the same type routed to different events.
+- **Notifiers** — a list of destinations (ntfy, email/SMTP, generic/Discord webhook). Each has a name, an enabled toggle, the events it fires on (new request / new signup), and a **Test** button — add as many as you like, including several of the same type routed to different events. The email/SMTP notifier also delivers the **requester opt-in emails** (approved / denied / ready-to-listen) to each user's own contact address.
 - **Public URL** — used to deep-link notifications back to the request queue.
 
 Secrets are never returned to the browser (the form shows `•••••••• (unchanged)`). The at-rest key
