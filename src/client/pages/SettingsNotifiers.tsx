@@ -1,11 +1,11 @@
-import { useState, useEffect, useRef } from 'react';
-import { createPortal } from 'react-dom';
+import { useState, useId } from 'react';
 import type { NotifierDto, KnownNotifierDto } from '@shared/schemas/connectors';
 import { NOTIFIER_REGISTRY, NOTIFIER_TYPES, type NotifierType, type NotifierField } from '@shared/notifier-registry';
 import { NOTIFICATION_EVENTS } from '@shared/notification-events';
 import { useCreateNotifier, useUpdateNotifier, useDeleteNotifier, useTestNotifier } from '../hooks';
 import { Button } from '../components/Button';
 import { BellIcon, PlusIcon, PencilIcon, SendIcon, TrashIcon } from '../components/icons';
+import { Dialog } from '../components/Dialog';
 import { Field, SectionHeader, SettingsCard } from './settings-ui';
 import { inputCls, secretPlaceholder } from './settings-fields';
 import {
@@ -174,7 +174,7 @@ function NotifierModal({
   const edit = useUpdateNotifier();
   const test = useTestNotifier();
   const [submitted, setSubmitted] = useState(false);
-  const nameRef = useRef<HTMLInputElement>(null);
+  const headingId = useId();
 
   const def = NOTIFIER_REGISTRY[form.type];
   const errors = validateNotifierForm(form);
@@ -183,18 +183,6 @@ function NotifierModal({
 
   const setField = (key: string, value: string | boolean) => setForm({ ...form, fields: { ...form.fields, [key]: value } });
   const setClear = (key: string, value: boolean) => setForm({ ...form, clear: { ...form.clear, [key]: value } });
-
-  // Focus the first field on open (once); close on Escape.
-  useEffect(() => {
-    nameRef.current?.focus();
-  }, []);
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
 
   function save() {
     setSubmitted(true);
@@ -214,68 +202,62 @@ function NotifierModal({
     if (body) test.mutate(body);
   }
 
-  // Portaled to <body> so position:fixed is viewport-relative — escapes the Settings page's
-  // backdrop-blur (glass-card) ancestor that would otherwise trap the overlay (off-center,
-  // partial dim, bleed-through). Outer glass-card → p-6 → inner glass-card = the two-level border.
-  return createPortal(
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-black/80 backdrop-blur-sm" onClick={onClose} />
-      <div role="dialog" aria-modal="true" className="relative flex max-h-[85vh] w-full max-w-3xl flex-col rounded-2xl glass-card shadow-2xl">
-        <div className="overflow-y-auto p-6">
-          <div className="flex flex-col gap-5 rounded-2xl glass-card p-6">
-            <p className="font-display text-lg font-semibold">{form.id ? 'Edit notifier' : 'Add notifier'}</p>
+  // Dialog owns the portal-to-<body> (escaping the Settings page's backdrop-blur ancestor),
+  // overlay, Esc/overlay-click close, and focus capture/return. The wide two-column form scrolls
+  // internally via Dialog's `scrollBody` when it exceeds the viewport.
+  return (
+    <Dialog open onClose={onClose} size="lg" scrollBody labelledBy={headingId}>
+      <div className="flex flex-col gap-5 p-6">
+        <p id={headingId} className="font-display text-lg font-semibold">{form.id ? 'Edit notifier' : 'Add notifier'}</p>
 
-            <div className="grid gap-5 sm:grid-cols-2">
-              <Field label="Name" error={showError('name')}>
-                <input ref={nameRef} className={inputCls} value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="e.g. My phone" />
-              </Field>
+        <div className="grid gap-5 sm:grid-cols-2">
+          <Field label="Name" error={showError('name')}>
+            <input className={inputCls} value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="e.g. My phone" />
+          </Field>
 
-              <Field label="Type">
-                <select className={inputCls} value={form.type} disabled={form.id !== null} onChange={(e) => setForm(newNotifierForm(e.target.value as NotifierType))}>
-                  {NOTIFIER_TYPES.map((t) => (
-                    <option key={t} value={t}>
-                      {NOTIFIER_REGISTRY[t].label}
-                    </option>
-                  ))}
-                </select>
-              </Field>
-
-              <div className="sm:col-span-2">
-                <Field label="Events" error={showError('events')} hint="Which events this notifier fires on.">
-                  <div className="flex flex-wrap gap-x-5 gap-y-2">
-                    {NOTIFICATION_EVENTS.map((ev) => (
-                      <label key={ev.key} className="flex items-center gap-2 text-sm">
-                        <input type="checkbox" className="h-4 w-4 accent-primary" checked={form.events.includes(ev.key)} onChange={() => setForm({ ...form, events: toggleEvent(form.events, ev.key) })} />
-                        <span>{ev.label}</span>
-                      </label>
-                    ))}
-                  </div>
-                </Field>
-              </div>
-
-              {def.fields.map((f) => (
-                <NotifierFieldInput key={f.key} field={f} form={form} setField={setField} setClear={setClear} error={showError(f.key)} />
+          <Field label="Type">
+            <select className={inputCls} value={form.type} disabled={form.id !== null} onChange={(e) => setForm(newNotifierForm(e.target.value as NotifierType))}>
+              {NOTIFIER_TYPES.map((t) => (
+                <option key={t} value={t}>
+                  {NOTIFIER_REGISTRY[t].label}
+                </option>
               ))}
-            </div>
+            </select>
+          </Field>
 
-            <div className="flex items-center justify-between gap-2 border-t border-border/50 pt-4">
-              <Button variant="secondary" size="sm" icon={SendIcon} loading={test.isPending} onClick={runTest}>
-                Test
-              </Button>
-              <div className="flex items-center gap-2">
-                <Button variant="ghost" size="sm" onClick={onClose}>
-                  Cancel
-                </Button>
-                <Button variant="primary" size="sm" loading={create.isPending || edit.isPending} onClick={save}>
-                  {form.id ? 'Save' : 'Add'}
-                </Button>
+          <div className="sm:col-span-2">
+            <Field label="Events" error={showError('events')} hint="Which events this notifier fires on.">
+              <div className="flex flex-wrap gap-x-5 gap-y-2">
+                {NOTIFICATION_EVENTS.map((ev) => (
+                  <label key={ev.key} className="flex items-center gap-2 text-sm">
+                    <input type="checkbox" className="h-4 w-4 accent-primary" checked={form.events.includes(ev.key)} onChange={() => setForm({ ...form, events: toggleEvent(form.events, ev.key) })} />
+                    <span>{ev.label}</span>
+                  </label>
+                ))}
               </div>
-            </div>
+            </Field>
+          </div>
+
+          {def.fields.map((f) => (
+            <NotifierFieldInput key={f.key} field={f} form={form} setField={setField} setClear={setClear} error={showError(f.key)} />
+          ))}
+        </div>
+
+        <div className="flex items-center justify-between gap-2 border-t border-border/50 pt-4">
+          <Button variant="secondary" size="sm" icon={SendIcon} loading={test.isPending} onClick={runTest}>
+            Test
+          </Button>
+          <div className="flex items-center gap-2">
+            <Button variant="ghost" size="sm" onClick={onClose}>
+              Cancel
+            </Button>
+            <Button variant="primary" size="sm" loading={create.isPending || edit.isPending} onClick={save}>
+              {form.id ? 'Save' : 'Add'}
+            </Button>
           </div>
         </div>
       </div>
-    </div>,
-    document.body,
+    </Dialog>
   );
 }
 
