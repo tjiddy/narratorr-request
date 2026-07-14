@@ -408,11 +408,13 @@ describe('useUpdateUser', () => {
   });
 });
 
-describe('useUpdateMe — requester opt-in save (#50)', () => {
-  // F2 — the mutation owns observable behavior beyond the pure toggle helpers: it dispatches
-  // the PATCH via `updateMe`, writes the returned MeDto straight into the `qk.me` cache (so the
-  // control + nudge reflect the new set immediately), and surfaces success/error toasts. Node-only
-  // (mocked useMutation returns raw options), mirroring the other mutation-hook tests here.
+describe('useUpdateMe — account save with proportional feedback (#50, #134)', () => {
+  // F2 — the mutation owns observable behavior beyond the pure helpers: it dispatches the PATCH via
+  // `updateMe`, writes the returned MeDto straight into the `qk.me` cache (so the control reflects the
+  // new set immediately), and surfaces success/error toasts. The success toast is proportional to the
+  // payload (#134) via the pure `meSuccessToast` helper: an email save acknowledges, a notifyOn-only
+  // toggle is silent. Node-only (mocked useMutation returns raw options), mirroring the other
+  // mutation-hook tests here. onSuccess receives `(dto, body)` — the mutation variables carry the shape.
   const dto = { notifyOn: ['available'], emailNotifyAvailable: true } as unknown as MeDto;
 
   it('dispatches updateMe with the exact opt-in body', () => {
@@ -420,15 +422,32 @@ describe('useUpdateMe — requester opt-in save (#50)', () => {
     expect(hoisted.api.updateMe).toHaveBeenCalledWith({ notifyOn: ['available'] });
   });
 
-  it('writes the returned DTO into the me cache directly (not invalidate) and toasts success', () => {
-    cb(useUpdateMe()).onSuccess(dto);
+  it('writes the returned DTO into the me cache directly (not invalidate) for every payload shape', () => {
+    cb(useUpdateMe()).onSuccess(dto, { email: 'new@x.com' });
     expect(hoisted.qc.setQueryData).toHaveBeenCalledWith(qk.me, dto);
     expect(hoisted.qc.setQueryData).toHaveBeenCalledWith(['me'], dto); // key verbatim, no drift
-    expect(success).toHaveBeenCalledWith('Notification preferences saved');
+    cb(useUpdateMe()).onSuccess(dto, { notifyOn: ['available'] });
+    expect(hoisted.qc.setQueryData).toHaveBeenCalledTimes(2);
     expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalled();
   });
 
-  it('surfaces ApiError message, else "Could not save preferences", on error', () => {
+  // Positive case FIRST — this must pass before the absence assertion below is trusted (non-vacuous).
+  it('toasts exactly "Email saved" on an email-carrying save (set or null-clear)', () => {
+    cb(useUpdateMe()).onSuccess(dto, { email: 'new@x.com' });
+    expect(success).toHaveBeenCalledWith('Email saved');
+    cb(useUpdateMe()).onSuccess(dto, { email: null }); // clearing still acknowledges
+    expect(success).toHaveBeenCalledTimes(2);
+    expect(success).toHaveBeenLastCalledWith('Email saved');
+  });
+
+  it('is silent on a notifyOn-only save — no success toast (the checkbox state is the confirmation)', () => {
+    cb(useUpdateMe()).onSuccess(dto, { notifyOn: ['available'] });
+    expect(success).not.toHaveBeenCalled();
+    // Cache write still happens — silence is only about the toast.
+    expect(hoisted.qc.setQueryData).toHaveBeenCalledWith(qk.me, dto);
+  });
+
+  it('surfaces ApiError message, else "Could not save preferences", on error (unchanged for both shapes)', () => {
     const h = cb(useUpdateMe());
     h.onError(new ApiError(400, 'B', 'bad opt-in'));
     expect(error).toHaveBeenCalledWith('bad opt-in');

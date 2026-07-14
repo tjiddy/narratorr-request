@@ -431,7 +431,7 @@ describe('requester-notification opt-in — GET + PATCH /api/me (#50)', () => {
 
   it('rejects a value outside NOTIFIABLE_TRANSITIONS with 400', async () => {
     const guest = await signup(app, 'guest@example.com');
-    const res = await patchMe(sessionCookie(guest), { notifyOn: ['denied'] });
+    const res = await patchMe(sessionCookie(guest), { notifyOn: ['failed'] });
     expect(res.statusCode).toBe(400);
   });
 
@@ -477,5 +477,83 @@ describe('requester-notification opt-in — GET + PATCH /api/me (#50)', () => {
     // agrees with the sweep's send gate — both treat '' as no usable contact.
     await dbRef.update(users).set({ email: '' }).where(eq(users.authSubject, 'guest@example.com'));
     expect((await me(sessionCookie(guest))).json().emailNotifyAvailable).toBe(false);
+  });
+});
+
+describe('account contact email — PATCH /api/me email contract (#131)', () => {
+  const me = (cookies: Record<string, string>) => app.inject({ method: 'GET', url: '/api/me', cookies });
+  const patchMe = (cookies: Record<string, string>, payload: Record<string, unknown>) =>
+    app.inject({ method: 'PATCH', url: '/api/me', cookies, payload });
+
+  it('sets the contact email (happy path) and echoes it; GET reflects it', async () => {
+    const guest = await signup(app, 'guest@example.com');
+    const cookie = sessionCookie(guest);
+    const res = await patchMe(cookie, { email: '  New@Contact.COM ' });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().email).toBe('new@contact.com'); // normalized by contactEmailSchema
+    expect((await me(cookie)).json().email).toBe('new@contact.com');
+  });
+
+  it('clears the contact via email: null', async () => {
+    const guest = await signup(app, 'guest@example.com');
+    const cookie = sessionCookie(guest);
+    expect((await me(cookie)).json().email).toBe('guest@example.com'); // signup seeded the contact
+    const res = await patchMe(cookie, { email: null });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().email).toBeNull();
+    expect((await me(cookie)).json().email).toBeNull();
+  });
+
+  it('rejects an invalid email with 400', async () => {
+    const guest = await signup(app, 'guest@example.com');
+    expect((await patchMe(sessionCookie(guest), { email: 'not-an-email' })).statusCode).toBe(400);
+  });
+
+  it('rejects email "" with 400 (empty string is NOT a clear sentinel)', async () => {
+    const guest = await signup(app, 'guest@example.com');
+    const res = await patchMe(sessionCookie(guest), { email: '' });
+    expect(res.statusCode).toBe(400);
+    expect((await me(sessionCookie(guest))).json().email).toBe('guest@example.com'); // unchanged
+  });
+
+  it('a notifyOn-only body leaves the contact email untouched (independent fields)', async () => {
+    const guest = await signup(app, 'guest@example.com');
+    const cookie = sessionCookie(guest);
+    const res = await patchMe(cookie, { notifyOn: ['approved'] });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ email: 'guest@example.com', notifyOn: ['approved'] });
+  });
+
+  it('an email-only body leaves the opt-in set untouched (independent fields)', async () => {
+    const guest = await signup(app, 'guest@example.com');
+    const cookie = sessionCookie(guest);
+    await patchMe(cookie, { notifyOn: ['approved', 'denied'] });
+    const res = await patchMe(cookie, { email: 'edited@x.com' });
+    expect(res.json()).toMatchObject({ email: 'edited@x.com', notifyOn: ['approved', 'denied'] });
+  });
+
+  it('an empty body is a 200 no-op (both fields optional)', async () => {
+    const guest = await signup(app, 'guest@example.com');
+    const res = await patchMe(sessionCookie(guest), {});
+    expect(res.statusCode).toBe(200);
+    expect(res.json().email).toBe('guest@example.com');
+  });
+
+  it('editing the contact NEVER mutates the login authSubject — the original login still works', async () => {
+    const guest = await signup(app, 'todd@example.com');
+    const cookie = sessionCookie(guest);
+    await patchMe(cookie, { email: 'contact@elsewhere.com' });
+
+    // The login identity (authSubject) is still the signup email, not the new contact.
+    const row = await usersSvc.findLocalByEmail('todd@example.com');
+    expect(row?.authSubject).toBe('todd@example.com');
+    expect(row?.email).toBe('contact@elsewhere.com');
+    // And logging in with the ORIGINAL credentials still succeeds.
+    const relogin = await app.inject({
+      method: 'POST',
+      url: '/api/auth/local/login',
+      payload: { email: 'todd@example.com', password: 'password123' },
+    });
+    expect(relogin.statusCode).toBe(200);
   });
 });

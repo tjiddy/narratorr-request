@@ -2,7 +2,7 @@ import { and, desc, eq, gte, inArray, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import type { Db } from '../../db/client.js';
 import { requests, users, type RequestRow } from '../../db/schema.js';
-import { emitFailed, type RequestFailureNotifyDeps } from './request-notifications.js';
+import { emitFailed, emitDecisionEmail, type RequestFailureNotifyDeps } from './request-notifications.js';
 export type { RequestFailureNotifyDeps } from './request-notifications.js';
 import { redact } from './notifications/redact.js';
 import type {
@@ -360,6 +360,12 @@ export class RequestService {
       const fresh = await this.getByPublicId(pid);
       throw conflict('NOT_PENDING', `request is ${fresh?.status ?? 'gone'}, not pending`);
     }
+    // The decision write has committed — fire the requester's decision email (issue #131) BEFORE the
+    // handoff, so an approved requester is still emailed even if the subsequent handoff throws (the
+    // `approved` transition already landed). Fire-and-forget: it never unwinds the committed decision.
+    // The denial reason is the admin's `decision.note` ONLY (in scope here) — never `claimed.note`,
+    // which after a note-less deny still carries the requester's original note.
+    emitDecisionEmail(this.notifyDeps, claimed, decision.action === 'deny' ? 'denied' : 'approved', decision.note ?? null);
     return decision.action === 'approve' ? this.handoff(claimed) : claimed;
   }
 

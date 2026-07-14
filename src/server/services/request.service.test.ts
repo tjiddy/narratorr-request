@@ -484,6 +484,121 @@ describe('admin decisions + handoff', () => {
   });
 });
 
+describe('decision-time requester email (#131)', () => {
+  // A fake sender captures the send-one-email calls (default: delivered). These assert the decision
+  // send contract: routed through the RequesterEmailSender seam (NOT the admin notifier), opt-in +
+  // deliverable-contact gated, denial reason = the admin's decision.note ONLY (never row.note), and
+  // fire-and-forget (a send fault never unwinds the committed decision).
+  function harness() {
+    const send = vi.fn(async (_a: RequesterEmailArgs): Promise<RequesterEmailOutcome> => 'delivered');
+    const warn = vi.fn();
+    const logger: NotifierLogger = { info() {}, warn, error() {}, debug() {} };
+    const deps = (over: { send?: RequesterEmailSender['send'] } = {}): RequestFailureNotifyDeps => ({
+      getNotifier: () => ({ notify: async () => {} } as unknown as Notifier),
+      users: new UserService(db),
+      requesterEmail: { send: over.send ?? send },
+      logger,
+    });
+    return { send, warn, deps };
+  }
+
+  async function optIn(id: number, email: string | null, on: NotifiableTransition[]) {
+    await db.update(users).set({ email, notifyOn: on }).where(eq(users.id, id));
+  }
+
+  /** A pending request owned by a non-admin requester with the given opt-in + contact. */
+  async function pendingFor(svc: RequestService, opts: { email: string | null; on: NotifiableTransition[] }) {
+    const user = await insertUser(db, { role: 'user' });
+    await optIn(user.id, opts.email, opts.on);
+    const { row } = await svc.create(user.id, body('B1'));
+    return { user, row };
+  }
+
+  it('approve emails a requester opted into `approved` — correct recipient + transition, no reason', async () => {
+    const h = harness();
+    const admin = await insertUser(db, { role: 'admin' });
+    const svc = new RequestService(db, client, policy(), h.deps());
+    const { row } = await pendingFor(svc, { email: 'req@example.com', on: ['approved'] });
+
+    await svc.decide(admin.id, row.publicId, { action: 'approve', note: null });
+    await vi.waitFor(() => expect(h.send).toHaveBeenCalledTimes(1));
+    const arg = h.send.mock.calls[0]![0];
+    expect(arg).toMatchObject({ to: 'req@example.com', transition: 'approved', request: { title: 'A Book' } });
+    expect(arg.reason).toBeUndefined(); // approved copy carries no reason
+  });
+
+  it('deny emails a requester opted into `denied` with the admin note as the reason', async () => {
+    const h = harness();
+    const admin = await insertUser(db, { role: 'admin' });
+    const svc = new RequestService(db, client, policy(), h.deps());
+    const { row } = await pendingFor(svc, { email: 'req@example.com', on: ['denied'] });
+
+    await svc.decide(admin.id, row.publicId, { action: 'deny', note: 'Out of scope' });
+    await vi.waitFor(() => expect(h.send).toHaveBeenCalledTimes(1));
+    expect(h.send.mock.calls[0]![0]).toMatchObject({ to: 'req@example.com', transition: 'denied', reason: 'Out of scope' });
+  });
+
+  it('deny WITHOUT an admin note but WITH a requester note carries NO reason (never leaks row.note)', async () => {
+    const h = harness();
+    const admin = await insertUser(db, { role: 'admin' });
+    const svc = new RequestService(db, client, policy(), h.deps());
+    const user = await insertUser(db, { role: 'user' });
+    await optIn(user.id, 'req@example.com', ['denied']);
+    const { row } = await svc.create(user.id, { ...body('B1'), note: 'please hurry' }); // the requester's own note
+
+    await svc.decide(admin.id, row.publicId, { action: 'deny', note: null }); // admin supplies no note
+    await vi.waitFor(() => expect(h.send).toHaveBeenCalledTimes(1));
+    expect(h.send.mock.calls[0]![0].reason).toBeUndefined(); // 'please hurry' is NOT the denial reason
+  });
+
+  it('does NOT email a requester who did not opt into the decided transition', async () => {
+    const h = harness();
+    const admin = await insertUser(db, { role: 'admin' });
+    const svc = new RequestService(db, client, policy(), h.deps());
+    const { row } = await pendingFor(svc, { email: 'req@example.com', on: ['denied'] }); // opted into denied only
+
+    await svc.decide(admin.id, row.publicId, { action: 'approve', note: null });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(h.send).not.toHaveBeenCalled();
+  });
+
+  it('does NOT email an opted-in requester with no deliverable contact', async () => {
+    const h = harness();
+    const admin = await insertUser(db, { role: 'admin' });
+    const svc = new RequestService(db, client, policy(), h.deps());
+    const { row } = await pendingFor(svc, { email: null, on: ['approved'] });
+
+    await svc.decide(admin.id, row.publicId, { action: 'approve', note: null });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(h.send).not.toHaveBeenCalled();
+  });
+
+  it('is a no-op when no requester-email sender is wired (3-arg service)', async () => {
+    const admin = await insertUser(db, { role: 'admin' });
+    const svc = new RequestService(db, client, policy()); // no notifyDeps
+    const user = await insertUser(db, { role: 'user' });
+    await optIn(user.id, 'req@example.com', ['approved']);
+    const { row } = await svc.create(user.id, body('B1'));
+    // Just asserting decide still commits without a sender wired.
+    const decided = await svc.decide(admin.id, row.publicId, { action: 'approve', note: null });
+    expect(decided.status).toBe('acquiring');
+  });
+
+  it('a sender throw never unwinds the committed decision (fire-and-forget catch-and-log)', async () => {
+    const h = harness();
+    const send = vi.fn(async (): Promise<RequesterEmailOutcome> => {
+      throw new Error('smtp down');
+    });
+    const admin = await insertUser(db, { role: 'admin' });
+    const svc = new RequestService(db, client, policy(), h.deps({ send }));
+    const { row } = await pendingFor(svc, { email: 'req@example.com', on: ['denied'] });
+
+    const denied = await svc.decide(admin.id, row.publicId, { action: 'deny', note: 'no' });
+    expect(denied.status).toBe('denied'); // decision committed despite the send fault
+    await vi.waitFor(() => expect(h.warn).toHaveBeenCalled()); // fault logged, never thrown
+  });
+});
+
 describe('handoff failure reasons (friendly per-code add-handoff errors)', () => {
   // Each terminal code → its friendly reason on the persisted row, refundable, no book id,
   // and the error still re-throws. A fresh approved request starts with no book, so

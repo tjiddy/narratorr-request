@@ -146,6 +146,25 @@ export class UserService {
   }
 
   /**
+   * Set or clear the caller's own CONTACT email (issue #131) — the address requester
+   * notifications are delivered to (`users.email`), NEVER the login identity (`authSubject`). Self-
+   * scoped: the route passes the AUTHENTICATED user's id and this touches only `email`, so no path
+   * here can mutate another user, the login subject, or any other column. `email` is already
+   * normalized (trim + lowercase) and deliverability-validated by the route's `contactEmailSchema`
+   * body, or `null` to clear (which re-enables OIDC provider backfill on the next login — see
+   * {@link upsertFromOidc}). Returns the updated row.
+   */
+  async setContactEmail(userId: number, email: string | null): Promise<UserRow> {
+    const [updated] = await this.db
+      .update(users)
+      .set({ email })
+      .where(eq(users.id, userId))
+      .returning();
+    if (!updated) throw notFound('user not found');
+    return updated;
+  }
+
+  /**
    * Upsert a user from an OIDC profile, keyed on (provider, subject). A returning user
    * refreshes their display fields — but only while `pending`/`active`; a `rejected`
    * account's metadata is frozen so a denied user can't keep churning their profile.
@@ -156,13 +175,18 @@ export class UserService {
     const existing = await this.findByIdentity(provider, profile.subject);
     if (existing) {
       if (existing.status === 'rejected') return { user: existing, created: false };
-      // Coalesce email/thumb against the stored row: a later login that omits a claim
-      // shouldn't blank out a value we already have.
+      // Contact email is BACKFILL-ONLY (issue #131): a stored address — whether manually set on the
+      // account page or previously derived from a claim — WINS over the incoming provider claim, so a
+      // re-login never clobbers a manual edit. The claim fills it only when the row has none (first
+      // login, or after the user cleared it via `email: null`, which re-enables backfill). This is the
+      // single authoritative precedence: manual contact email wins until cleared. `authSubject` (login
+      // identity) is untouched either way. Thumb still refreshes from the claim (display-only, no manual
+      // edit surface); a later login that OMITS the thumb claim still can't blank a value we have.
       const [updated] = await this.db
         .update(users)
         .set({
           username: profile.username,
-          email: profile.email ?? existing.email,
+          email: existing.email ?? profile.email,
           thumb: profile.thumb ?? existing.thumb,
         })
         .where(eq(users.id, existing.id))

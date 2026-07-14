@@ -1,13 +1,20 @@
-import { NOTIFIABLE_TRANSITIONS, type NotifiableTransition } from '@shared/schemas/user';
+import { NOTIFIABLE_TRANSITIONS, type NotifiableTransition, type UpdateMeBody } from '@shared/schemas/user';
 
-// Pure logic for the requester-notification opt-in control + discoverability nudge (issue #50).
-// Extracted from the React component so it's unit-testable without a jsdom harness
-// (frontend-logic-extract-not-jsdom): the component wires these to inputs/localStorage, these
-// decide state. The PATCH /api/me body is `{ notifyOn: NotifiableTransition[] }`.
+// Pure logic for the account modal (issue #131): the requester-notification opt-in checkboxes, the
+// contact-email save row, and the identity provider line. Extracted from the React component so
+// it's unit-testable without a jsdom harness (frontend-logic-extract-not-jsdom): the component
+// wires these to inputs, these decide state. The PATCH /api/me body is
+// `{ notifyOn?: NotifiableTransition[]; email?: string | null }` (both fields independent/optional).
 
-/** Human label per transition, for the opt-in checkboxes. Keyed to `NOTIFIABLE_TRANSITIONS`. */
+/**
+ * Short label per transition, for the notifications row. Keyed to `NOTIFIABLE_TRANSITIONS`. These
+ * are the trailing half of the lead line "Email me when my request is …" — so they read as
+ * "approved" / "denied" / "ready to listen".
+ */
 export const NOTIFY_TRANSITION_LABELS: Record<NotifiableTransition, string> = {
-  available: 'When my request is ready to listen',
+  approved: 'approved',
+  denied: 'denied',
+  available: 'ready to listen',
 };
 
 /**
@@ -38,15 +45,66 @@ export function optInDisabled(emailNotifyAvailable: boolean): boolean {
 }
 
 /**
- * Whether to show the one-time discoverability nudge pointing at the opt-in control. Shown only
- * when email delivery is available AND the user hasn't opted into anything yet AND they haven't
- * dismissed the nudge before. Off-by-default + email-only risks the flagship feature being
- * invisible; this surfaces it exactly once to users who could actually use it.
+ * The identity provider line's label for the account modal. Maps the `MeDto.authProvider` id (only
+ * an id — no display label) to human copy, reusing the `useAuthProviders` list to resolve a
+ * configured OIDC provider's label: `local` → "email", `plex` → "Plex", any configured OIDC id →
+ * its label, and a raw-id fallback when no configured label matches (unknown id, or the providers
+ * list is still loading / absent). The component renders "Signed in with {label}".
  */
-export function shouldShowNudge(
-  emailNotifyAvailable: boolean,
-  notifyOn: readonly NotifiableTransition[],
-  dismissed: boolean,
-): boolean {
-  return emailNotifyAvailable && notifyOn.length === 0 && !dismissed;
+export function providerLabel(
+  authProvider: string,
+  providers: readonly { id: string; label: string }[],
+): string {
+  if (authProvider === 'local') return 'email';
+  if (authProvider === 'plex') return 'Plex';
+  return providers.find((p) => p.id === authProvider)?.label ?? authProvider;
+}
+
+/**
+ * Whether the email Save button is active (dirty): true when the trimmed draft differs from the
+ * stored contact (null reads as the empty string). Save is spatially scoped to the email row — it
+ * commits ONLY email — so this drives its at-rest-vs-amber state independent of the notify toggles.
+ */
+export function isEmailDirty(stored: string | null, draft: string): boolean {
+  return draft.trim() !== (stored ?? '');
+}
+
+/**
+ * The `email` value for the PATCH body from the draft field: an empty (or whitespace-only) field
+ * clears the contact (`null`), any other value is sent trimmed for the server's `contactEmailSchema`
+ * to normalize + validate (an invalid address 400s and surfaces inline). Clearing is `email: null`;
+ * the empty string is never sent (it would 400 — the server rejects `""` as a non-clear).
+ */
+export function emailPatchValue(draft: string): string | null {
+  const trimmed = draft.trim();
+  return trimmed === '' ? null : trimmed;
+}
+
+/**
+ * The email draft to adopt after a SUCCESSFUL save, reconciled to the server's returned contact
+ * (`MeDto.email`, already normalized: trimmed + lowercased, or `null` when cleared). Without this,
+ * a save of e.g. `New@Contact.COM` normalizes server-side to `new@contact.com` while the input keeps
+ * the pre-normalized draft, so {@link isEmailDirty} — a case-sensitive compare — would leave Save
+ * falsely amber. Resetting the draft to the returned value makes the row clean again. Composing this
+ * with `isEmailDirty(saved, reconciledEmailDraft(saved))` is always `false` — the tested invariant.
+ */
+export function reconciledEmailDraft(saved: string | null): string {
+  return saved ?? '';
+}
+
+/**
+ * The success toast for a `useUpdateMe` mutation, or `null` for none — feedback proportional to the
+ * action (#134). The account modal routes two shapes through one hook: an explicit email Save and
+ * instant-apply notification checkboxes.
+ *   • Any body carrying `email` (set OR `null`-clear) → "Email saved". An explicit commit button
+ *     deserves an acknowledgment, and the field looks identical before/after, so nothing else
+ *     confirms it. When BOTH fields ride one body the explicit-commit action wins.
+ *   • A `notifyOn`-only body → `null` (silent). The persisted checkbox is the confirmation (the
+ *     platform convention for instant-apply toggles), which also avoids toast-stacking when several
+ *     boxes are toggled.
+ * Keyed on the presence of the `email` KEY, not its value, so a `email: null` clear still toasts.
+ * Errors are handled separately in the hook and always toast, regardless of shape.
+ */
+export function meSuccessToast(body: UpdateMeBody): string | null {
+  return 'email' in body ? 'Email saved' : null;
 }

@@ -31,10 +31,13 @@ import {
   deleteNotifier,
   testNotifier,
   getAuthProviders,
+  getPublicConfig,
   localLogin,
   localSignup,
   ApiError,
 } from './api';
+import { decideBadge } from './instance-badge';
+import { meSuccessToast } from './pages/notify-prefs';
 
 export const qk = {
   me: ['me'] as const,
@@ -100,15 +103,19 @@ export const keepSameListData =
 export const useMe = () =>
   useQuery({ queryKey: qk.me, queryFn: getMe, retry: false, staleTime: 60_000 });
 
-/** Save the caller's own requester-notification opt-in set (issue #50). Writes the fresh MeDto
- *  straight into the `me` cache so the control + nudge reflect the new set immediately. */
+/** The account modal's self-scoped save (issue #131). Backs two callers — the explicit email Save and
+ *  the instant-apply notification checkboxes — both PATCHing `/api/me`. Writes the fresh MeDto straight
+ *  into the `me` cache so the control reflects the new state immediately. Success feedback is
+ *  proportional to the payload via `meSuccessToast` (#134): an email save toasts "Email saved", a
+ *  notifyOn-only toggle is silent (the persisted checkbox is the confirmation). Errors always toast. */
 export function useUpdateMe() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (body: UpdateMeBody) => updateMe(body),
-    onSuccess: (dto) => {
+    onSuccess: (dto, body) => {
       qc.setQueryData(qk.me, dto);
-      toast.success('Notification preferences saved');
+      const message = meSuccessToast(body);
+      if (message) toast.success(message);
     },
     onError: (err) => toast.error(err instanceof ApiError ? err.message : 'Could not save preferences'),
   });
@@ -337,4 +344,35 @@ export function useTheme() {
   const toggleTheme = () => setTheme((prev) => (prev === 'light' ? 'dark' : 'light'));
 
   return { theme, toggleTheme };
+}
+
+// --- Instance badge (dev-vs-prod tab distinguisher, issue #135) ----------------
+// Thin DOM shim over the pure `decideBadge()` decision (untested by convention — the logic it wraps
+// is unit-tested in instance-badge.test.ts). Mounted once at the top of App() before its auth/loading
+// branches so it runs for BOTH authenticated and unauthenticated tabs. Fetches the public config and,
+// when a badge is set, prefixes the tab title and swaps the favicon to the violet-recolored data URI.
+// Unset (prod) is a pure no-op: the decision returns identity, so the DOM is never touched (no flash).
+// A failed fetch just leaves the baseline tab — display-only, never surfaces an error into the UI.
+export function useInstanceBadge(): void {
+  useEffect(() => {
+    let cancelled = false;
+    void getPublicConfig()
+      .then((cfg) => {
+        if (cancelled) return;
+        const link = document.querySelector<HTMLLinkElement>('link[rel="icon"]');
+        const current = {
+          title: document.title,
+          faviconHref: link?.getAttribute('href') ?? '/favicon.svg',
+        };
+        const next = decideBadge(cfg.instanceBadge, current);
+        if (next.title !== current.title) document.title = next.title;
+        if (link && next.faviconHref !== current.faviconHref) link.setAttribute('href', next.faviconHref);
+      })
+      .catch(() => {
+        // Display-only; a failed /api/config leaves the baseline favicon + title. Never throws into the UI.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 }
