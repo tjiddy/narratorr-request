@@ -693,6 +693,35 @@ describe('settings routes — connection swap on a narratorr change (#144/#145)'
     expect(seen[1]?.apiKey).toBe('fresh-key');
   });
 
+  it('DISCONNECTS on a PUT carrying narratorr: null — clears both clients and retires the cache', async () => {
+    // The null arm of the swap ternary. Every other case here saves a connection, so reversing or
+    // dropping that arm (leaving the retired server's live clients and its cached capability in
+    // place) would keep the whole suite green.
+    expect((await putConnectors({ narratorr: { url: 'http://n:3000', apiKey: 'k' } })).statusCode).toBe(200);
+    await primeCachedCapability();
+    expect(narratorr.configured).toBe(true);
+    const before = narratorr.generation;
+
+    expect((await putConnectors({ narratorr: null })).statusCode).toBe(200);
+
+    // Exactly one bump, and the connection is genuinely gone…
+    expect(narratorr.generation).toBe(before + 1);
+    expect(narratorr.configured).toBe(false);
+    await expect(Promise.resolve().then(() => narratorr.getBook('bk_1'))).rejects.toMatchObject({
+      statusCode: 502,
+      upstreamCode: 'NOT_CONFIGURED',
+    });
+    await expect(Promise.resolve().then(() => narratorr.openCompanionEpub('bk_1'))).rejects.toMatchObject({
+      statusCode: 502,
+      upstreamCode: 'NOT_CONFIGURED',
+    });
+    // …and the disconnected server's cached `true` is unreadable — the read re-probes rather than
+    // serving it, well inside the 60s TTL.
+    const callsBefore = capability.calls;
+    expect((await readFeatures()).json().ebooksEnabled).toBe(true);
+    expect(capability.calls).toBe(callsBefore + 1);
+  });
+
   it('swaps ADJACENTLY to the DB write — visible while reconfigure() is still parked', async () => {
     // An ordering-only assertion cannot distinguish an adjacent swap from one deferred past the
     // awaits. So park `reconfigure()` INSIDE itself, right after the swap, and assert the new

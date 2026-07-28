@@ -10,47 +10,60 @@ import type { NarratorrClientPair } from './narratorr-clients.js';
  * error instead of crashing.
  *
  * Two properties everything downstream leans on:
- *   • ATOMIC swap. {@link set} replaces BOTH inner clients and bumps {@link generation} in one
- *     synchronous assignment, so no reader can ever observe the JSON client from one connection
- *     paired with the stream client (or the cached capability) of another.
+ *   • ATOMIC swap. {@link set} replaces BOTH inner clients and bumps {@link generation} by
+ *     replacing ONE immutable state object, so no reader can ever observe the JSON client from
+ *     one connection paired with the stream client (or the cached capability) of another. The
+ *     installed pair is a defensive SNAPSHOT of the caller's object: a caller that retains the
+ *     argument and later reassigns one of its fields cannot half-swap an installed connection
+ *     behind the generation's back.
  *   • The generation is the only cache key for connection-scoped state. `FeatureService` stamps
  *     its entries with it, which retires the previous connection's cached capability by
  *     construction — there is no invalidate() to call, and no window in which one could be missed.
  *     It follows that an UNCHANGED generation means the inner client instances are identity-equal:
  *     `set()` is the only writer, and it always bumps.
  */
+/** The holder's whole mutable surface: one object, replaced wholesale, never mutated in place. */
+interface ConnectionState {
+  readonly clients: NarratorrClientPair | null;
+  readonly generation: number;
+}
+
+/** Copy the caller's pair so a later mutation of THEIR object can't reach an installed connection. */
+function snapshot(clients: NarratorrClientPair | null): NarratorrClientPair | null {
+  return clients && { json: clients.json, stream: clients.stream };
+}
+
 export class NarratorrClientHolder implements INarratorrClient, IEbookStreamClient {
-  private clients: NarratorrClientPair | null;
-  private gen = 0;
+  private state: ConnectionState;
 
   constructor(clients: NarratorrClientPair | null = null) {
-    this.clients = clients;
+    this.state = { clients: snapshot(clients), generation: 0 };
   }
 
   /** Install (or clear) the whole connection. Both slots and the generation move together. */
   set(clients: NarratorrClientPair | null): void {
-    this.clients = clients;
-    this.gen += 1;
+    this.state = { clients: snapshot(clients), generation: this.state.generation + 1 };
   }
 
   /** Monotonic connection generation. Never decreases; bumped by every {@link set}. */
   get generation(): number {
-    return this.gen;
+    return this.state.generation;
   }
 
   get configured(): boolean {
-    return this.clients !== null;
+    return this.state.clients !== null;
   }
 
   private require(): NarratorrClientPair {
-    if (!this.clients) {
+    const { clients } = this.state;
+    if (!clients) {
       throw new NarratorrError(
         0,
         'NOT_CONFIGURED',
         "Narratorr isn't connected yet. An admin can set it up on the Settings page.",
       );
     }
-    return this.clients;
+    return clients;
   }
 
   searchMetadata(q: string) {

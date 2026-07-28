@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { buildNarratorrClients } from './narratorr-clients.js';
-import { NarratorrClient } from './narratorr-client.js';
+import { buildNarratorrClients, buildNarratorrConnection } from './narratorr-clients.js';
+import { NarratorrClient, NarratorrError } from './narratorr-client.js';
 import { NarratorrStreamClient } from './narratorr-stream-client.js';
 
 // Issue #145 AC15: ONE config read must feed BOTH halves of a connection. The credentials are
@@ -50,5 +50,65 @@ describe('buildNarratorrClients', () => {
     // constructions is exactly the defect this pins.
     expect(new Set(seen.map((s) => s.apiKey)).size).toBe(1);
     expect(new Set(seen.map((s) => new URL(s.url).origin)).size).toBe(1);
+  });
+});
+
+// The production boot graph. `src/server/index.ts` runs `main()` on import and can never be
+// executed by a test, so these two wiring invariants live in this seam instead of in unreachable
+// composition-root code — a route harness that merely MIRRORS the wiring is not evidence for it.
+describe('buildNarratorrConnection', () => {
+  it('installs both factory halves in the holder from one config, at generation zero', async () => {
+    const seen = captureFetch();
+    const { narratorr } = buildNarratorrConnection({ url: 'http://boot-n:3000', apiKey: 'boot-key' });
+
+    expect(narratorr.configured).toBe(true);
+    expect(narratorr.generation).toBe(0);
+
+    await narratorr.getBook('bk_1').catch(() => {});
+    await narratorr.openCompanionEpub('bk_1').catch(() => {});
+    expect(seen).toHaveLength(2);
+    expect(seen[0]?.url).toBe('http://boot-n:3000/api/v1/books/bk_1');
+    expect(seen[1]?.url).toBe('http://boot-n:3000/api/v1/books/bk_1/companion-epub');
+    expect(seen[0]?.apiKey).toBe('boot-key');
+    expect(seen[1]?.apiKey).toBe('boot-key');
+  });
+
+  it('leaves the connection unconfigured when there is no saved config', async () => {
+    const { narratorr } = buildNarratorrConnection(null);
+    expect(narratorr.configured).toBe(false);
+    // The boot WARN and the health route both read `configured`; every call must reach the shared
+    // NOT_CONFIGURED contract rather than crashing on a missing client.
+    await expect(Promise.resolve().then(() => narratorr.openCompanionEpub('bk_1'))).rejects.toBeInstanceOf(
+      NarratorrError,
+    );
+  });
+
+  it('keys FeatureService to THAT holder — for the probe AND the generation', async () => {
+    // Two distinct defects this catches: a resolver probing a different client (it would never
+    // see the live reconnect) and one keyed to a different generation (a swap would not retire
+    // the previous server's cached capability).
+    let capabilityCalls = 0;
+    vi.stubGlobal('fetch', () => {
+      capabilityCalls += 1;
+      return Promise.resolve(
+        new Response(JSON.stringify({ companionEpub: { enabled: true } }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+    });
+    const { narratorr, features } = buildNarratorrConnection({ url: 'http://boot-n:3000', apiKey: 'boot-key' });
+
+    const T0 = 1_700_000_000_000;
+    await expect(features.ebooksCapability(T0)).resolves.toBe(true);
+    expect(capabilityCalls).toBe(1); // the probe went through THIS holder's client
+    await expect(features.ebooksCapability(T0 + 1)).resolves.toBe(true);
+    expect(capabilityCalls).toBe(1); // …and cached, so the re-probe below means something
+
+    // Swapping the holder retires the entry — only true if the resolver reads THIS holder's
+    // generation. A resolver keyed elsewhere would serve the cached value here.
+    narratorr.set(buildNarratorrClients({ baseUrl: 'http://other-n:3000', apiKey: 'other-key' }));
+    await expect(features.ebooksCapability(T0 + 2)).resolves.toBe(true);
+    expect(capabilityCalls).toBe(2);
   });
 });

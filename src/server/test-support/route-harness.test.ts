@@ -1,6 +1,7 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { buildRouteApp } from './route-harness.js';
 import { registerHealthRoutes } from '../routes/health.js';
+import type { NarratorrEbookStream } from '../services/narratorr-stream-client.js';
 
 // The harness's narratorr wiring is shared by every route-test file, so the "configured" and
 // "unconfigured" states it hands out are asserted here once rather than re-derived per suite.
@@ -23,6 +24,41 @@ describe('route harness — narratorr connection wiring', () => {
       expect(h.ebookStream.opened).toEqual(['bk_1']);
       expect(stream.contentType).toBe('application/epub+zip');
       expect(stream.contentLength).toBe(h.ebookStream.bytes.byteLength);
+    } finally {
+      await h.app.close();
+    }
+  });
+
+  it('installs a caller-provided ebookStream override as THE stream reached through the holder', async () => {
+    // Without this, a harness that ignored `opts.ebookStream` and always built its own fake would
+    // leave the option silently inert — and every future proxy-route test asserting on an injected
+    // stream boundary would be asserting against a double the route never touched.
+    const bytes = new Uint8Array([9, 9, 9, 9, 9]);
+    const openCompanionEpub = vi.fn(
+      async (_publicId: string, _opts?: { signal?: AbortSignal }): Promise<NarratorrEbookStream> => ({
+        contentType: 'application/x-custom-double',
+        contentLength: bytes.byteLength,
+        body: new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(bytes);
+            c.close();
+          },
+        }),
+      }),
+    );
+    const override = { openCompanionEpub };
+    const h = await buildRouteApp({ register: registerHealthRoutes, ebookStream: override });
+    try {
+      const ac = new AbortController();
+      const stream = await h.narratorrHolder.openCompanionEpub('bk_custom', { signal: ac.signal });
+
+      // Reached through the holder the routes actually hold — with BOTH arguments intact.
+      expect(openCompanionEpub).toHaveBeenCalledWith('bk_custom', { signal: ac.signal });
+      expect(stream.contentType).toBe('application/x-custom-double');
+      expect(stream.contentLength).toBe(bytes.byteLength);
+      // …and the harness surfaces the same double, so a test can drive it after building.
+      // (`ebookStream` is declared as the default fake's type, the way `narratorr` already is.)
+      expect(h.ebookStream as unknown).toBe(override);
     } finally {
       await h.app.close();
     }

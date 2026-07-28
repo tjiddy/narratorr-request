@@ -152,6 +152,36 @@ describe('NarratorrClientHolder — connection generation', () => {
     expect(holder.generation).toBe(3);
   });
 
+  it('snapshots the installed pair — mutating the caller-owned object cannot half-swap it', async () => {
+    // The generation is only meaningful if `set()` is the ONLY way the installed clients can
+    // change. Storing the caller's object by reference would let a retained handle swap one half
+    // (server B's stream against server A's JSON and cache generation) with no bump at all.
+    const a = fakePair();
+    const b = fakePair();
+    // A deliberately mutable handle on the same shape the holder is handed.
+    const retained: { json: typeof a.json; stream: typeof a.stream } = { json: a.json, stream: a.stream };
+    const holder = new NarratorrClientHolder(retained);
+
+    retained.stream = b.stream;
+    retained.json = b.json;
+
+    await holder.getBook('bk_1');
+    await holder.openCompanionEpub('bk_1');
+    expect(a.json.getBook).toHaveBeenCalledWith('bk_1');
+    expect(a.stream.openCompanionEpub).toHaveBeenCalledWith('bk_1', undefined);
+    expect(b.json.getBook).not.toHaveBeenCalled();
+    expect(b.stream.openCompanionEpub).not.toHaveBeenCalled();
+    expect(holder.generation).toBe(0); // nothing moved, so nothing was retired
+
+    // Same guarantee on the `set()` path, not just the constructor.
+    holder.set(retained);
+    retained.stream = a.stream;
+    await holder.openCompanionEpub('bk_2');
+    expect(b.stream.openCompanionEpub).toHaveBeenCalledWith('bk_2', undefined);
+    expect(a.stream.openCompanionEpub).toHaveBeenCalledTimes(1); // still just the first call
+    expect(holder.generation).toBe(1);
+  });
+
   it('a caller holding only the holder reaches the NEW clients on the very next call', async () => {
     // The "no service may retain a concrete client" guarantee, from the consumer's side: both
     // halves are re-read per call, so a swap needs no cooperation from the caller.

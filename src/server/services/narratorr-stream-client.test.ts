@@ -5,7 +5,9 @@ import {
   NarratorrStreamClient,
   parseContentLength,
   ERROR_BODY_MAX_BYTES,
+  DEFAULT_STREAM_HEADER_TIMEOUT_MS,
 } from './narratorr-stream-client.js';
+import { buildNarratorrClients } from './narratorr-clients.js';
 import { NarratorrError } from './narratorr-client.js';
 import { errorBody } from '../../shared/schemas/v1/common.js';
 
@@ -25,6 +27,7 @@ const API_KEY = 'stream-test-key';
 const HEADER_TIMEOUT_MS = 100;
 
 interface RecordedRequest {
+  method: string;
   url: string;
   headers: IncomingMessage['headers'];
 }
@@ -56,7 +59,7 @@ async function startServer(
   let notify: (() => void) | null = null;
 
   const server = createServer((req, res) => {
-    requests.push({ url: req.url ?? '', headers: req.headers });
+    requests.push({ method: req.method ?? '', url: req.url ?? '', headers: req.headers });
     // A client that walks away mid-response makes the socket error (EPIPE/ECONNRESET) — swallow
     // it so a hardening test can't take the whole worker down with an unhandled 'error'.
     res.on('error', () => {});
@@ -195,13 +198,16 @@ describe('NarratorrStreamClient — happy path and the bounded result view', () 
     await readAll(result.body);
   });
 
-  it('sends the configured X-Api-Key', async () => {
+  it('issues a GET carrying the configured X-Api-Key', async () => {
     const s = await startServer((_req, res) => {
       res.writeHead(200, { 'content-length': '0' });
       res.end();
     });
 
     await readAll((await clientFor(s).openCompanionEpub('bk_1')).body);
+    // narratorr exposes this endpoint as GET only — a regression to POST would 405 in production
+    // while every other assertion here (which ignores the method) stayed green.
+    expect(s.requests[0]?.method).toBe('GET');
     expect(s.requests[0]?.headers['x-api-key']).toBe(API_KEY);
   });
 });
@@ -280,18 +286,52 @@ describe('NarratorrStreamClient — timeout shape', () => {
     expect(err).toBeInstanceOf(NarratorrError);
     timers.expectHeaderTimerCleared(30_000);
   });
+
+  it('arms the PRODUCTION 15s default when no timeout is configured — including through the factory', async () => {
+    // Every other timeout test supplies a short override, so the shipped default and the
+    // `?? DEFAULT_STREAM_HEADER_TIMEOUT_MS` path are otherwise never exercised: the deadline could
+    // silently become 0 or unbounded with the suite still green. Asserted on the ARMED DELAY (the
+    // request itself fails fast against a dead port) rather than by waiting 15 seconds.
+    expect(DEFAULT_STREAM_HEADER_TIMEOUT_MS).toBe(15_000);
+    const dead = await deadBaseUrl();
+
+    for (const client of [
+      new NarratorrStreamClient({ baseUrl: dead, apiKey: API_KEY }),
+      buildNarratorrClients({ baseUrl: dead, apiKey: API_KEY }).stream,
+    ]) {
+      const timers = spyTimers();
+      await rejection(client.openCompanionEpub('bk_1'));
+      timers.expectHeaderTimerCleared(DEFAULT_STREAM_HEADER_TIMEOUT_MS);
+      vi.restoreAllMocks();
+    }
+  });
 });
 
-/** Watch the client-owned header timer through the globals it uses. */
-function spyTimers(): { expectHeaderTimerCleared(delayMs: number): void } {
+/**
+ * Watch the client-owned header timer through the globals it uses. `headerTimerCleared` doubles as
+ * a "the response headers have landed" probe — the client clears that timer the moment `fetch()`
+ * resolves — which is how a test can act strictly AFTER header acquisition without a sleep.
+ */
+function spyTimers(): {
+  headerTimerCleared(delayMs: number): boolean;
+  expectHeaderTimerCleared(delayMs: number): void;
+} {
   const setSpy = vi.spyOn(globalThis, 'setTimeout');
   const clearSpy = vi.spyOn(globalThis, 'clearTimeout');
+  const armedWith = (delayMs: number): unknown[] =>
+    setSpy.mock.calls
+      .map((call, i) => ({ ms: call[1], handle: setSpy.mock.results[i]?.value as unknown }))
+      .filter((t) => t.ms === delayMs)
+      .map((t) => t.handle);
+  const cleared = (handle: unknown): boolean => clearSpy.mock.calls.some((c) => (c[0] as unknown) === handle);
+
   return {
-    expectHeaderTimerCleared(delayMs: number) {
-      const armed = setSpy.mock.calls
-        .map((call, i) => ({ ms: call[1], handle: setSpy.mock.results[i]?.value as unknown }))
-        .filter((t) => t.ms === delayMs)
-        .map((t) => t.handle);
+    headerTimerCleared: (delayMs) => {
+      const armed = armedWith(delayMs);
+      return armed.length === 1 && cleared(armed[0]);
+    },
+    expectHeaderTimerCleared(delayMs) {
+      const armed = armedWith(delayMs);
       expect(armed).toHaveLength(1);
       expect(clearSpy.mock.calls.map((c) => c[0] as unknown)).toContain(armed[0]);
     },
@@ -459,6 +499,18 @@ describe('NarratorrStreamClient — non-2xx mapping', () => {
     });
   });
 
+  it.each([500, 404])('maps an EMPTY %d body to NON_JSON, not HTTP_<status>', async (status) => {
+    // An empty body is a non-JSON body. `HTTP_<status>` is reserved for a body we parsed and
+    // found the wrong shape, so a bodiless 5xx from a proxy must not masquerade as one.
+    const s = await startServer((_req, res) => {
+      res.writeHead(status, { 'content-length': '0' });
+      res.end();
+    });
+    const err = await rejection(clientFor(s).openCompanionEpub('bk_1'));
+    expect(err).toBeInstanceOf(NarratorrError);
+    expect(err).toMatchObject({ upstreamStatus: status, upstreamCode: 'NON_JSON' });
+  });
+
   it('falls back to NON_JSON for an HTML error page', async () => {
     const s = await startServer((_req, res) => {
       res.writeHead(502, { 'content-type': 'text/html' });
@@ -513,6 +565,36 @@ describe('NarratorrStreamClient — non-2xx mapping', () => {
     expect(err).toBeInstanceOf(NarratorrError);
     expect(err).toMatchObject({ upstreamStatus: 500, upstreamCode: 'NON_JSON' });
     expect(elapsed).toBeLessThan(3000);
+    await s.whenAborted();
+  });
+
+  it('keeps ABORTED attribution when the caller disconnects DURING the error-body read', async () => {
+    // The error-body read is the second place a caller disconnect can land, and it maps every
+    // reader failure to "whatever bytes arrived" — so without an explicit re-check the user
+    // closing the tab is reported as an upstream 500. #146 branches on that distinction.
+    const s = await startServer((_req, res) => {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.write('{"error":{"code":"boom"'); // partial, then stalls until the caller gives up
+    });
+
+    const ac = new AbortController();
+    const timers = spyTimers();
+    // Generous error-body deadline: only the caller's abort can end this read, so the assertion
+    // can't be satisfied by the deadline path the test above already covers. The header deadline
+    // is distinctive so the probe below can't match an unrelated timer.
+    const pending = clientFor(s, { headerTimeoutMs: 5_000, errorBodyTimeoutMs: 30_000 }).openCompanionEpub(
+      'bk_1',
+      { signal: ac.signal },
+    );
+    // Abort STRICTLY after header acquisition: the header timer is cleared the instant `fetch()`
+    // resolves, so this pins the abort inside the error-body read rather than letting it land on
+    // the (already covered) pre-header path.
+    await vi.waitFor(() => expect(timers.headerTimerCleared(5_000)).toBe(true));
+    ac.abort();
+
+    const err = await rejection(pending);
+    expect(err).toBeInstanceOf(NarratorrError);
+    expect(err).toMatchObject({ upstreamStatus: 0, upstreamCode: 'ABORTED' });
     await s.whenAborted();
   });
 });

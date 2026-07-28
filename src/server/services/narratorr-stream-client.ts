@@ -51,6 +51,11 @@ export function parseContentLength(raw: string | null): number | null {
   return Number.isSafeInteger(n) ? n : null;
 }
 
+/** The caller-disconnect outcome. One builder, so both places it can land agree on the wording. */
+function abortedError(path: string): NarratorrError {
+  return new NarratorrError(0, 'ABORTED', `Narratorr GET ${path} aborted by the caller`);
+}
+
 /** Join the collected error-body chunks, truncating at the cap. */
 function concatCapped(chunks: Uint8Array[], cap: number): Uint8Array {
   let total = 0;
@@ -129,13 +134,11 @@ export class NarratorrStreamClient {
         redirect: 'error',
         headers: { 'X-Api-Key': this.apiKey },
       });
-    } catch (err) {
+    } catch (err: unknown) {
       // Attribution matters to the proxy route: "the user closed the tab" and "narratorr is
       // dead" are the same AbortError here but very different log lines. The caller's signal
       // wins — a composed abort we did not schedule is theirs.
-      if (opts.signal?.aborted) {
-        throw new NarratorrError(0, 'ABORTED', `Narratorr GET ${path} aborted by the caller`);
-      }
+      if (opts.signal?.aborted) throw abortedError(path);
       const reason = headerTimedOut && err instanceof Error && err.name === 'AbortError' ? 'timed out' : 'unreachable';
       throw new NarratorrError(0, 'NETWORK', `Narratorr GET ${path} ${reason}`);
     } finally {
@@ -143,7 +146,14 @@ export class NarratorrStreamClient {
       clearTimeout(timer);
     }
 
-    if (!res.ok) throw await this.errorFor(path, res);
+    // The error-body read is a SECOND place the caller's disconnect can land (a stalled non-2xx
+    // body is exactly the case the bounded read exists for), and `readBoundedErrorBody` maps every
+    // reader failure to "whatever bytes arrived". Re-check the caller signal around it so an
+    // abort keeps its attribution instead of being reported as an upstream failure.
+    if (!res.ok) {
+      const err = await this.errorFor(path, res);
+      throw opts.signal?.aborted ? abortedError(path) : err;
+    }
 
     // A 2xx with no body (204/205/304) can't be proxied; returning an unusable value would push
     // the failure into the route's stream plumbing instead of its error path.
@@ -166,9 +176,17 @@ export class NarratorrStreamClient {
   private async errorFor(path: string, res: Response): Promise<NarratorrError> {
     const text = await this.readBoundedErrorBody(res);
 
+    // An EMPTY non-2xx body is a non-JSON body, not a non-envelope JSON one: `HTTP_<status>` is
+    // reserved for a body we successfully parsed and found the wrong shape. (This is a deliberate
+    // divergence from `NarratorrClient.request()`, which coerces empty to `undefined` and lands on
+    // `HTTP_<status>` — that client's mapping is shipped and out of scope here.)
+    if (!text) {
+      return new NarratorrError(res.status, 'NON_JSON', `Narratorr GET ${path} returned an empty body`);
+    }
+
     let json: unknown;
     try {
-      json = text ? JSON.parse(text) : undefined;
+      json = JSON.parse(text);
     } catch {
       return new NarratorrError(res.status, 'NON_JSON', `Narratorr GET ${path} returned non-JSON`);
     }
