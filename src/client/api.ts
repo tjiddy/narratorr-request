@@ -14,6 +14,7 @@ import type {
   NotifierTestBody,
 } from '@shared/schemas/connectors';
 import type { SystemInfoDto } from '@shared/schemas/system';
+import type { FeaturesDto } from '@shared/schemas/features';
 import type { PublicConfigDto } from '@shared/schemas/config';
 
 export class ApiError extends Error {
@@ -147,6 +148,9 @@ export const localSignup = (email: string, password: string) =>
   postCredentials('/api/auth/local/signup', email, password);
 
 export const getSystemInfo = () => fetch('/api/admin/system', opts()).then(parse<SystemInfoDto>);
+
+/** Derived, instance-level feature state (issue #144). Active-user gated — 401/403 for anyone else. */
+export const getFeatures = () => fetch('/api/features', opts()).then(parse<FeaturesDto>);
 
 export const getConnectorSettings = () =>
   fetch('/api/admin/settings/connectors', opts()).then(parse<ConnectorSettingsDto>);

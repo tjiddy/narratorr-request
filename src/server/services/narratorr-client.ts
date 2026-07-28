@@ -220,3 +220,5 @@ export type IMetadataSearchClient = Pick<INarratorrClient, 'searchMetadata'>;
 export type IBookHandoffClient = Pick<INarratorrClient, 'addBook'>;
 /** `StatusPoller` — lifecycle polling only. */
 export type IBookStatusClient = Pick<INarratorrClient, 'getBook'>;
+/** `FeatureService` — the capability probe only. */
+export type ICapabilityClient = Pick<INarratorrClient, 'getCapabilities'>;

@@ -132,3 +132,81 @@ describe('SettingsPage → NotifiersSection → KindleSenderCard wiring (#143)',
     expect(screen.getByRole('heading', { name: 'Backup SMTP' })).toBeInTheDocument();
   });
 });
+
+/**
+ * Host-level wiring for the companion-ebook toggle (#144). The pure helpers in
+ * `settings-ebooks.ts` prove init/dirty/payload logic, but they cannot prove that the page
+ * actually RENDERS an accessible control, threads `data.ebooksEnabled` down to it, or submits the
+ * body those helpers build — the same `useConnectorSettings() → SettingsPage → GeneralSection`
+ * prop chain the Kindle-sender cases above cover for the Notifications section.
+ */
+describe('SettingsPage → GeneralSection → companion-ebook toggle (#144)', () => {
+  /** Render the page on the General section (where the toggle lives) and return the fetch spy. */
+  async function openGeneral(settings: ConnectorSettingsDto) {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.startsWith(CONNECTORS_URL)) {
+          // Echo the write back so the PUT resolves like the real route does.
+          if (init?.method === 'PUT') {
+            return Promise.resolve(jsonRes(200, { ...settings, ...JSON.parse(String(init.body)) }));
+          }
+          return Promise.resolve(jsonRes(200, settings));
+        }
+        throw new Error(`unstubbed fetch: ${url}`);
+      }),
+    );
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const user = userEvent.setup();
+    render(
+      <QueryClientProvider client={client}>
+        <SettingsPage />
+      </QueryClientProvider>,
+    );
+    // General is the default section; wait for the settings load to paint it.
+    await screen.findByText('Companion eBooks');
+    return { user, fetchMock: vi.mocked(globalThis.fetch) };
+  }
+
+  /** The PUT bodies the page sent, in order. */
+  const putBodies = (fetchMock: ReturnType<typeof vi.mocked<typeof globalThis.fetch>>): unknown[] =>
+    fetchMock.mock.calls
+      .filter(([, init]) => init?.method === 'PUT')
+      .map(([, init]) => JSON.parse(String(init?.body)));
+
+  it('renders an accessible control that is OFF by default, with no Save until it changes', async () => {
+    await openGeneral(dto({ ebooksEnabled: false }));
+    const toggle = screen.getByLabelText('Companion eBooks') as HTMLInputElement;
+    expect(toggle).not.toBeChecked();
+    // Per-card save: the button only appears once the card is dirty.
+    expect(screen.queryByRole('button', { name: 'Save' })).not.toBeInTheDocument();
+  });
+
+  it('reflects a SAVED true — a dropped or hard-coded prop would render it off', async () => {
+    await openGeneral(dto({ ebooksEnabled: true }));
+    expect(screen.getByLabelText('Companion eBooks')).toBeChecked();
+  });
+
+  it('turning it ON submits exactly { ebooksEnabled: true }', async () => {
+    const { user, fetchMock } = await openGeneral(dto({ ebooksEnabled: false }));
+    await user.click(screen.getByLabelText('Companion eBooks'));
+    await user.click(await screen.findByRole('button', { name: 'Save' }));
+
+    await vi.waitFor(() => expect(putBodies(fetchMock)).toHaveLength(1));
+    // ONLY the toggle: no sibling field, and no `narratorr` key (which would retire the server's
+    // cached capability on every save).
+    expect(putBodies(fetchMock)[0]).toEqual({ ebooksEnabled: true });
+  });
+
+  it('turning it OFF submits an EXPLICIT false, not an empty body', async () => {
+    // The regression a truthiness-spread payload introduces: `{}` means "keep" on the server, so
+    // the feature could never be turned back off while the UI reported a successful save.
+    const { user, fetchMock } = await openGeneral(dto({ ebooksEnabled: true }));
+    await user.click(screen.getByLabelText('Companion eBooks'));
+    await user.click(await screen.findByRole('button', { name: 'Save' }));
+
+    await vi.waitFor(() => expect(putBodies(fetchMock)).toHaveLength(1));
+    expect(putBodies(fetchMock)[0]).toEqual({ ebooksEnabled: false });
+  });
+});

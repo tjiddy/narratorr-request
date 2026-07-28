@@ -25,6 +25,7 @@ const hoisted = vi.hoisted(() => ({
     listUserRequests: vi.fn(),
     updateMe: vi.fn(),
     updateConnectorSettings: vi.fn(),
+    getFeatures: vi.fn(),
   },
   // A module-scoped slot backing the test-only `react` useState mock so a re-invoked
   // `useTheme()` observes the value a prior `toggleTheme()` wrote.
@@ -54,6 +55,7 @@ vi.mock('./api', async (importActual) => {
     listUserRequests: hoisted.api.listUserRequests,
     updateMe: hoisted.api.updateMe,
     updateConnectorSettings: hoisted.api.updateConnectorSettings,
+    getFeatures: hoisted.api.getFeatures,
   };
 });
 
@@ -104,6 +106,8 @@ import {
   useUserRequests,
   useUsers,
   useConnectorSettings,
+  useUpdateEbooksEnabled,
+  useFeatures,
   useSystemInfo,
   useAuthProviders,
   useLocalAuth,
@@ -152,6 +156,8 @@ const placeholder = (q: QueryOptions): PlaceholderFn => q.placeholderData as Pla
 
 // Minimal cast helpers — the callbacks only read the few fields we set.
 const req = (over: Partial<RequestDto>): RequestDto => ({ title: 'Dune', status: 'pending', ...over } as RequestDto);
+const meDto = (over: Partial<MeDto>): MeDto =>
+  ({ publicId: 'us_1', username: 'ann', role: 'user', status: 'active', ...over }) as MeDto;
 
 beforeEach(() => vi.clearAllMocks());
 afterEach(() => {
@@ -184,6 +190,7 @@ describe('qk query-key builders', () => {
     expect(qk.users).toEqual(['admin', 'users']);
     expect(qk.connectors).toEqual(['admin', 'settings', 'connectors']);
     expect(qk.system).toEqual(['admin', 'system']);
+    expect(qk.features).toEqual(['features']);
     expect(qk.authProviders).toEqual(['auth', 'providers']);
   });
 });
@@ -339,6 +346,28 @@ describe('centralized read-site keys + prefix guards', () => {
 
   it('useConnectorSettings keys on qk.connectors', () => {
     expect(query(useConnectorSettings()).queryKey).toEqual(qk.connectors);
+  });
+
+  // AC24/AC25 (#144) — the features query's key, fetcher and the active-only enablement. Without
+  // this the hook could key elsewhere, call the wrong endpoint, or fire on the login /
+  // pending / rejected screens, where `/api/features` only ever 401s or 403s.
+  it('useFeatures keys on qk.features and fetches through getFeatures', async () => {
+    const q = query(useFeatures(meDto({ status: 'active' })));
+    expect(q.queryKey).toEqual(qk.features);
+    expect(q.queryKey).toEqual(['features']);
+    hoisted.api.getFeatures.mockResolvedValue({ ebooksEnabled: true, kindleDeliveryAvailable: false, kindleSenderEmail: null });
+    await q.queryFn();
+    expect(hoisted.api.getFeatures).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['a signed-out caller', undefined, false],
+    ['a pending account', meDto({ status: 'pending' }), false],
+    ['a rejected account', meDto({ status: 'rejected' }), false],
+    ['an active user', meDto({ status: 'active' }), true],
+    ['an admin (never gated by the queue)', meDto({ role: 'admin', status: 'pending' }), true],
+  ] as const)('useFeatures is enabled=%s for %s', (_label, me, expected) => {
+    expect(query(useFeatures(me)).enabled).toBe(expected);
   });
 
   it('useSystemInfo keys on qk.system', () => {
@@ -509,6 +538,56 @@ describe('useUpdateConnectors', () => {
     const h = cb(useUpdateConnectors());
     h.onError(new ApiError(422, 'V', 'invalid url'));
     expect(error).toHaveBeenCalledWith('invalid url');
+    h.onError(new Error('x'));
+    expect(error).toHaveBeenCalledWith('Save failed');
+  });
+});
+
+describe('useUpdateEbooksEnabled (#144)', () => {
+  it('puts the built body on the wire unmodified, including an explicit false', async () => {
+    const dto = { ebooksEnabled: false } as ConnectorSettingsDto;
+    hoisted.api.updateConnectorSettings.mockResolvedValue(dto);
+
+    await expect(mutFn(useUpdateEbooksEnabled())({ ebooksEnabled: false })).resolves.toBe(dto);
+    expect(hoisted.api.updateConnectorSettings).toHaveBeenCalledWith({ ebooksEnabled: false });
+
+    await mutFn(useUpdateEbooksEnabled())({ ebooksEnabled: true });
+    expect(hoisted.api.updateConnectorSettings).toHaveBeenLastCalledWith({ ebooksEnabled: true });
+  });
+
+  it('invalidates connectors AND features — never setQueryData', () => {
+    // The toggle is a SECOND per-card save on a page that already runs Public URL and quota saves
+    // through `useUpdateConnectors`'s wholesale `setQueryData`. Adding another wholesale writer to
+    // `qk.connectors` is the #160 rollback shape: under reverse settlement an earlier response
+    // snapshot overwrites a later sibling's committed field, so the toggle visibly reverts even
+    // though its own write succeeded. Invalidating re-reads the authoritative row instead.
+    cb(useUpdateEbooksEnabled()).onSuccess();
+    expect(hoisted.qc.setQueryData).not.toHaveBeenCalled();
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
+    // …and the derived payload is stale the moment the flag lands.
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
+    expect(success).toHaveBeenCalledWith('Settings saved');
+  });
+
+  it('converges under REVERSE settlement with a sibling wholesale save', () => {
+    // Simulate the race: the toggle save commits first, then a publicUrl save (issued earlier,
+    // settling later) writes its pre-toggle response snapshot over the whole cache entry.
+    const staleSnapshot = { publicUrl: 'https://app.example.com', ebooksEnabled: false } as ConnectorSettingsDto;
+    cb(useUpdateEbooksEnabled()).onSuccess();
+    cb(useUpdateConnectors()).onSuccess(staleSnapshot);
+
+    // The sibling did clobber the cache with `ebooksEnabled: false`…
+    expect(hoisted.qc.setQueryData).toHaveBeenCalledWith(qk.connectors, staleSnapshot);
+    // …but the toggle asked for a REFETCH of that same key rather than a competing write, so the
+    // server's committed row is what lands last. A toggle built on setQueryData would instead
+    // leave the clobbered value on screen with no pending read to correct it.
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
+  });
+
+  it('surfaces the ApiError message, else a fallback', () => {
+    const h = cb(useUpdateEbooksEnabled());
+    h.onError(new ApiError(400, 'BAD', 'nope'));
+    expect(error).toHaveBeenCalledWith('nope');
     h.onError(new Error('x'));
     expect(error).toHaveBeenCalledWith('Save failed');
   });

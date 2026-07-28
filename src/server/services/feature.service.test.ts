@@ -5,7 +5,7 @@ import {
   CAPABILITY_UNSUPPORTED_TTL_MS,
   CAPABILITY_STALE_WINDOW_MS,
 } from './feature.service.js';
-import { NarratorrError, type INarratorrClient } from './narratorr-client.js';
+import { NarratorrError, type ICapabilityClient, type INarratorrClient } from './narratorr-client.js';
 import { NarratorrClientHolder } from './narratorr-client-holder.js';
 import type { V1Capabilities } from '../../shared/schemas/v1/capabilities.js';
 
@@ -50,6 +50,13 @@ class StubClient {
   }
 }
 
+/**
+ * Widen a capability-only stub to the holder's full `INarratorrClient` slot. The holder is the
+ * production seam for the NOT_CONFIGURED / live-reconnect cases, and it delegates every method;
+ * these tests only ever reach `getCapabilities`, so the other members are deliberately absent.
+ */
+const asClient = (stub: ICapabilityClient): INarratorrClient => stub as INarratorrClient;
+
 const upstream = (status: number, code: string) => new NarratorrError(status, code, `upstream ${code}`);
 const NETWORK = upstream(0, 'NETWORK');
 const CONTRACT_MISMATCH = upstream(200, 'CONTRACT_MISMATCH');
@@ -57,7 +64,7 @@ const CONTRACT_MISMATCH = upstream(200, 'CONTRACT_MISMATCH');
 /** A stub + resolver pair wired the way production wires them (resolver reads the client live). */
 function build(): { client: StubClient; features: FeatureService } {
   const client = new StubClient();
-  return { client, features: new FeatureService(client as unknown as INarratorrClient) };
+  return { client, features: new FeatureService(client) };
 }
 
 describe('FeatureService — outcome classification', () => {
@@ -116,7 +123,7 @@ describe('FeatureService — outcome classification', () => {
     // IS configured, the first real success behaves exactly like a first success — a later
     // transient failure inside the window still stale-serves it.
     inner.resolves(true);
-    holder.set(inner as unknown as INarratorrClient);
+    holder.set(asClient(inner));
     await expect(features.ebooksCapability(T0 + 1000)).resolves.toBe(true);
     inner.rejects(NETWORK);
     await expect(features.ebooksCapability(T0 + 1000 + CAPABILITY_STALE_WINDOW_MS - 1)).resolves.toBe(true);
@@ -260,12 +267,12 @@ describe('FeatureService — invalidation (generation)', () => {
     // adjacency `reconfigure()` uses.
     const a = new StubClient();
     const b = new StubClient();
-    const holder = new NarratorrClientHolder(a as unknown as INarratorrClient);
+    const holder = new NarratorrClientHolder(asClient(a));
     const features = new FeatureService(holder);
     const settleA = a.defers();
     const first = features.ebooksCapability(T0);
 
-    holder.set(b as unknown as INarratorrClient);
+    holder.set(asClient(b));
     features.invalidate();
 
     // (a) A fresh caller does not join A's flight — it asks B.
@@ -290,7 +297,7 @@ describe('FeatureService — invalidation (generation)', () => {
 
   it('A→unconfigured: the next resolve answers NOT_CONFIGURED with no upstream call', async () => {
     const a = new StubClient();
-    const holder = new NarratorrClientHolder(a as unknown as INarratorrClient);
+    const holder = new NarratorrClientHolder(asClient(a));
     const features = new FeatureService(holder);
     const settleA = a.defers();
     const first = features.ebooksCapability(T0);

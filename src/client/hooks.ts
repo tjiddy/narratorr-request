@@ -24,6 +24,7 @@ import {
   listUserRequests,
   getConnectorSettings,
   getSystemInfo,
+  getFeatures,
   updateConnectorSettings,
   testConnector,
   createNotifier,
@@ -37,6 +38,7 @@ import {
   ApiError,
 } from './api';
 import { decideBadge } from './instance-badge';
+import { featuresQueryEnabled } from './features';
 import { meSuccessToast, mergeMeCache } from './pages/notify-prefs';
 
 export const qk = {
@@ -64,6 +66,9 @@ export const qk = {
   // byte-for-byte or save → cache-write → invalidate silently no-ops.
   connectors: ['admin', 'settings', 'connectors'] as const,
   system: ['admin', 'system'] as const,
+  // Derived feature state (issue #144). Instance-level and identical for every active caller, so
+  // one un-parameterized entry — no per-user segment.
+  features: ['features'] as const,
   authProviders: ['auth', 'providers'] as const,
 };
 
@@ -225,6 +230,27 @@ export const useSystemInfo = () =>
   // roughly live without hammering the upstream probe.
   useQuery({ queryKey: qk.system, queryFn: getSystemInfo, refetchInterval: 30_000 });
 
+// --- Derived feature state (issue #144) --------------------------------------
+/**
+ * Instance-level feature flags for the signed-in SPA. Gated on an ACTIVE caller: `/api/features`
+ * is `requireActiveUser`, so firing it on the login or pending/rejected screen would only produce
+ * a 401/403 and an error state the gate then has to fail-safe around. Pass the `me` payload
+ * (`useMe().data`); `undefined` keeps the query disabled.
+ *
+ * Read the result through the pure gates in `./features` (`ebooksVisible` /
+ * `kindleDeliveryVisible`) rather than touching `.data` directly — they own the fail-safe
+ * loading/error handling.
+ */
+export const useFeatures = (me: MeDto | undefined) =>
+  useQuery({
+    queryKey: qk.features,
+    queryFn: getFeatures,
+    enabled: featuresQueryEnabled(me),
+    // Operator config changes rarely, and the server already caches the capability probe — but
+    // don't hold a disabled-to-enabled flip for a whole session either.
+    staleTime: 60_000,
+  });
+
 // --- Connector settings (admin) ----------------------------------------------
 export const useConnectorSettings = () =>
   // No refetch-on-focus: the Settings form remounts on cache change, so a background
@@ -264,6 +290,32 @@ export function useUpdateKindleSender() {
       toast.success('Kindle sender saved');
     },
     onError: (err) => toast.error(err instanceof ApiError ? err.message : 'Could not save the Kindle sender'),
+  });
+}
+
+/**
+ * The companion-ebook toggle's own save (issue #144). Like {@link useUpdateKindleSender} it hits
+ * the shared connectors PUT but INVALIDATES `qk.connectors` rather than writing it wholesale.
+ *
+ * `useUpdateConnectors`'s `setQueryData` is only safe because one mutation instance sits behind
+ * one Save; the General section already runs Public URL and quota saves independently, so a second
+ * wholesale writer on the same key is the issue #160 rollback shape — under reverse settlement an
+ * earlier response snapshot overwrites a later sibling's committed field, and the toggle visibly
+ * reverts even though its write succeeded. Invalidating re-reads the server's authoritative row
+ * instead, so concurrent saves converge on both committed values regardless of settle order.
+ */
+export function useUpdateEbooksEnabled() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: UpdateConnectorSettingsBody) => updateConnectorSettings(body),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: qk.connectors });
+      // The derived feature payload is computed from this flag, so it is stale the moment the
+      // toggle lands — refresh it or the admin's own tab keeps the old gating until it refocuses.
+      void qc.invalidateQueries({ queryKey: qk.features });
+      toast.success('Settings saved');
+    },
+    onError: (err) => toast.error(err instanceof ApiError ? err.message : 'Save failed'),
   });
 }
 

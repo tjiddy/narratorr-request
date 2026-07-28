@@ -1,4 +1,4 @@
-import { NarratorrError, type INarratorrClient } from './narratorr-client.js';
+import { NarratorrError, type ICapabilityClient } from './narratorr-client.js';
 
 /** A successful probe (either boolean) stays fresh for a minute. */
 export const CAPABILITY_TTL_MS = 60_000;
@@ -63,7 +63,7 @@ export class FeatureService {
   private entry: CacheEntry | null = null;
   private inFlight: InFlight | null = null;
 
-  constructor(private readonly narratorr: INarratorrClient) {}
+  constructor(private readonly narratorr: ICapabilityClient) {}
 
   /**
    * Retire every cached/in-flight result. Synchronous, never throws, and clears NOTHING — it
