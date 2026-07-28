@@ -93,7 +93,7 @@ function wrapPeekedStream(
         pending = null;
         if (result.done) controller.close();
         else controller.enqueue(result.value);
-      } catch (err) {
+      } catch (err: unknown) {
         controller.error(err);
       }
     },
@@ -168,7 +168,7 @@ export function registerEbookRoutes(app: FastifyInstance, deps: AppDeps): void {
         // precede the id grammar so a malformed id can never answer ahead of authorization.
         requireActiveUser(request);
         ready = await prepareDownload(request, reply, deps, live);
-      } catch (err) {
+      } catch (err: unknown) {
         // The FAILURE seam (AC26 rule 2). A caller who is already gone is an expected outcome,
         // not an error: hijacking here means no dead-socket write, no unhandled rejection and no
         // error-level log line. Otherwise this throws exactly as before, so the central error
@@ -267,13 +267,13 @@ async function openAndPeek(
   let stream: NarratorrEbookStream;
   try {
     stream = await deps.narratorr.openCompanionEpub(bookId, { signal });
-  } catch (err) {
+  } catch (err: unknown) {
     throw mapUpstreamFailure(err, reply);
   }
   const reader = stream.body.getReader();
   try {
     return { stream, reader, peeked: await reader.read() };
-  } catch (err) {
+  } catch (err: unknown) {
     void reader.cancel().catch(() => {});
     throw mapUpstreamFailure(err, reply);
   }
