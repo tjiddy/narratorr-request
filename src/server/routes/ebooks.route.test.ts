@@ -1,9 +1,10 @@
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import type { FastifyInstance, RouteOptions } from 'fastify';
 import { buildRouteApp, type RouteHarness } from '../test-support/route-harness.js';
 import { insertUser } from '../test-support/db.js';
 import { registerEbookRoutes, proxyContentType } from './ebooks.js';
 import { registerFeatureRoutes } from './features.js';
+import { registerRoutes } from './index.js';
 import { NarratorrError } from '../services/narratorr-client.js';
 import { EBOOK_DOWNLOAD_MAX } from '../plugins/rate-limit.js';
 import { expectNoLeaks as sweepForLeaks, UPSTREAM_POSIX_PATH } from '../test-support/leak-sentinels.js';
@@ -15,11 +16,15 @@ import type { AppConfig } from '../config.js';
 // a real socket and live in `ebooks.stream.route.test.ts` (learning `msw-cannot-test-body-read-abort`).
 
 const URL_FOR = (bookId: string, query = '') => `/api/ebooks/${bookId}/download${query}`;
+/** A fixed instant for the rate-limit cases — any value works, it just must not advance. */
+const FROZEN_NOW = new Date('2026-07-28T12:00:00.000Z');
 const GOOD_ID = 'bk_abc123';
 
 let h: RouteHarness;
 afterEach(async () => {
-  await h.app.close();
+  // Optional: not every test builds the shared harness (the no-200-schema receipt only calls
+  // `collectRoutes`), so under a `-t` filter `h` can legitimately be unset when this runs.
+  await h?.app.close();
   vi.restoreAllMocks();
 });
 
@@ -133,6 +138,35 @@ describe('route registration receipts (AC3, AC4, F11)', () => {
     const route = routes.find((r) => r.url === '/api/ebooks/:bookId/download');
     expect(route).toBeDefined();
     expect(route?.schema?.response).toBeUndefined();
+  });
+});
+
+describe('central route registry (AC1)', () => {
+  // Every other test in this file registers `registerEbookRoutes` DIRECTLY, so none of them notices
+  // if the `registerRoutes()` wiring line disappears — production would 404 every download while the
+  // suite stayed green. These two drive the real central registrar.
+  it('registerRoutes() exposes GET /api/ebooks/:bookId/download', async () => {
+    const raw: RouteOptions[] = [];
+    h = await buildRouteApp({
+      register: (app: FastifyInstance, deps) => {
+        app.addHook('onRoute', (r: RouteOptions) => {
+          raw.push(r);
+        });
+        registerRoutes(app, deps);
+      },
+    });
+    const registered = raw.flatMap((r) => (Array.isArray(r.method) ? r.method : [r.method]).map((m) => `${m} ${r.url}`));
+    expect(registered).toContain('GET /api/ebooks/:bookId/download');
+  });
+
+  it('is REACHABLE through the central registry — a miss would be NOT_FOUND, not UNAUTHORIZED', async () => {
+    // The behavioral half, and the sharper discriminator: with the route wired, an anonymous caller
+    // reaches the handler's guard and gets 401 UNAUTHORIZED. Unwire it and the harness's production
+    // not-found handler answers 404 NOT_FOUND instead.
+    h = await buildRouteApp({ register: registerRoutes });
+    const res = await h.app.inject({ method: 'GET', url: URL_FOR(GOOD_ID) });
+    expect(res.statusCode).toBe(401);
+    expect(res.json().error.code).toBe('UNAUTHORIZED');
   });
 });
 
@@ -514,6 +548,19 @@ describe('mid-stream failure (AC24)', () => {
 });
 
 describe('rate limiting, per user (AC29-AC31)', () => {
+  // `@fastify/rate-limit`'s LocalStore reads the AMBIENT `Date.now()` (store/LocalStore.js:12) to
+  // decide which one-minute bucket a request lands in, so asserting the exact 10th/11th transition
+  // against the wall clock is a bet that no pause ever straddles a minute boundary mid-test. Freeze
+  // Date — and ONLY Date (`toFake`), so `setTimeout` and the real event loop keep working for the
+  // app, the in-memory DB and `inject()` — and the bucket becomes deterministic regardless of how
+  // long the run is stalled.
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'], now: FROZEN_NOW });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it(`caps one user at ${EBOOK_DOWNLOAD_MAX} per window and leaves a second user untouched (AC30)`, async () => {
     await build();
     const alice = await cookiesFor('active', { username: 'alice' });
@@ -528,6 +575,13 @@ describe('rate limiting, per user (AC29-AC31)', () => {
     expectNoLeaks(tripped, '429');
 
     expect((await download(GOOD_ID, '', bob)).statusCode).toBe(200);
+
+    // With the clock frozen the bucket is now provably OURS to move: stepping past the declared
+    // window must free the same user again. This turns the frozen clock from a defensive measure
+    // into an asserted one — it pins both edges of the transition, and it pins
+    // EBOOK_DOWNLOAD_WINDOW's real value rather than trusting the constant.
+    vi.setSystemTime(new Date(FROZEN_NOW.getTime() + 61_000));
+    expect((await download(GOOD_ID, '', alice)).statusCode, 'the window must reset the cap').toBe(200);
   });
 
   it('never caps in AUTH_BYPASS mode — every request is the dev admin there (AC31)', async () => {
