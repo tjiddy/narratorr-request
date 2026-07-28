@@ -1,12 +1,12 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import type { FastifyInstance, RouteOptions } from 'fastify';
-import type { Response as InjectResponse } from 'light-my-request';
 import { buildRouteApp, type RouteHarness } from '../test-support/route-harness.js';
 import { insertUser } from '../test-support/db.js';
 import { registerEbookRoutes, proxyContentType } from './ebooks.js';
 import { registerFeatureRoutes } from './features.js';
 import { NarratorrError } from '../services/narratorr-client.js';
 import { EBOOK_DOWNLOAD_MAX } from '../plugins/rate-limit.js';
+import { expectNoLeaks as sweepForLeaks, UPSTREAM_POSIX_PATH } from '../test-support/leak-sentinels.js';
 import type { AppConfig } from '../config.js';
 
 // `GET /api/ebooks/:bookId/download` (issue #146) over `app.inject()`. This file owns everything
@@ -50,37 +50,10 @@ async function download(bookId = GOOD_ID, query = '', cookies?: Record<string, s
   return h.app.inject({ method: 'GET', url: URL_FOR(bookId, query), ...(cookies ? { cookies } : {}) });
 }
 
-// ---------------------------------------------------------------------------
-// AC38 leak sentinels: a CLOSED list, every entry a value the test injects upstream or configures.
-// Provenance is what makes the sweep safe to run over every response — no test title, book id or
-// caller-supplied title below contains any of these substrings, so it can never trip on
-// caller-owned text.
-// ---------------------------------------------------------------------------
-const NARRATORR_BASE_URL = 'http://narratorr.internal:8123';
-const NARRATORR_API_KEY = 'sk-leak-sentinel-key';
-const UPSTREAM_POSIX_PATH = '/var/lib/narratorr/media/Secret.epub';
-const UPSTREAM_WINDOWS_PATH = 'C:\\narratorr\\media\\Secret.epub';
-const UPSTREAM_UNC_PATH = '\\\\host\\share\\Secret.epub';
-const UPSTREAM_DISPOSITION_NAME = 'upstream-chosen-name.epub';
-
-export const LEAK_SENTINELS: ReadonlyArray<[label: string, value: string]> = [
-  ['narratorr api key', NARRATORR_API_KEY],
-  ['narratorr base url', NARRATORR_BASE_URL],
-  ['narratorr host:port', 'narratorr.internal:8123'],
-  ['the /api/v1 path prefix', '/api/v1'],
-  ['a POSIX media path', UPSTREAM_POSIX_PATH],
-  ['a Windows media path', UPSTREAM_WINDOWS_PATH],
-  ['a UNC media path', UPSTREAM_UNC_PATH],
-  ['the upstream content-disposition filename', UPSTREAM_DISPOSITION_NAME],
-];
-
-/** AC32: no sentinel may appear in the body or in ANY response header, on ANY branch. */
-export function expectNoLeaks(res: InjectResponse, where: string): void {
-  const haystack = `${res.body}\n${JSON.stringify(res.headers)}`;
-  for (const [label, value] of LEAK_SENTINELS) {
-    expect(haystack.includes(value), `${where}: leaked ${label}`).toBe(false);
-  }
-}
+// AC38's leak sentinels and the sweep helper live in `test-support/leak-sentinels.ts`, shared with
+// the real-socket file — importing one test file from another would re-run its whole suite.
+const expectNoLeaks = (res: { body: string; headers: Record<string, unknown> }, where: string) =>
+  sweepForLeaks(res.body, res.headers, where);
 
 describe('GET /api/ebooks/:bookId/download — guards (AC1, AC2)', () => {
   it('401s an anonymous caller and opens NO upstream stream', async () => {
@@ -570,7 +543,9 @@ async function collectRoutes(): Promise<RouteOptions[]> {
   const raw: RouteOptions[] = [];
   const harness = await buildRouteApp({
     register: (app: FastifyInstance, deps) => {
-      app.addHook('onRoute', (r: RouteOptions) => raw.push(r));
+      app.addHook('onRoute', (r: RouteOptions) => {
+        raw.push(r);
+      });
       registerEbookRoutes(app, deps);
     },
   });

@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import * as featureState from '../services/feature-state.js';
+import type * as FeatureStateModule from '../services/feature-state.js';
 import { buildRouteApp, type RouteHarness } from '../test-support/route-harness.js';
 import { insertUser } from '../test-support/db.js';
 import { registerFeatureRoutes } from './features.js';
@@ -11,7 +12,7 @@ import { registerEbookRoutes } from './ebooks.js';
 // EXPORT and proves each handler crosses that boundary: the wrapper delegates to the real
 // implementation, so observable behavior is unchanged and only the call itself is under test.
 vi.mock('../services/feature-state.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../services/feature-state.js')>();
+  const actual = await importOriginal<typeof FeatureStateModule>();
   return { ...actual, resolveFeatures: vi.fn(actual.resolveFeatures) };
 });
 

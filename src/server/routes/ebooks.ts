@@ -157,54 +157,91 @@ export function registerEbookRoutes(app: FastifyInstance, deps: AppDeps): void {
     },
     async (request, reply) => {
       const live = trackLiveness(request, reply);
+
+      let ready: PreparedDownload | null;
       try {
-        // Lexically inside the handler: the route-guard manifest greps for this, and it must run
-        // before the id grammar so a malformed id can never answer ahead of authorization.
+        // Lexically inside the handler, deliberately: the route-guard manifest guardrail is
+        // STRUCTURAL — it greps this handler's source for a guard identifier — and the call must
+        // precede the id grammar so a malformed id can never answer ahead of authorization.
         requireActiveUser(request);
-
-        // Re-checked on EVERY download through the shared resolver, so enforcement can never
-        // disagree with what `/api/features` told the same caller. Fail-closed by construction.
-        if (!(await resolveFeatures(deps)).ebooksEnabled) throw ebooksDisabled();
-
-        const { bookId } = request.params;
-        if (!BOOK_ID_RE.test(bookId)) throw ebookUnavailable();
-
-        // Fastify's querystring parser yields an ARRAY for a repeated key; only a string is
-        // usable, and the filename helper decides that. The title only ever affects THIS
-        // caller's Content-Disposition and is never echoed anywhere else.
-        const filename = epubFilename({ title: request.query?.title, bookId });
-
-        // AC26 rule 1: the one place a companion stream is opened, guarded immediately before it.
-        // (`resolveFeatures` may still hit its own cached `/capabilities` probe — that is
-        // FeatureService's traffic, shared with `/api/features`, not per-download traffic.)
-        if (live.gone()) return reply.hijack();
-
-        const { stream, reader, peeked } = await openAndPeek(deps, bookId, live.signal, reply);
-
-        // The success seam. Everything above this line is header-phase: nothing has been written,
-        // so a caller who left gets no response attempt at all.
-        if (live.gone()) {
-          void reader.cancel().catch(() => {});
-          return reply.hijack();
-        }
-        reply.header('content-type', proxyContentType(stream.contentType));
-        // Forwarded EXACTLY when the client parsed one, the legitimate `0` included; a null
-        // length means chunked, not "guess".
-        if (stream.contentLength !== null) reply.header('content-length', String(stream.contentLength));
-        reply.header('content-disposition', contentDispositionAttachment(filename));
-        reply.header('cache-control', 'private, no-store');
-        reply.header('x-content-type-options', 'nosniff');
-        return reply.send(wrapPeekedStream(reader, peeked));
+        ready = await prepareDownload(request, reply, deps, live);
       } catch (err) {
-        // The failure seam. A caller who is already gone is an expected outcome, not an error:
-        // returning here means no dead-socket write, no unhandled rejection and no error-level
-        // log line. Otherwise this throws exactly as before, so the central error handler stays
-        // the sole formatter of our envelope.
-        if (live.gone()) return reply.hijack();
+        // The FAILURE seam (AC26 rule 2). A caller who is already gone is an expected outcome,
+        // not an error: hijacking here means no dead-socket write, no unhandled rejection and no
+        // error-level log line. Otherwise this throws exactly as before, so the central error
+        // handler remains the sole formatter of our envelope.
+        if (live.gone()) {
+          reply.hijack();
+          return;
+        }
         throw err;
       }
+
+      // The SUCCESS seam. `null` means the caller left before anything was committed — nothing
+      // has been written yet, so they get no response attempt at all.
+      if (!ready) {
+        reply.hijack();
+        return;
+      }
+
+      const { stream, reader, peeked, filename } = ready;
+      reply.header('content-type', proxyContentType(stream.contentType));
+      // Forwarded EXACTLY when the client parsed one, the legitimate `0` included; a null length
+      // means chunked, not "guess".
+      if (stream.contentLength !== null) reply.header('content-length', String(stream.contentLength));
+      reply.header('content-disposition', contentDispositionAttachment(filename));
+      reply.header('cache-control', 'private, no-store');
+      reply.header('x-content-type-options', 'nosniff');
+      return reply.send(wrapPeekedStream(reader, peeked));
     },
   );
+}
+
+/** Everything the success commit needs, or `null` when the caller left during the header phase. */
+interface PreparedDownload {
+  stream: NarratorrEbookStream;
+  reader: ReadableStreamDefaultReader<Uint8Array>;
+  peeked: ReadableStreamReadResult<Uint8Array>;
+  filename: string;
+}
+
+/**
+ * The rest of the header phase, after the handler's own guard: re-check the flags, validate the
+ * id, derive the filename and peek the upstream stream. Nothing here writes to the reply, so every
+ * failure is still an ordinary thrown error the central handler can format — that ordering is what
+ * AC25 buys.
+ */
+async function prepareDownload(
+  request: FastifyRequest<{ Params: { bookId: string }; Querystring: Record<string, unknown> }>,
+  reply: FastifyReply,
+  deps: AppDeps,
+  live: Liveness,
+): Promise<PreparedDownload | null> {
+  // Re-checked on EVERY download through the shared resolver, so enforcement can never disagree
+  // with what `/api/features` told the same caller. Fail-closed by construction.
+  if (!(await resolveFeatures(deps)).ebooksEnabled) throw ebooksDisabled();
+
+  const { bookId } = request.params;
+  if (!BOOK_ID_RE.test(bookId)) throw ebookUnavailable();
+
+  // Fastify's querystring parser yields an ARRAY for a repeated key; only a string is usable, and
+  // the filename helper decides that. The title only ever affects THIS caller's
+  // Content-Disposition and is never echoed anywhere else.
+  const filename = epubFilename({ title: request.query?.title, bookId });
+
+  // AC26 rule 1: the one place a companion stream is opened, guarded immediately before it.
+  // (`resolveFeatures` may still hit its own cached `/capabilities` probe — that is
+  // FeatureService's traffic, shared with `/api/features`, not per-download traffic.)
+  if (live.gone()) return null;
+
+  const opened = await openAndPeek(deps, bookId, live.signal, reply);
+
+  // Re-checked after the peek: the read can resolve perfectly well while the caller was leaving.
+  if (live.gone()) {
+    void opened.reader.cancel().catch(() => {});
+    return null;
+  }
+  return { ...opened, filename };
 }
 
 /**
