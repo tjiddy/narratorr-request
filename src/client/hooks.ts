@@ -24,6 +24,7 @@ import {
   listUserRequests,
   getConnectorSettings,
   getSystemInfo,
+  getFeatures,
   updateConnectorSettings,
   testConnector,
   createNotifier,
@@ -37,6 +38,7 @@ import {
   ApiError,
 } from './api';
 import { decideBadge } from './instance-badge';
+import { featuresQueryEnabled } from './features';
 import { meSuccessToast, mergeMeCache } from './pages/notify-prefs';
 
 export const qk = {
@@ -59,11 +61,14 @@ export const qk = {
   users: ['admin', 'users'] as const,
   userRequests: (publicId: string, limit: number) =>
     ['admin', 'users', publicId, 'requests', limit] as const,
-  // The connectors settings blob — one entry shared by the query, its optimistic
-  // setQueryData write, and the notifier mutations that invalidate it. These must agree
-  // byte-for-byte or save → cache-write → invalidate silently no-ops.
+  // The connectors settings blob — one entry shared by the query and by every settings/notifier
+  // mutation, all of which INVALIDATE it (no writer holds a wholesale setQueryData any more; see
+  // `reconcileConnectorWrite`). These must agree byte-for-byte or an invalidation silently no-ops.
   connectors: ['admin', 'settings', 'connectors'] as const,
   system: ['admin', 'system'] as const,
+  // Derived feature state (issue #144). Instance-level and identical for every active caller, so
+  // one un-parameterized entry — no per-user segment.
+  features: ['features'] as const,
   authProviders: ['auth', 'providers'] as const,
 };
 
@@ -225,6 +230,27 @@ export const useSystemInfo = () =>
   // roughly live without hammering the upstream probe.
   useQuery({ queryKey: qk.system, queryFn: getSystemInfo, refetchInterval: 30_000 });
 
+// --- Derived feature state (issue #144) --------------------------------------
+/**
+ * Instance-level feature flags for the signed-in SPA. Gated on an ACTIVE caller: `/api/features`
+ * is `requireActiveUser`, so firing it on the login or pending/rejected screen would only produce
+ * a 401/403 and an error state the gate then has to fail-safe around. Pass the `me` payload
+ * (`useMe().data`); `undefined` keeps the query disabled.
+ *
+ * Read the result through the pure gates in `./features` (`ebooksVisible` /
+ * `kindleDeliveryVisible`) rather than touching `.data` directly — they own the fail-safe
+ * loading/error handling.
+ */
+export const useFeatures = (me: MeDto | undefined) =>
+  useQuery({
+    queryKey: qk.features,
+    queryFn: getFeatures,
+    enabled: featuresQueryEnabled(me),
+    // Operator config changes rarely, and the server already caches the capability probe — but
+    // don't hold a disabled-to-enabled flip for a whole session either.
+    staleTime: 60_000,
+  });
+
 // --- Connector settings (admin) ----------------------------------------------
 export const useConnectorSettings = () =>
   // No refetch-on-focus: the Settings form remounts on cache change, so a background
@@ -235,14 +261,59 @@ export const useConnectorSettings = () =>
     refetchOnWindowFocus: false,
   });
 
+/**
+ * Reconcile the caches a settings write can invalidate, from the SERVER's committed state.
+ *
+ * Called from `onSettled`, never `onSuccess`. Every settings route persists FIRST and only then
+ * awaits the fallible reconfiguration tail (`routes/settings.ts` — `update()`/`createNotifier()`/
+ * `updateNotifier()`/`deleteNotifier()` all commit before `await reconfigure(...)`), so a write can
+ * be durable in the database and STILL answer 500. `settings.route.test.ts`'s rejecting-tail rows
+ * assert exactly that pairing. Reconciling only on success therefore leaves the SPA rendering
+ * pre-write state for a change that actually landed — the mirror image of the #160 race, and the
+ * reason reconciliation is a settlement concern rather than a success concern.
+ *
+ * Refetching after a genuine failure (a 400 the server rejected outright, or an unsent request) is
+ * the cheap direction: it costs one GET that returns the unchanged row. Guessing from the status
+ * code which failures committed is not something a client can do correctly.
+ *
+ * `retiresCapability` mirrors the server's own trigger — `reconfigure(narratorrChanged)` bumps the
+ * capability generation only for a narratorr write, so only that write needs `qk.features` on this
+ * path. (Writes whose OWN field feeds the derived payload pass `true` unconditionally.)
+ */
+function reconcileConnectorWrite(qc: ReturnType<typeof useQueryClient>, retiresCapability: boolean): void {
+  void qc.invalidateQueries({ queryKey: qk.connectors });
+  if (retiresCapability) void qc.invalidateQueries({ queryKey: qk.features });
+}
+
+/**
+ * The General + Narratorr cards' save. INVALIDATES `qk.connectors` rather than writing the
+ * response DTO wholesale.
+ *
+ * It used to `setQueryData(qk.connectors, dto)`, which was safe only while exactly one mutation
+ * instance existed. It hasn't been for a while: Public URL, default quota and Narratorr each
+ * instantiate their own, and the ebook toggle (#144) added a fourth save to the same key. Two
+ * concurrent saves are then a lost-update race — the server computes each response from the row as
+ * it stood when THAT request read it, so a response that settles last overwrites the whole cache
+ * entry with a snapshot predating its sibling's committed write (the #160 shape). Invalidating
+ * instead means every save converges on one authoritative re-read regardless of settle order:
+ * a later invalidation supersedes an in-flight refetch rather than racing a blind write against it.
+ *
+ * `qk.features` is retired only for a NARRATORR write — the same trigger, and the same reasoning,
+ * as `reconfigure(narratorrChanged)` on the server (`routes/settings.ts`): swapping the connection
+ * retires the cached capability generation, so an already-mounted `useFeatures` would otherwise
+ * keep serving the previous server's `ebooksEnabled` until its `staleTime` lapsed AND something
+ * happened to trigger a refetch (a stale mark alone schedules nothing). Public URL and quota saves
+ * cannot change the derived payload, so they don't pay for a refetch.
+ *
+ * Both reconciliations run from `onSettled` — see {@link reconcileConnectorWrite} for why a 500 is
+ * not evidence that nothing was written.
+ */
 export function useUpdateConnectors() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (body: UpdateConnectorSettingsBody) => updateConnectorSettings(body),
-    onSuccess: (dto) => {
-      qc.setQueryData(qk.connectors, dto);
-      toast.success('Settings saved');
-    },
+    onSettled: (_dto, _err, body) => reconcileConnectorWrite(qc, body.narratorr !== undefined),
+    onSuccess: () => toast.success('Settings saved'),
     onError: (err) => toast.error(err instanceof ApiError ? err.message : 'Save failed'),
   });
 }
@@ -250,20 +321,40 @@ export function useUpdateConnectors() {
 /**
  * The Kindle-sender picker's own save (issue #143). It hits the SAME connectors PUT but
  * INVALIDATES `qk.connectors` rather than writing it wholesale, mirroring the notifier-CRUD
- * mutations it sits beside. `useUpdateConnectors`'s `setQueryData` is safe only because one
- * mutation instance sits behind one Save; adding a second wholesale writer to the same key is
- * the issue #160 shape. Invalidating also re-runs the server's read-time resolution, which is
- * what turns a reconfirm into `ok` on screen.
+ * mutations it sits beside — every save against this shared key now invalidates, which is what
+ * makes concurrent saves converge instead of racing (#160). Invalidating also re-runs the
+ * server's read-time resolution, which is what turns a reconfirm into `ok` on screen.
  */
 export function useUpdateKindleSender() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (body: UpdateConnectorSettingsBody) => updateConnectorSettings(body),
-    onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: qk.connectors });
-      toast.success('Kindle sender saved');
-    },
+    // `/api/features` derives `kindleSenderEmail` / `kindleDeliveryAvailable` from exactly the
+    // read-time sender resolution this save changes (#144), so it always retires that key too.
+    onSettled: () => reconcileConnectorWrite(qc, true),
+    onSuccess: () => toast.success('Kindle sender saved'),
     onError: (err) => toast.error(err instanceof ApiError ? err.message : 'Could not save the Kindle sender'),
+  });
+}
+
+/**
+ * The companion-ebook toggle's own save (issue #144). Like {@link useUpdateKindleSender} it hits
+ * the shared connectors PUT but INVALIDATES `qk.connectors` rather than writing it wholesale, so
+ * concurrent saves converge on the server's authoritative row regardless of settle order (#160 —
+ * asserted end-to-end in `hooks.connector-cache.test.tsx`).
+ *
+ * It always retires `qk.features` as well: this flag IS half of the derived `ebooksEnabled`, so
+ * the payload is stale the moment the toggle lands, and an admin's own tab would otherwise keep
+ * the old gating until something else happened to trigger a refetch. Reconciled on settlement, so
+ * a toggle that commits and then 500s in the reconfiguration tail still refreshes the UI.
+ */
+export function useUpdateEbooksEnabled() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: UpdateConnectorSettingsBody) => updateConnectorSettings(body),
+    onSettled: () => reconcileConnectorWrite(qc, true),
+    onSuccess: () => toast.success('Settings saved'),
+    onError: (err) => toast.error(err instanceof ApiError ? err.message : 'Save failed'),
   });
 }
 
@@ -280,15 +371,22 @@ export function useTestConnector() {
 // list reflects the committed state — and the masked secrets reset cleanly. They
 // invalidate `qk.connectors`, the same entry the connectors query reads and the save
 // writes, so all four sites agree through one registry entry.
+//
+// EDIT and DELETE also retire `qk.features` (#144): the Kindle sender is resolved at READ time
+// against the live notifier list, so editing the selected notifier's `from` flips it to
+// `sender-changed` and deleting it to `notifier-missing` — both of which change
+// `kindleDeliveryAvailable` / `kindleSenderEmail` on `/api/features`.
+//
+// CREATE deliberately does NOT: the resolver matches the stored selection by notifier id, and a
+// new notifier is assigned a fresh `publicId('nf')`, so it cannot become (or repair) the selected
+// sender. Adding one is the single notifier mutation that cannot change the derived payload.
 
 export function useCreateNotifier() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (body: CreateNotifierBody) => createNotifier(body),
-    onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: qk.connectors });
-      toast.success('Notifier added');
-    },
+    onSettled: () => reconcileConnectorWrite(qc, false),
+    onSuccess: () => toast.success('Notifier added'),
     onError: (err) => toast.error(err instanceof ApiError ? err.message : 'Could not add notifier'),
   });
 }
@@ -297,10 +395,8 @@ export function useUpdateNotifier() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ id, body }: { id: string; body: UpdateNotifierBody }) => updateNotifier(id, body),
-    onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: qk.connectors });
-      toast.success('Notifier saved');
-    },
+    onSettled: () => reconcileConnectorWrite(qc, true),
+    onSuccess: () => toast.success('Notifier saved'),
     onError: (err) => toast.error(err instanceof ApiError ? err.message : 'Could not save notifier'),
   });
 }
@@ -309,10 +405,8 @@ export function useDeleteNotifier() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => deleteNotifier(id),
-    onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: qk.connectors });
-      toast.success('Notifier deleted');
-    },
+    onSettled: () => reconcileConnectorWrite(qc, true),
+    onSuccess: () => toast.success('Notifier deleted'),
     onError: (err) => toast.error(err instanceof ApiError ? err.message : 'Could not delete notifier'),
   });
 }

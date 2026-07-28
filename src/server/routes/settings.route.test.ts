@@ -20,12 +20,15 @@ import { SettingsService } from '../services/settings.service.js';
 import { ConnectorSettingsService } from '../services/connector-settings.service.js';
 import { SecretCodec, deriveSettingsKey } from '../util/secret-codec.js';
 import { NarratorrClientHolder } from '../services/narratorr-client-holder.js';
+import { FeatureService } from '../services/feature.service.js';
 import { Notifier } from '../services/notifications/index.js';
 import { errorHandlerPlugin } from '../plugins/error-handler.js';
 import { registerSettingsRoutes } from './settings.js';
+import { registerFeatureRoutes } from './features.js';
 import type { AppDeps } from '../services/deps.js';
 import type { AuthUser } from '../types.js';
 import type { CreateNotifierBody } from '../../shared/schemas/connectors.js';
+import type { V1Capabilities } from '../../shared/schemas/v1/capabilities.js';
 
 const codec = new SecretCodec(deriveSettingsKey({ sessionSecret: 'route-test' }));
 const silentLog = { info() {}, warn() {}, error() {}, debug() {} };
@@ -38,15 +41,39 @@ let deps: AppDeps;
 let db: Db;
 let connectorSettings: ConnectorSettingsService;
 let narratorr: NarratorrClientHolder;
+let features: FeatureService;
+let invalidate: ReturnType<typeof vi.spyOn>;
+let capability: CountingCapabilityClient;
+
+/**
+ * The upstream the capability resolver probes (issue #144), counting calls so a test can tell a
+ * cache hit from a re-probe. Deliberately handed to `FeatureService` DIRECTLY rather than through
+ * `narratorr`: `reconfigure()` replaces the holder's inner client with a REAL `NarratorrClient`
+ * pointed at the saved URL, which would turn every probe here into an actual socket. Bypassing the
+ * holder isolates what these tests are about — whether the generation was bumped — from the
+ * network. The holder swap itself is asserted separately via `narratorr.configured`.
+ */
+class CountingCapabilityClient {
+  calls = 0;
+  enabled = true;
+  async getCapabilities(): Promise<V1Capabilities> {
+    this.calls += 1;
+    return { companionEpub: { enabled: this.enabled } };
+  }
+}
 
 async function buildApp(): Promise<FastifyInstance> {
   db = await createTestDb();
   await new SettingsService(db).ensure();
   connectorSettings = new ConnectorSettingsService(db, codec);
   narratorr = new NarratorrClientHolder(null);
+  capability = new CountingCapabilityClient();
+  features = new FeatureService(capability);
+  invalidate = vi.spyOn(features, 'invalidate');
   deps = {
     connectorSettings,
     narratorr,
+    features,
     notifier: new Notifier([], null, silentLog),
     // reconfigure() refreshes the request-quota policy on every connector/notifier save.
     requests: { reconfigureQuota: vi.fn() },
@@ -63,6 +90,9 @@ async function buildApp(): Promise<FastifyInstance> {
     else if (role === 'user') req.user = USER;
   });
   registerSettingsRoutes(f, deps);
+  // Registered alongside so the AC16 tests can observe the generation through the real consumer
+  // surface (`/api/features` re-probes vs. serves the cached value), not just the spy.
+  registerFeatureRoutes(f, deps);
   await f.ready();
   return f;
 }
@@ -594,5 +624,153 @@ describe('settings routes — write mutex (no clobber on overlapping writes)', (
     const stored = await connectorSettings.getStored();
     expect(stored.publicUrl).toBe('https://app.example.com');
     expect(stored.notifiers).toHaveLength(1);
+  });
+});
+
+// AC16.7 (issue #144): a narratorr CONNECTION CHANGE must retire the cached companion-ebook
+// capability, and nothing else may. The generation bump sits on the statement immediately after
+// `deps.narratorr.set(...)` — before `reconfigure()`'s two remaining awaits — so a concurrent
+// `/api/features` read (which deliberately does NOT take the settings write mutex) can never
+// observe the new holder paired with the old generation's cache.
+describe('settings routes — capability invalidation on a narratorr change (#144)', () => {
+  const FEATURES_URL = '/api/features';
+  const emailCreate = (from: string): CreateNotifierBody => ({
+    name: 'Mail',
+    type: 'email',
+    events: ['request.created'],
+    config: { host: 'smtp.example.com', port: 587, secure: false, user: 'u', pass: 'p', from, to: 'admin@ex.com' },
+  });
+
+  const readFeatures = () => app.inject({ method: 'GET', url: FEATURES_URL, headers: asAdmin });
+  const putConnectors = (payload: Record<string, unknown>) =>
+    app.inject({ method: 'PUT', url: CONNECTORS_URL, headers: asAdmin, payload });
+
+  /** Turn the feature on and warm the cache, so a later probe means the generation was bumped. */
+  async function primeCachedCapability(): Promise<void> {
+    await connectorSettings.update({ ebooksEnabled: true });
+    expect((await readFeatures()).json().ebooksEnabled).toBe(true);
+    expect(capability.calls).toBe(1);
+    // A second read inside the TTL is served from cache — the baseline every row below contrasts with.
+    await readFeatures();
+    expect(capability.calls).toBe(1);
+  }
+
+  it('invalidates on a PUT carrying narratorr — the next read RE-PROBES instead of serving the cache', async () => {
+    await primeCachedCapability();
+
+    const res = await putConnectors({ narratorr: { url: 'http://n:3000', apiKey: 'k' } });
+    expect(res.statusCode).toBe(200);
+    expect(invalidate).toHaveBeenCalledTimes(1);
+
+    expect((await readFeatures()).json().ebooksEnabled).toBe(true);
+    expect(capability.calls).toBe(2); // re-probed, despite being well inside the 60s TTL
+  });
+
+  it('bumps ADJACENTLY to the holder swap — visible while reconfigure() is still parked', async () => {
+    // An ordering-only assertion (`set` before `invalidate`) cannot distinguish an adjacent bump
+    // from one deferred past the awaits. So park `reconfigure()` INSIDE itself, right after the
+    // swap, and assert the new generation is already observable from a concurrent reader.
+    await primeCachedCapability();
+
+    let release!: () => void;
+    const parked = new Promise<void>((res) => {
+      release = res;
+    });
+    const real = connectorSettings.getNotificationsConfig.bind(connectorSettings);
+    vi.spyOn(connectorSettings, 'getNotificationsConfig').mockImplementation(async () => {
+      await parked;
+      return real();
+    });
+
+    const put = putConnectors({ narratorr: { url: 'http://n:3000', apiKey: 'k' } });
+    // Let the PUT run up to the parked await.
+    await vi.waitFor(() => expect(invalidate).toHaveBeenCalledTimes(1));
+    // The holder has already swapped…
+    expect(narratorr.configured).toBe(true);
+    // …and a concurrent read is ALREADY in the new generation: it re-probes rather than serving
+    // the cached `true`. A bump deferred past the awaits would still serve the cache here.
+    expect((await readFeatures()).json().ebooksEnabled).toBe(true);
+    expect(capability.calls).toBe(2);
+
+    release();
+    expect((await put).statusCode).toBe(200);
+  });
+
+  it.each([
+    ['getNotificationsConfig', 'getNotificationsConfig' as const],
+    ['getDefaultQuota', 'getDefaultQuota' as const],
+  ])('survives a REJECTING %s tail — the bump already happened', async (_label, method) => {
+    // The DB update and the holder swap are already durable when the tail runs. A bump placed
+    // after it would be skipped entirely by the rejection, stranding the new connection with the
+    // previous generation's cache — indefinitely, since nothing retries.
+    await primeCachedCapability();
+    vi.spyOn(connectorSettings, method).mockRejectedValue(new Error('tail exploded'));
+
+    const res = await putConnectors({ narratorr: { url: 'http://n:3000', apiKey: 'k' } });
+    expect(res.statusCode).toBe(500);
+    expect(invalidate).toHaveBeenCalledTimes(1);
+
+    vi.restoreAllMocks();
+    expect((await readFeatures()).json().ebooksEnabled).toBe(true);
+    expect(capability.calls).toBe(2); // the new generation, not the stranded old one
+  });
+
+  // The F13 regressions: `reconfigure()` rebuilds the narratorr client on EVERY save, so an
+  // unconditional bump would discard a valid capability result — and its 15-minute stale budget —
+  // on each of these. One row per non-narratorr write path.
+  describe('does NOT invalidate on a save that cannot change the connection', () => {
+    it.each([
+      ['ebooksEnabled only', () => putConnectors({ ebooksEnabled: true })],
+      ['defaultQuota only', () => putConnectors({ defaultQuota: { mode: 'limited', limit: 3, windowDays: 7 } })],
+      ['publicUrl only', () => putConnectors({ publicUrl: 'https://app.example.com' })],
+    ])('%s', async (_label, save) => {
+      await primeCachedCapability();
+      expect((await save()).statusCode).toBe(200);
+      expect(invalidate).not.toHaveBeenCalled();
+      // The cached value — and its stale budget — survives.
+      expect((await readFeatures()).json().ebooksEnabled).toBe(true);
+      expect(capability.calls).toBe(1);
+    });
+
+    it('kindleSender only', async () => {
+      await primeCachedCapability();
+      const nf = (await createNotifier(emailCreate('bot@ex.com'))).json();
+      // (notifier CREATE also ran reconfigure() — assert across both writes)
+      expect((await putConnectors({ kindleSender: { notifierId: nf.id } })).statusCode).toBe(200);
+      expect(invalidate).not.toHaveBeenCalled();
+      expect((await readFeatures()).json().kindleSenderEmail).toBe('bot@ex.com');
+      expect(capability.calls).toBe(1);
+    });
+
+    it.each([
+      ['notifier create', async () => (await createNotifier(ntfyCreate())).statusCode],
+      [
+        'notifier update',
+        async () => {
+          const nf = (await createNotifier(ntfyCreate())).json();
+          const res = await app.inject({
+            method: 'PUT',
+            url: `${NOTIFIERS_URL}/${nf.id}`,
+            headers: asAdmin,
+            payload: ntfyCreate({ name: 'Renamed' }),
+          });
+          return res.statusCode;
+        },
+      ],
+      [
+        'notifier delete',
+        async () => {
+          const nf = (await createNotifier(ntfyCreate())).json();
+          const res = await app.inject({ method: 'DELETE', url: `${NOTIFIERS_URL}/${nf.id}`, headers: asAdmin });
+          return res.statusCode;
+        },
+      ],
+    ])('%s', async (_label, save) => {
+      await primeCachedCapability();
+      expect(await save()).toBe(200);
+      expect(invalidate).not.toHaveBeenCalled();
+      expect((await readFeatures()).json().ebooksEnabled).toBe(true);
+      expect(capability.calls).toBe(1);
+    });
   });
 });

@@ -68,14 +68,55 @@ describe('schema migrations', () => {
     client.close();
   });
 
+  // issue #144: the companion-ebook opt-in. Same fresh-DB shape check as 0001 above — a migration
+  // that never lands (an edited baseline, which drizzle tracks by content hash and silently skips
+  // on an existing DB) fails here rather than at a customer's boot.
+  it('applies the append-only 0002 ebooks_enabled column on top of the baseline', async () => {
+    const client = createClient({ url: ':memory:' });
+    await migrate(drizzle(client), { migrationsFolder: drizzleDir });
+    const col = (await client.execute("PRAGMA table_info('app_settings')")).rows.find(
+      (r) => r['name'] === 'ebooks_enabled',
+    );
+    expect(col).toBeDefined();
+    expect(col?.['notnull']).toBe(1); // NOT NULL — every read gets a concrete boolean
+    client.close();
+  });
+
+  // AC2's other half, which a fresh-DB test CANNOT reach: an EXISTING install (schema stopped at
+  // 0001, singleton row already written) must survive the in-place upgrade and read the new column
+  // as false. Default OFF is the safe state — the flag is opt-in, never opt-out — so a migration
+  // that defaulted it on, or that dropped/recreated the row, would silently publish ebooks to
+  // every family member on upgrade.
+  it('gives an EXISTING app_settings row ebooks_enabled = false when 0002 is applied in place', async () => {
+    const client = await seedThenMigrate({
+      target: '0002_app_settings_ebooks_enabled',
+      seed: async (c) => {
+        await c.execute(
+          "INSERT INTO app_settings (id, default_quota_mode, default_quota_limit, default_quota_window_days) VALUES (1, 'limited', 7, 7)",
+        );
+      },
+    });
+    const rows = (await client.execute('SELECT id, default_quota_limit, ebooks_enabled FROM app_settings')).rows;
+    expect(rows).toHaveLength(1);
+    // The pre-existing row survives with its own values intact…
+    expect(rows[0]?.['default_quota_limit']).toBe(7);
+    // …and the new column reads falsy (SQLite stores the boolean default as 0).
+    expect(rows[0]?.['ebooks_enabled']).toBe(0);
+    client.close();
+  });
+
   it('journal, .sql files and snapshots stay in lockstep — no stragglers, baseline untouched', () => {
     const journal = JSON.parse(
       fs.readFileSync(path.join(drizzleDir, 'meta', '_journal.json'), 'utf8'),
     ) as { entries: { idx: number; tag: string }[] };
     // Migrations are APPEND-ONLY from the 1.0 baseline forward: 0000_baseline must remain the
     // first entry, with every later migration stacked after it in idx order.
-    expect(journal.entries.map((e) => e.tag)).toEqual(['0000_baseline', '0001_user_kindle_email']);
-    expect(journal.entries.map((e) => e.idx)).toEqual([0, 1]);
+    expect(journal.entries.map((e) => e.tag)).toEqual([
+      '0000_baseline',
+      '0001_user_kindle_email',
+      '0002_app_settings_ebooks_enabled',
+    ]);
+    expect(journal.entries.map((e) => e.idx)).toEqual([0, 1, 2]);
     // The .sql files and meta snapshots must match the journal — a stale leftover would
     // change what migrate() applies (sql) or what drizzle-kit diffs against (snapshot).
     const sqlFiles = fs.readdirSync(drizzleDir).filter((f) => f.endsWith('.sql')).sort();

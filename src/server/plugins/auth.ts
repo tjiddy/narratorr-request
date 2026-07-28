@@ -6,6 +6,7 @@ import type { UserService } from '../services/user.service.js';
 import type { AuthUser } from '../types.js';
 import { createSessionToken, verifySessionToken, SESSION_TTL_MS } from '../util/session.js';
 import { accountPending, accountRejected, forbidden, unauthorized } from '../util/errors.js';
+import { isApprovedUser } from '../../shared/schemas/user.js';
 
 export const SESSION_COOKIE = 'nreq_session';
 
@@ -83,7 +84,10 @@ export function requireUser(request: FastifyRequest): AuthUser {
  */
 export function requireActiveUser(request: FastifyRequest): AuthUser {
   const user = requireUser(request);
-  if (user.role === 'admin' || user.status === 'active') return user;
+  // The decision itself lives in `isApprovedUser` (shared) — this function owns only the
+  // ENFORCEMENT (which error a rejected caller gets). The client gates its active-user-only
+  // requests on the same predicate, so the two can't drift.
+  if (isApprovedUser(user)) return user;
   throw user.status === 'rejected' ? accountRejected() : accountPending();
 }
 

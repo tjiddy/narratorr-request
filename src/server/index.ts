@@ -21,6 +21,7 @@ import { buildNotifier } from './services/notifications/index.js';
 import { RequesterEmailService } from './services/notifications/requester-email.js';
 import { ConnectorSettingsService } from './services/connector-settings.service.js';
 import { NarratorrClientHolder } from './services/narratorr-client-holder.js';
+import { FeatureService } from './services/feature.service.js';
 import { SecretCodec, deriveSettingsKey } from './util/secret-codec.js';
 import { errorHandlerPlugin } from './plugins/error-handler.js';
 import { authRateLimitOptions } from './plugins/rate-limit.js';
@@ -86,6 +87,9 @@ async function main(): Promise<void> {
     { getNotifier: () => deps.notifier, users, requesterEmail, logger: app.log },
   );
   const search = new SearchService(narratorr);
+  // Reads narratorr through the HOLDER (not a captured client) so a live reconnect is observed;
+  // `reconfigure()` bumps its generation beside the holder swap on a connection change.
+  const features = new FeatureService(narratorr);
   // One OidcService per configured provider, keyed by id. Authorization is the approval
   // queue (no per-provider gate), so the mapped profile flows straight to upsertFromOidc.
   const oidc = new Map<string, { service: OidcService<OidcProfile>; config: (typeof config.oidcProviders)[number] }>();
@@ -109,6 +113,7 @@ async function main(): Promise<void> {
     search,
     connectorSettings,
     narratorr,
+    features,
     notifier,
     oidc,
   };

@@ -2,6 +2,7 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { useMe, useInstanceBadge } from './hooks';
 import { ApiError, logout } from './api';
+import { unapprovedStatus } from '@shared/schemas/user';
 import { Layout } from './components/Layout';
 import { SearchPage } from './pages/SearchPage';
 import { MyRequestsPage } from './pages/MyRequestsPage';
@@ -40,9 +41,12 @@ export function App() {
 
   const isAdmin = me.data.role === 'admin';
 
-  // Authenticated but not (yet) approved — admins are always active and skip this.
-  if (!isAdmin && me.data.status !== 'active') {
-    return <AccountStatusScreen status={me.data.status} />;
+  // Authenticated but not (yet) approved. Derived from the SHARED approval policy (which already
+  // exempts admins) rather than a local restatement, so this shell decision and the server's
+  // `requireActiveUser` boundary can never drift apart.
+  const unapproved = unapprovedStatus(me.data);
+  if (unapproved) {
+    return <AccountStatusScreen status={unapproved} />;
   }
 
   return (

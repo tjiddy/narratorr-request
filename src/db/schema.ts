@@ -144,6 +144,13 @@ export const appSettings = sqliteTable(
   // mapped to a fixed day count {1,7,30}. NOT NULL so the cutoff calc always has a concrete
   // value; default 30 seeds a fresh row and survives an omit-to-keep save. Rides BOTH modes.
   defaultQuotaWindowDays: integer('default_quota_window_days').notNull().default(30),
+  // Companion-ebook publishing opt-in (issue #144). AND-ed with narratorr's own
+  // `companionEpub.enabled` capability to derive `ebooksEnabled` — the owner may support ebooks
+  // in narratorr without publishing them to family. Default OFF: the flag is opt-in, never
+  // opt-out, so an existing DB migrated in place also reads false. Deliberately a COLUMN, not a
+  // key in the encrypted `connectors` blob: a blob-envelope degrade-to-empty read (or a
+  // SESSION_SECRET rotation that renders the blob undecryptable) can never silently flip it.
+  ebooksEnabled: integer('ebooks_enabled', { mode: 'boolean' }).notNull().default(false),
   // Which roles are auto-approved on request create. MVP: ['admin'].
   autoApproveRoles: text('auto_approve_roles', { mode: 'json' })
     .notNull()

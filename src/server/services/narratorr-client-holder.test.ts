@@ -3,6 +3,7 @@ import { NarratorrClientHolder } from './narratorr-client-holder.js';
 import type { INarratorrClient } from './narratorr-client.js';
 import type { V1Book } from '../../shared/schemas/v1/books.js';
 import type { V1System } from '../../shared/schemas/v1/system.js';
+import type { V1Capabilities } from '../../shared/schemas/v1/capabilities.js';
 
 // What every call should look like while the inner client is null — surfaced to our
 // own clients as a 502 (server-to-server) carrying the NOT_CONFIGURED upstream code.
@@ -10,6 +11,7 @@ const NOT_CONFIGURED = { statusCode: 502, upstreamCode: 'NOT_CONFIGURED' };
 
 const book: V1Book = { id: 'bk_1', title: 'A Book', authors: [], narrators: [], status: 'searching' };
 const system: V1System = { version: 'v1.0.0' };
+const capabilities: V1Capabilities = { companionEpub: { enabled: true } };
 
 // The holder's delegating methods aren't `async` — `require()` throws synchronously
 // when unconfigured, which every caller observes as a rejection because they `await`.
@@ -22,12 +24,14 @@ function fakeClient(): INarratorrClient & {
   addBook: ReturnType<typeof vi.fn>;
   getBook: ReturnType<typeof vi.fn>;
   getSystem: ReturnType<typeof vi.fn>;
+  getCapabilities: ReturnType<typeof vi.fn>;
 } {
   return {
     searchMetadata: vi.fn().mockResolvedValue([]),
     addBook: vi.fn().mockResolvedValue(book),
     getBook: vi.fn().mockResolvedValue(book),
     getSystem: vi.fn().mockResolvedValue(system),
+    getCapabilities: vi.fn().mockResolvedValue(capabilities),
   };
 }
 
@@ -39,6 +43,9 @@ describe('NarratorrClientHolder', () => {
     await expect(awaited(() => holder.addBook('B1'))).rejects.toMatchObject(NOT_CONFIGURED);
     await expect(awaited(() => holder.getBook('bk_1'))).rejects.toMatchObject(NOT_CONFIGURED);
     await expect(awaited(() => holder.getSystem())).rejects.toMatchObject(NOT_CONFIGURED);
+    // The capability probe (issue #144) must reach the SAME NOT_CONFIGURED signal — the resolver
+    // branches on that code to answer `false` immediately without burning its stale window.
+    await expect(awaited(() => holder.getCapabilities())).rejects.toMatchObject(NOT_CONFIGURED);
   });
 
   it('delegates each method to the inner client and returns its result once configured', async () => {
@@ -56,6 +63,8 @@ describe('NarratorrClientHolder', () => {
     expect(inner.getBook).toHaveBeenCalledWith('bk_42');
     await expect(holder.getSystem()).resolves.toBe(system);
     expect(inner.getSystem).toHaveBeenCalledWith();
+    await expect(holder.getCapabilities()).resolves.toBe(capabilities);
+    expect(inner.getCapabilities).toHaveBeenCalledWith();
   });
 
   it('re-arms the NOT_CONFIGURED throw after set(null)', async () => {
@@ -68,6 +77,9 @@ describe('NarratorrClientHolder', () => {
     await expect(awaited(() => holder.addBook('B1'))).rejects.toMatchObject(NOT_CONFIGURED);
     await expect(awaited(() => holder.getBook('bk_1'))).rejects.toMatchObject(NOT_CONFIGURED);
     await expect(awaited(() => holder.getSystem())).rejects.toMatchObject(NOT_CONFIGURED);
+    // The capability probe (issue #144) must reach the SAME NOT_CONFIGURED signal — the resolver
+    // branches on that code to answer `false` immediately without burning its stale window.
+    await expect(awaited(() => holder.getCapabilities())).rejects.toMatchObject(NOT_CONFIGURED);
     // The disarmed inner client is never touched.
     expect(inner.searchMetadata).not.toHaveBeenCalled();
     expect(inner.addBook).not.toHaveBeenCalled();

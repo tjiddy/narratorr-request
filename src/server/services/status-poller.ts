@@ -2,12 +2,12 @@ import { Cron } from 'croner';
 import type { FastifyBaseLogger } from 'fastify';
 import type { RequestService } from './request.service.js';
 import { BOOK_VANISHED_REASON } from './request.service.js';
-import type { INarratorrClient } from './narratorr-client.js';
+import type { IBookStatusClient } from './narratorr-client.js';
 import { NarratorrError } from './narratorr-client.js';
 
 export interface StatusPollerOptions {
   requests: RequestService;
-  client: INarratorrClient;
+  client: IBookStatusClient;
   logger: FastifyBaseLogger;
   /** Poll cadence (seconds). */
   intervalSeconds?: number;
@@ -28,7 +28,7 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
  */
 export class StatusPoller {
   private readonly requests: RequestService;
-  private readonly client: INarratorrClient;
+  private readonly client: IBookStatusClient;
   private readonly logger: FastifyBaseLogger;
   private readonly batchSize: number;
   private readonly jitterMs: number;

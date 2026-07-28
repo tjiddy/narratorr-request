@@ -15,7 +15,7 @@ import { OPEN_REQUEST_STATUSES, ACTIVE_REQUEST_STATUSES, APPROVED_REQUEST_STATUS
 import { roleSchema, sanitizeNotifyOn, normalizeContactEmail, type Role, type RequestQuotaMode } from '../../shared/schemas/user.js';
 import type { DefaultQuota, QuotaWindowDays } from '../../shared/schemas/connectors.js';
 import type { V1Book } from '../../shared/schemas/v1/books.js';
-import type { INarratorrClient } from './narratorr-client.js';
+import type { IBookHandoffClient } from './narratorr-client.js';
 import {
   isTerminalHandoffError,
   handoffFailureReason,
@@ -103,7 +103,7 @@ export interface QuotaUsage {
 export class RequestService {
   constructor(
     private readonly db: Db,
-    private readonly client: INarratorrClient,
+    private readonly client: IBookHandoffClient,
     private readonly policy: RequestPolicy,
     private readonly notifyDeps?: RequestFailureNotifyDeps,
   ) {}

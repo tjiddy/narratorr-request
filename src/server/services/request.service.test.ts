@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { and, eq } from 'drizzle-orm';
 import { RequestService, sanitizeAutoApproveRoles, type RequestPolicy, type RequestFailureNotifyDeps } from './request.service.js';
-import { NarratorrError, type INarratorrClient } from './narratorr-client.js';
+import { NarratorrError, type IBookHandoffClient } from './narratorr-client.js';
 import { UserService } from './user.service.js';
 import type { Notifier, NotificationPayload } from './notifications/index.js';
 import type { NotifierLogger } from './notifications/types.js';
@@ -16,7 +16,7 @@ import type { BookStatus } from '../../shared/schemas/book.js';
 import type { CreateRequestBody, RequestStatus } from '../../shared/schemas/request.js';
 
 /** Configurable fake — controls the book status the handoff/poll observes. */
-class FakeClient implements INarratorrClient {
+class FakeClient implements IBookHandoffClient {
   status: BookStatus = 'searching';
   throwOnAdd: Error | null = null;
   added: string[] = [];

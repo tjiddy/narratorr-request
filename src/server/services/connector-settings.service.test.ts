@@ -1007,3 +1007,81 @@ describe('getDto — requesterEmailWarning (#50 admin-visible warning)', () => {
     expect((await svc.getDto()).requesterEmailWarning).toBe(false);
   });
 });
+
+describe('ConnectorSettingsService — companion-ebook opt-in (#144)', () => {
+  it('defaults OFF on a fresh DB', async () => {
+    expect((await svc.getDto()).ebooksEnabled).toBe(false);
+    expect((await svc.getEbookSettings()).ebooksEnabled).toBe(false);
+  });
+
+  it('persists an explicit true, and an unrelated save leaves it alone (omit-to-keep)', async () => {
+    await svc.update({ ebooksEnabled: true });
+    expect((await svc.getDto()).ebooksEnabled).toBe(true);
+
+    await svc.update({ publicUrl: 'https://app.example.com' });
+    expect((await svc.getDto()).ebooksEnabled).toBe(true);
+    await svc.update({ defaultQuota: { mode: 'limited', limit: 3, windowDays: 7 } });
+    expect((await svc.getDto()).ebooksEnabled).toBe(true);
+  });
+
+  it('persists an explicit FALSE over a currently-true row', async () => {
+    // The regression an `if (body.ebooksEnabled)` truthiness test would introduce: `false` would
+    // be indistinguishable from omitted, and the feature could never be turned back off.
+    await svc.update({ ebooksEnabled: true });
+    await svc.update({ ebooksEnabled: false });
+    expect((await svc.getDto()).ebooksEnabled).toBe(false);
+  });
+
+  it('applies the toggle and the quota in ONE write when the body carries both', async () => {
+    const updateSpy = vi.spyOn(db, 'update');
+    await svc.update({ ebooksEnabled: true, defaultQuota: { mode: 'limited', limit: 5, windowDays: 1 } });
+    expect(updateSpy).toHaveBeenCalledTimes(1);
+    updateSpy.mockRestore();
+
+    const row = await db.query.appSettings.findFirst();
+    expect(row).toMatchObject({ ebooksEnabled: true, defaultQuotaMode: 'limited', defaultQuotaLimit: 5, defaultQuotaWindowDays: 1 });
+  });
+
+  it('survives a connectors blob that fails the envelope schema — the flag is column-backed', async () => {
+    // Why it is a column, not a key in the encrypted blob: a degrade-to-empty read (a corrupt
+    // blob, or a SESSION_SECRET rotation that renders it undecryptable) must never silently flip
+    // the feature — in either direction.
+    await svc.update({ ebooksEnabled: true });
+    await db
+      .update(appSettings)
+      .set({ connectors: { publicUrl: null, narratorr: null, notifiers: 42 } as unknown as StoredConnectors })
+      .where(eq(appSettings.id, 1));
+
+    const dto = await svc.getDto();
+    expect(dto.notifiers).toEqual([]); // the blob genuinely degraded…
+    expect(dto.ebooksEnabled).toBe(true); // …and the column still reports the real value
+    expect((await svc.getEbookSettings()).ebooksEnabled).toBe(true);
+  });
+
+  it('getEbookSettings reads the row ONCE and resolves the same sender getDto does', async () => {
+    // `/api/features` is polled by every active client, so it must not run getDto's
+    // requesterEmailWarning sweep over `users` — but it must agree with it on the sender.
+    const nf = await svc.createNotifier({
+      name: 'Mail',
+      type: 'email',
+      events: ['request.created'],
+      config: { host: 'smtp.example.com', port: 587, secure: false, from: 'bot@ex.com', to: 'admin@ex.com', pass: 'p' },
+    });
+    await svc.update({ kindleSender: { notifierId: nf.id }, ebooksEnabled: true });
+
+    const readSpy = vi.spyOn(db.query.appSettings, 'findFirst');
+    const narrow = await svc.getEbookSettings();
+    expect(readSpy).toHaveBeenCalledTimes(1);
+    readSpy.mockRestore();
+
+    expect(narrow.kindleSender).toEqual((await svc.getDto()).kindleSender);
+    expect(narrow.kindleSender).toMatchObject({ status: 'ok', confirmedFrom: 'bot@ex.com' });
+  });
+
+  it('does not sweep the users table (no requesterEmailWarning work on the polled path)', async () => {
+    const selectSpy = vi.spyOn(db, 'select');
+    await svc.getEbookSettings();
+    expect(selectSpy).not.toHaveBeenCalled();
+    selectSpy.mockRestore();
+  });
+});

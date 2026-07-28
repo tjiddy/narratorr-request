@@ -67,6 +67,7 @@ const baseDto: ConnectorSettingsDto = {
   defaultQuota: { mode: 'limited', limit: 10, windowDays: 30 },
   requesterEmailWarning: false,
   kindleSender: null,
+  ebooksEnabled: false,
 };
 
 /** A minimal stand-in for the bits of `Response` that `api.ts`'s `parse()` actually reads. */

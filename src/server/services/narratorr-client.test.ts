@@ -301,6 +301,49 @@ describe('companion ebooks — search annotation + book DTO (#1961)', () => {
   });
 });
 
+describe('NarratorrClient.getCapabilities (capability probe, narratorr #1961 / issue #144)', () => {
+  const CAPS_URL = `${MOCK_BASE_URL}/api/v1/capabilities`;
+
+  it('parses the capability body through the vendored contract', async () => {
+    await expect(client.getCapabilities()).resolves.toEqual({ companionEpub: { enabled: true } });
+  });
+
+  it('carries the API key — a keyless client gets a 401, never a "capability missing" answer', async () => {
+    // Why the probe MUST be keyed: a keyless probe cannot distinguish "old narratorr" (404) from
+    // "bad key" (401), and only the first means unsupported.
+    const keyless = new NarratorrClient({ baseUrl: MOCK_BASE_URL, apiKey: '' });
+    await expect(keyless.getCapabilities()).rejects.toMatchObject({ upstreamStatus: 401 });
+  });
+
+  it('preserves upstreamStatus 404 for BOTH a Fastify-style JSON body and a proxy HTML page', async () => {
+    // Status, not code, is the load-bearing discriminator: the two 404 shapes yield DIFFERENT
+    // codes (`HTTP_404` vs `NON_JSON`) while meaning exactly the same thing.
+    server.use(http.get(CAPS_URL, () => HttpResponse.json({ message: 'Route GET:/api/v1/capabilities not found' }, { status: 404 })));
+    await expect(client.getCapabilities()).rejects.toMatchObject({ upstreamStatus: 404, upstreamCode: 'HTTP_404' });
+
+    server.use(http.get(CAPS_URL, () => new HttpResponse('<html><body>404 Not Found</body></html>', { status: 404 })));
+    await expect(client.getCapabilities()).rejects.toMatchObject({ upstreamStatus: 404, upstreamCode: 'NON_JSON' });
+  });
+
+  it('surfaces a 200 body missing companionEpub.enabled as CONTRACT_MISMATCH (drift, not "unsupported")', async () => {
+    server.use(http.get(CAPS_URL, () => HttpResponse.json({ companionEpub: {} })));
+    await expect(client.getCapabilities()).rejects.toMatchObject({
+      upstreamStatus: 200,
+      upstreamCode: 'CONTRACT_MISMATCH',
+    });
+  });
+
+  it('maps a transport error to upstreamStatus 0 / NETWORK', async () => {
+    server.use(http.get(CAPS_URL, () => HttpResponse.error()));
+    await expect(client.getCapabilities()).rejects.toMatchObject({ upstreamStatus: 0, upstreamCode: 'NETWORK' });
+  });
+
+  it('tolerates an unknown sibling capability (the vendored schema is consumer-lenient)', async () => {
+    server.use(http.get(CAPS_URL, () => HttpResponse.json({ companionEpub: { enabled: false }, somethingNew: { enabled: true } })));
+    await expect(client.getCapabilities()).resolves.toEqual({ companionEpub: { enabled: false } });
+  });
+});
+
 describe('companion ebooks — capabilities + byte-stream fixture handlers (#1961)', () => {
   const keyed = { headers: { 'x-api-key': 'test-key' } };
 

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import Fastify, { type FastifyInstance } from 'fastify';
+import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import cookie from '@fastify/cookie';
 import rateLimit from '@fastify/rate-limit';
 import { serializerCompiler, validatorCompiler, type ZodTypeProvider } from 'fastify-type-provider-zod';
@@ -20,6 +20,10 @@ import { registerRequestRoutes } from './requests.js';
 import type { AppConfig } from '../config.js';
 import type { AppDeps } from '../services/deps.js';
 import type { INarratorrClient } from '../services/narratorr-client.js';
+import { buildRouteApp } from '../test-support/route-harness.js';
+import { insertUser } from '../test-support/db.js';
+import { meDtoSchema, isApprovedUser, USER_ROLES, USER_STATUSES } from '../../shared/schemas/user.js';
+import { requireActiveUser } from '../plugins/auth.js';
 
 const SESSION_SECRET = 'auth-route-test-secret';
 
@@ -731,5 +735,112 @@ describe('PATCH /api/me kindleEmail contract (#142)', () => {
       const res = await patchMe(cookie, { email: 'contact@x.com' });
       expect(res.json().emailNotifyAvailable).toBe(true);
     });
+  });
+});
+
+// AC23 (issue #144): `/api/me` must stay ISOLATED from the companion-ebook capability. It is
+// `requireUser` (a pending/rejected account can call it) and it is the SPA bootstrap request —
+// `App.tsx` white-screens on a non-401 failure — so it must never make, or wait on, a narratorr
+// probe. Driven through the shared harness because that wires a real narratorr holder and a real
+// capability resolver, i.e. the state a leaking implementation would reach for.
+describe('GET /api/me — isolation from narratorr / feature state (#144)', () => {
+  const FEATURE_KEYS = ['ebooksEnabled', 'kindleDeliveryAvailable', 'kindleSenderEmail'];
+
+  /** Every narratorr method rejects — a total upstream outage — while counting probe attempts. */
+  function deadNarratorr(): INarratorrClient & { capabilityCalls: number } {
+    const down = () => Promise.reject(new Error('narratorr down'));
+    const client = {
+      capabilityCalls: 0,
+      searchMetadata: down,
+      addBook: down,
+      getBook: down,
+      getSystem: down,
+      getCapabilities: () => {
+        client.capabilityCalls += 1;
+        return down();
+      },
+    };
+    return client as unknown as INarratorrClient & { capabilityCalls: number };
+  }
+
+  it.each([
+    ['a total narratorr outage', () => ({ narratorr: deadNarratorr() })],
+    ['an unconfigured narratorr', () => ({ narratorrConfigured: false })],
+  ])('returns 200 with an unchanged body under %s', async (_label, build) => {
+    const over = build();
+    const h = await buildRouteApp({ register: registerAuthRoutes, ...over });
+    try {
+      // The admin toggle is ON, so a `/api/me` that consulted feature state would probe.
+      await h.connectorSettings.update({ ebooksEnabled: true });
+      const user = await insertUser(h.db, { role: 'user', status: 'active' });
+      const res = await h.app.inject({ method: 'GET', url: '/api/me', cookies: h.cookieFor(user) });
+
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.publicId).toBe(user.publicId);
+      for (const key of FEATURE_KEYS) expect(body).not.toHaveProperty(key);
+      // …and no probe was attempted on this path at all (the unconfigured case has no client
+      // to count on — the holder itself refuses, which the assertion above already covers).
+      expect(('narratorr' in over ? over.narratorr : h.narratorr).capabilityCalls).toBe(0);
+    } finally {
+      await h.app.close();
+    }
+  });
+
+  it('keeps the feature keys out of the mapper as well as the wire', async () => {
+    // `meDtoSchema` is non-`.strict()`, so it silently strips unknown keys — a route-body
+    // assertion alone cannot catch a mapper that started emitting them. Assert the schema itself
+    // has no such field (learned in #142/#159).
+    for (const key of FEATURE_KEYS) {
+      expect(meDtoSchema.shape).not.toHaveProperty(key);
+    }
+  });
+});
+
+/**
+ * F4 — the approval-queue policy has ONE home (`isApprovedUser`), and the server's authorization
+ * boundary is the thing that must actually obey it.
+ *
+ * `requireActiveUser` (the enforcement), `App.tsx` (which shell an authenticated caller sees) and
+ * `featuresQueryEnabled` (whether to issue an active-user-only request) all consume the shared
+ * predicate. Each of those has its own unit tests, but per-layer tests can ALL stay green while
+ * the layers drift apart — so this asserts the cross-contract directly: over the complete
+ * role × status matrix, `requireActiveUser` admits exactly the callers `isApprovedUser` accepts.
+ *
+ * Driven through the real guard, not a re-derivation of it: if a future change reintroduces a
+ * local role/status test in `auth.ts`, this fails even though the predicate itself still passes.
+ */
+describe('requireActiveUser × isApprovedUser cross-contract (#144 F4)', () => {
+  const MATRIX = USER_ROLES.flatMap((role) => USER_STATUSES.map((status) => ({ role, status })));
+
+  it('covers the whole role × status space, with both verdicts represented', () => {
+    // Guards the guard: a matrix that accidentally became all-admit (or all-deny) would make
+    // every row below vacuous.
+    expect(MATRIX).toHaveLength(6);
+    const approved = MATRIX.filter(isApprovedUser);
+    expect(approved.length).toBeGreaterThan(0);
+    expect(approved.length).toBeLessThan(MATRIX.length);
+  });
+
+  it.each(MATRIX)('requireActiveUser admits (%s) exactly when isApprovedUser does', (user) => {
+    const request = { user: { id: 1, publicId: 'us_1', username: 'u', ...user } } as FastifyRequest;
+    const expected = isApprovedUser(user);
+
+    if (expected) {
+      expect(requireActiveUser(request)).toMatchObject(user);
+    } else {
+      // …and a rejected caller gets the account-state error, never a silent pass-through.
+      expect(() => requireActiveUser(request)).toThrowError(
+        expect.objectContaining({ statusCode: 403 }) as Error,
+      );
+    }
+  });
+
+  it('still rejects an unauthenticated request regardless of the predicate', () => {
+    // `isApprovedUser` speaks only to role/status; authentication is a separate precondition the
+    // guard owns, and sharing the predicate must not have leaked that away.
+    expect(() => requireActiveUser({} as FastifyRequest)).toThrowError(
+      expect.objectContaining({ statusCode: 401 }) as Error,
+    );
   });
 });

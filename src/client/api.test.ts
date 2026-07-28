@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { getMe, requestBookFrom, listMyRequests, listAdminQueue, listUserRequests, ApiError } from './api';
+import { getMe, getFeatures, requestBookFrom, listMyRequests, listAdminQueue, listUserRequests, ApiError } from './api';
 import type { V1AudibleResult } from '@shared/schemas/v1/metadata';
 
 // parse<T> (api.ts:23) is a private module function — not exported — so its HTTP
@@ -63,6 +63,21 @@ describe('parse (via getMe wrapper)', () => {
     const err = await getMe().catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ApiError);
     expect(err).toMatchObject({ status: 502, code: 'NON_JSON', message: 'Unexpected non-JSON response (502)' });
+  });
+});
+
+describe('getFeatures (#144)', () => {
+  it('GETs /api/features with same-origin credentials and returns the parsed payload', async () => {
+    const payload = { ebooksEnabled: true, kindleDeliveryAvailable: true, kindleSenderEmail: 'bot@ex.com' };
+    const mock = stubFetch(new Response(JSON.stringify(payload), { status: 200 }));
+    await expect(getFeatures()).resolves.toEqual(payload);
+    // The session cookie is what makes the route's requireActiveUser gate resolvable at all.
+    expect(mock).toHaveBeenCalledWith('/api/features', expect.objectContaining({ credentials: 'same-origin' }));
+  });
+
+  it('rejects with the ApiError the guard emits (403 for a pending account)', async () => {
+    stubFetch(new Response(JSON.stringify({ error: { code: 'ACCOUNT_PENDING', message: 'pending' } }), { status: 403 }));
+    await expect(getFeatures()).rejects.toMatchObject({ status: 403, code: 'ACCOUNT_PENDING' });
   });
 });
 

@@ -10,6 +10,7 @@ import { ConnectorSettingsService } from '../services/connector-settings.service
 import { RequestService, type RequestPolicy } from '../services/request.service.js';
 import { SearchService } from '../services/search.service.js';
 import { NarratorrClientHolder } from '../services/narratorr-client-holder.js';
+import { FeatureService } from '../services/feature.service.js';
 import { Notifier } from '../services/notifications/notifier.service.js';
 import type { NotifierLogger } from '../services/notifications/types.js';
 import { SecretCodec, deriveSettingsKey } from '../util/secret-codec.js';
@@ -23,6 +24,7 @@ import type { AppDeps } from '../services/deps.js';
 import type { INarratorrClient } from '../services/narratorr-client.js';
 import type { V1Book } from '../../shared/schemas/v1/books.js';
 import type { V1System } from '../../shared/schemas/v1/system.js';
+import type { V1Capabilities } from '../../shared/schemas/v1/capabilities.js';
 import type { BookStatus } from '../../shared/schemas/book.js';
 import type { AuthUser } from '../types.js';
 
@@ -56,6 +58,10 @@ export const TEST_USER: AuthUser = { id: 9002, publicId: 'us_user', username: 'u
 export class FakeNarratorrClient implements INarratorrClient {
   status: BookStatus = 'searching';
   added: string[] = [];
+  /** What the companion-ebook capability probe reports (issue #144) — flip per test. */
+  companionEpub = true;
+  /** How many times the capability probe was called — asserts the `/api/features` short-circuit. */
+  capabilityCalls = 0;
   private seq = 0;
 
   async searchMetadata(): Promise<[]> {
@@ -71,6 +77,10 @@ export class FakeNarratorrClient implements INarratorrClient {
   }
   async getSystem(): Promise<V1System> {
     return { version: 'v1.0.0' };
+  }
+  async getCapabilities(): Promise<V1Capabilities> {
+    this.capabilityCalls += 1;
+    return { companionEpub: { enabled: this.companionEpub } };
   }
 }
 
@@ -91,6 +101,10 @@ export interface RouteHarness {
    * with `narratorrConfigured: false` to start unconfigured.
    */
   narratorrHolder: NarratorrClientHolder;
+  /** The real capability resolver wired into `deps.features` — spy on `invalidate`, drive `nowMs`. */
+  features: FeatureService;
+  /** The real connector-settings service behind `deps.connectorSettings` — write the admin flags. */
+  connectorSettings: ConnectorSettingsService;
   /** The real `SearchService` wired against {@link narratorrHolder} — spy on `.search` to force errors. */
   search: SearchService;
   config: AppConfig;
@@ -154,6 +168,9 @@ export async function buildRouteApp(opts: BuildRouteAppOpts): Promise<RouteHarne
   // through both paths, and the health route can read `deps.narratorr.configured`.
   const narratorrHolder = new NarratorrClientHolder((opts.narratorrConfigured ?? true) ? narratorr : null);
   const search = new SearchService(narratorrHolder);
+  // Mirrors production wiring: the resolver reads the same swappable holder, so a route test can
+  // flip `narratorr.companionEpub` (or `.set(null)`) and observe it through `/api/features`.
+  const features = new FeatureService(narratorrHolder);
   // A real Notifier (no channels → inert) with its `notify` swapped for a spy, so route tests
   // can assert dispatch without a structural cast. Building the genuine type means a new required
   // AppDeps field surfaces as a compile error here instead of a silent runtime `undefined`.
@@ -203,6 +220,7 @@ export async function buildRouteApp(opts: BuildRouteAppOpts): Promise<RouteHarne
     search,
     connectorSettings,
     narratorr: narratorrHolder,
+    features,
     notifier,
     oidc: new Map(),
   };
@@ -241,6 +259,8 @@ export async function buildRouteApp(opts: BuildRouteAppOpts): Promise<RouteHarne
     notify,
     narratorr: narratorr as FakeNarratorrClient,
     narratorrHolder,
+    features,
+    connectorSettings,
     search,
     config,
     roleUsers,
