@@ -3,6 +3,11 @@ import { z } from 'zod';
 import type { Db } from '../../db/client.js';
 import { appSettings, users } from '../../db/schema.js';
 import { selectEmailSource } from './notifications/requester-email.js';
+import {
+  confirmSenderMailbox,
+  resolveKindleSender,
+  KINDLE_SENDER_INVALID_MESSAGE,
+} from './notifications/kindle-sender.js';
 import { notificationEventSchema, type NotificationEvent } from '../../shared/notification-events.js';
 import { quotaWindowDaysSchema, storedConnectorsSchema } from '../../shared/schemas/connectors.js';
 import { hasNotifyOn } from '../../shared/schemas/user.js';
@@ -35,6 +40,7 @@ const EMPTY: StoredConnectors = {
   publicUrl: null,
   narratorr: null,
   notifiers: [],
+  kindleSender: null,
 };
 
 /** Minimal structural logger (Fastify's pino logger satisfies it). */
@@ -96,7 +102,13 @@ export class ConnectorSettingsService {
       );
       return { ...EMPTY };
     }
-    return parsed.data as unknown as StoredConnectors;
+    // `kindleSender` is `.optional()` at the schema layer so a PRE-FEATURE blob (no key at all)
+    // stays a normal, warn-free read; normalize the resulting `undefined` to `null` here so every
+    // reader sees exactly one shape (`exactOptionalPropertyTypes` forbids assigning `: undefined`).
+    return {
+      ...(parsed.data as unknown as StoredConnectors),
+      kindleSender: parsed.data.kindleSender ?? null,
+    };
   }
 
   /**
@@ -228,6 +240,9 @@ export class ConnectorSettingsService {
       notifiers: c.notifiers.map((n) => this.toNotifierDto(n)),
       defaultQuota: this.sanitizeQuota(row),
       requesterEmailWarning: await this.computeRequesterEmailWarning(c),
+      // Resolved at READ time against the live decrypted notifiers (no cross-write coordination:
+      // notifier CRUD never touches the stored pair — see resolveKindleSender in kindle-sender.ts).
+      kindleSender: resolveKindleSender(c.kindleSender, c.notifiers.map((n) => this.toRuntimeNotifier(n))),
     };
   }
 
@@ -274,9 +289,11 @@ export class ConnectorSettingsService {
     const cur = await this.getStored();
     const next: StoredConnectors = { ...cur };
 
-    const hasConnectorFields = body.publicUrl !== undefined || body.narratorr !== undefined;
+    const hasConnectorFields =
+      body.publicUrl !== undefined || body.narratorr !== undefined || body.kindleSender !== undefined;
     if (body.publicUrl !== undefined) next.publicUrl = body.publicUrl;
     if (body.narratorr !== undefined) next.narratorr = this.resolveNarratorr(body.narratorr, cur.narratorr);
+    if (body.kindleSender !== undefined) next.kindleSender = this.resolveKindleSender(body.kindleSender, cur);
 
     const q = body.defaultQuota;
     const [row] = await this.db
@@ -547,6 +564,30 @@ export class ConnectorSettingsService {
     const apiKey = this.resolveSecret(body.apiKey, cur?.apiKey);
     if (!apiKey) throw badRequest('NARRATORR_KEY_REQUIRED', 'Narratorr requires an API key.');
     return { url: body.url, apiKey };
+  }
+
+  /**
+   * Resolve a Kindle-sender selection (issue #143) into the stored pair. The body carries ONLY the
+   * notifier id; `confirmedFrom` is DERIVED here from that notifier's live `from`, so the
+   * confirmation can never be spoofed by a client and re-sending an unchanged id is a meaningful
+   * write (the reconfirm out of `sender-changed`). Runs BEFORE the single UPDATE — like
+   * `resolveNarratorr` — so a rejected selection leaves the whole row (connector blob AND the
+   * quota columns) untouched, even in a mixed body. A selection that can't be confirmed is a
+   * `400 KINDLE_SENDER_INVALID` with a CASE-SPECIFIC message; there is deliberately no
+   * fall-through to another email notifier.
+   */
+  private resolveKindleSender(
+    body: NonNullable<UpdateConnectorSettingsBody['kindleSender']> | null,
+    cur: StoredConnectors,
+  ): StoredConnectors['kindleSender'] {
+    if (body === null) return null;
+    // Confirm against the DECRYPTED runtime notifiers — the same view the read-time resolver and
+    // the send path use, so a write can't succeed into a state `getDto()` would call invalid.
+    const confirmation = confirmSenderMailbox(body.notifierId, cur.notifiers.map((n) => this.toRuntimeNotifier(n)));
+    if ('failure' in confirmation) {
+      throw badRequest('KINDLE_SENDER_INVALID', KINDLE_SENDER_INVALID_MESSAGE[confirmation.failure]);
+    }
+    return { notifierId: body.notifierId, confirmedFrom: confirmation.mailbox };
   }
 
   /**

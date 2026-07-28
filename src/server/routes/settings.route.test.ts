@@ -159,6 +159,114 @@ describe('settings routes — GET/PUT connectors', () => {
   });
 });
 
+describe('settings routes — Kindle sender selector (#143)', () => {
+  const emailCreate = (from: string, name = 'Mail'): CreateNotifierBody => ({
+    name,
+    type: 'email',
+    events: ['request.created'],
+    config: { host: 'smtp.example.com', port: 587, secure: false, user: 'u', pass: 'p', from, to: 'admin@ex.com' },
+  });
+
+  const putKindle = (kindleSender: unknown, headers = asAdmin) =>
+    app.inject({ method: 'PUT', url: CONNECTORS_URL, headers, payload: { kindleSender } });
+
+  it('GET carries the resolved kindleSender — null when unset, the resolved object once saved', async () => {
+    // Non-vacuous against the non-strict response schema: a field the mapper emits but the
+    // schema omits is silently stripped, so this would read `undefined` on that regression.
+    const before = await app.inject({ method: 'GET', url: CONNECTORS_URL, headers: asAdmin });
+    expect(before.json()).toHaveProperty('kindleSender', null);
+
+    const nf = (await createNotifier(emailCreate('Narratorr <Bot@Ex.com>'))).json();
+    await putKindle({ notifierId: nf.id });
+    const res = await app.inject({ method: 'GET', url: CONNECTORS_URL, headers: asAdmin });
+    expect(res.json().kindleSender).toEqual({
+      notifierId: nf.id,
+      confirmedFrom: 'Bot@Ex.com',
+      status: 'ok',
+      currentFrom: 'Bot@Ex.com',
+    });
+  });
+
+  it('PUT persists and ECHOES the freshly resolved value; a non-admin is still 403', async () => {
+    const nf = (await createNotifier(emailCreate('bot@ex.com'))).json();
+    const res = await putKindle({ notifierId: nf.id });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().kindleSender).toMatchObject({ notifierId: nf.id, confirmedFrom: 'bot@ex.com', status: 'ok' });
+    expect((await connectorSettings.getStored()).kindleSender).toEqual({ notifierId: nf.id, confirmedFrom: 'bot@ex.com' });
+
+    expect((await putKindle({ notifierId: nf.id }, asUser)).statusCode).toBe(403);
+  });
+
+  it('an invalid selection returns the standard envelope with a CASE-SPECIFIC message', async () => {
+    const res = await putKindle({ notifierId: 'nf_nope' });
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toEqual({
+      error: {
+        code: 'KINDLE_SENDER_INVALID',
+        message: 'That notifier no longer exists — pick an email notifier that is still configured.',
+      },
+    });
+
+    const ntfy = (await createNotifier(ntfyCreate())).json();
+    expect((await putKindle({ notifierId: ntfy.id })).json().error.message).toBe(
+      'The Kindle sender must be an email (SMTP) notifier.',
+    );
+  });
+
+  it('rejects a client-supplied confirmedFrom (inner .strict) — the confirmation is never spoofable', async () => {
+    const nf = (await createNotifier(emailCreate('bot@ex.com'))).json();
+    expect((await putKindle({ notifierId: nf.id, confirmedFrom: 'attacker@evil.com' })).statusCode).toBe(400);
+  });
+
+  it('editing the selected notifier’s From → sender-changed; re-PUTting the SAME id reconfirms to ok', async () => {
+    const nf = (await createNotifier(emailCreate('bot@ex.com'))).json();
+    await putKindle({ notifierId: nf.id });
+
+    await app.inject({ method: 'PUT', url: `${NOTIFIERS_URL}/${nf.id}`, headers: asAdmin, payload: emailCreate('new@ex.com') });
+    const changed = await app.inject({ method: 'GET', url: CONNECTORS_URL, headers: asAdmin });
+    expect(changed.json().kindleSender).toMatchObject({ status: 'sender-changed', confirmedFrom: 'bot@ex.com', currentFrom: 'new@ex.com' });
+
+    const reconfirm = await putKindle({ notifierId: nf.id });
+    expect(reconfirm.json().kindleSender).toMatchObject({ status: 'ok', confirmedFrom: 'new@ex.com' });
+  });
+
+  // The server-side half of AC21's no-same-id-Save rule: outside `sender-changed`, re-sending the
+  // saved id is a GUARANTEED 400 — which is exactly why the picker never offers it.
+  it('a same-id re-PUT after the notifier is deleted is rejected 400 (the UI must never offer it)', async () => {
+    const nf = (await createNotifier(emailCreate('bot@ex.com'))).json();
+    await putKindle({ notifierId: nf.id });
+    await app.inject({ method: 'DELETE', url: `${NOTIFIERS_URL}/${nf.id}`, headers: asAdmin });
+    expect((await app.inject({ method: 'GET', url: CONNECTORS_URL, headers: asAdmin })).json().kindleSender).toMatchObject({
+      status: 'notifier-missing',
+    });
+
+    const res = await putKindle({ notifierId: nf.id });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe('KINDLE_SENDER_INVALID');
+  });
+
+  it('kindleSender: null clears the selection through the route', async () => {
+    const nf = (await createNotifier(emailCreate('bot@ex.com'))).json();
+    await putKindle({ notifierId: nf.id });
+    expect((await putKindle(null)).json().kindleSender).toBeNull();
+    expect((await connectorSettings.getStored()).kindleSender).toBeNull();
+  });
+
+  // Regression: the parser gates ONLY the selector — retro-validating the notifier's own `from`
+  // would brick every working notifier whose From is a display string.
+  it('POST/PUT of an email notifier with an unparseable From still succeeds', async () => {
+    const created = await createNotifier(emailCreate('ops team'));
+    expect(created.statusCode).toBe(200);
+    const edited = await app.inject({
+      method: 'PUT',
+      url: `${NOTIFIERS_URL}/${created.json().id}`,
+      headers: asAdmin,
+      payload: emailCreate('a@x.com, b@y.com'),
+    });
+    expect(edited.statusCode).toBe(200);
+  });
+});
+
 describe('settings routes — notifier CRUD + live reconfigure', () => {
   it('create persists, returns the masked DTO, and rebuilds the live notifier', async () => {
     expect(deps.notifier.enabled).toBe(false);

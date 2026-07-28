@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   connectorSettingsDtoSchema,
   notifierDtoSchema,
+  storedConnectorsSchema,
   storedNotifierSchema,
   testConnectorBodySchema,
   testConnectorResultSchema,
@@ -181,6 +182,66 @@ describe('createNotifierBodySchema / notifierTestBodySchema', () => {
   });
 });
 
+describe('storedConnectorsSchema — kindleSender containment (#143)', () => {
+  const blob = (over: Record<string, unknown> = {}) => ({
+    publicUrl: null,
+    narratorr: { url: 'https://n:3000', apiKey: 'enc:v1:abc' },
+    notifiers: [{ id: 'nf_1', name: 'Phone', type: 'ntfy', events: ['request.created'], config: { topic: 't' } }],
+    ...over,
+  });
+
+  it('parses a PRE-FEATURE blob (no kindleSender key) with the siblings intact', () => {
+    const parsed = storedConnectorsSchema.parse(blob());
+    expect(parsed.narratorr).toEqual({ url: 'https://n:3000', apiKey: 'enc:v1:abc' });
+    expect(parsed.notifiers).toHaveLength(1);
+    expect(parsed.kindleSender ?? null).toBeNull();
+  });
+
+  it('round-trips a healthy selection', () => {
+    expect(storedConnectorsSchema.parse(blob({ kindleSender: { notifierId: 'nf_1', confirmedFrom: 'Bot@Ex.com' } })).kindleSender)
+      .toEqual({ notifierId: 'nf_1', confirmedFrom: 'Bot@Ex.com' });
+  });
+
+  // The member carries its own `.catch(null)` so a malformed value degrades ROW-LOCALLY. Without
+  // it the whole envelope fails, and `connectorsFrom()` resets the blob to EMPTY — discarding the
+  // encrypted narratorr key. Assert the SIBLINGS survive, not just that the member is null.
+  it.each([
+    ['a non-object', 42],
+    ['a wrong-typed member', { notifierId: 42 }],
+    ['a missing member', {}],
+  ])('contains %s to null while narratorr + notifiers survive', (_label, kindleSender) => {
+    const parsed = storedConnectorsSchema.safeParse(blob({ kindleSender }));
+    expect(parsed.success).toBe(true);
+    expect(parsed.data?.kindleSender ?? null).toBeNull();
+    expect(parsed.data?.narratorr).toEqual({ url: 'https://n:3000', apiKey: 'enc:v1:abc' });
+    expect(parsed.data?.notifiers).toHaveLength(1);
+  });
+
+  it('accepts an explicit null (a cleared selection)', () => {
+    expect(storedConnectorsSchema.parse(blob({ kindleSender: null })).kindleSender).toBeNull();
+  });
+});
+
+describe('updateConnectorSettingsBodySchema — kindleSender (#143)', () => {
+  it('accepts an id-only selection, an explicit null, and omission', () => {
+    expect(parse({ kindleSender: { notifierId: 'nf_1' } }).kindleSender).toEqual({ notifierId: 'nf_1' });
+    expect(parse({ kindleSender: null }).kindleSender).toBeNull();
+    expect(parse({}).kindleSender).toBeUndefined();
+  });
+
+  // The inner object is `.strict()` so a client can never SUPPLY the confirmation — the server
+  // always derives it from the notifier's live `from`, which is what makes it unspoofable.
+  it('rejects a client-supplied confirmedFrom (or any other extra inner key)', () => {
+    expect(accepts({ kindleSender: { notifierId: 'nf_1', confirmedFrom: 'x@y.com' } })).toBe(false);
+    expect(accepts({ kindleSender: { notifierId: 'nf_1', bogus: 1 } })).toBe(false);
+  });
+
+  it('rejects an empty notifierId and a non-object selection', () => {
+    expect(accepts({ kindleSender: { notifierId: '' } })).toBe(false);
+    expect(accepts({ kindleSender: 'nf_1' })).toBe(false);
+  });
+});
+
 describe('storedNotifierSchema — type-lenient persistence boundary', () => {
   it('parses a row whose type is NOT in the registry (round-trips, type: string)', () => {
     const row = { id: 'nf_x', name: 'Legacy', type: 'apprise', events: ['user.pending'], config: { token: 'enc:v1:abc' } };
@@ -224,20 +285,41 @@ describe('connectorSettingsDtoSchema', () => {
       ],
       defaultQuota: { mode: 'limited', limit: 10, windowDays: 30 },
       requesterEmailWarning: false,
+      kindleSender: null,
     };
     expect(connectorSettingsDtoSchema.safeParse(dto).success).toBe(true);
   });
 
   it('accepts empty notifiers + null connections + an unlimited default', () => {
-    expect(
-      connectorSettingsDtoSchema.parse({
-        publicUrl: null,
-        narratorr: null,
-        notifiers: [],
-        defaultQuota: { mode: 'unlimited', windowDays: 30 },
-        requesterEmailWarning: false,
-      }),
-    ).toEqual({ publicUrl: null, narratorr: null, notifiers: [], defaultQuota: { mode: 'unlimited', windowDays: 30 }, requesterEmailWarning: false });
+    const dto = {
+      publicUrl: null,
+      narratorr: null,
+      notifiers: [],
+      defaultQuota: { mode: 'unlimited', windowDays: 30 },
+      requesterEmailWarning: false,
+      kindleSender: null,
+    };
+    expect(connectorSettingsDtoSchema.parse(dto)).toEqual(dto);
+  });
+
+  // The response object is non-`.strict()`, so a resolved kindleSender the mapper emits but the
+  // schema omitted would be SILENTLY stripped off the wire. Pin that it survives serialization.
+  it('carries the resolved kindleSender through, and rejects an unknown status', () => {
+    const dto = (kindleSender: unknown) => ({
+      publicUrl: null,
+      narratorr: null,
+      notifiers: [],
+      defaultQuota: { mode: 'unlimited' as const, windowDays: 30 },
+      requesterEmailWarning: false,
+      kindleSender,
+    });
+    const resolved = { notifierId: 'nf_1', confirmedFrom: 'Bot@Ex.com', status: 'sender-changed', currentFrom: 'new@ex.com' };
+    expect(connectorSettingsDtoSchema.parse(dto(resolved)).kindleSender).toEqual(resolved);
+    for (const status of ['ok', 'notifier-missing', 'not-email', 'config-unusable', 'from-unparseable', 'sender-changed']) {
+      expect(connectorSettingsDtoSchema.safeParse(dto({ ...resolved, status })).success, status).toBe(true);
+    }
+    expect(connectorSettingsDtoSchema.safeParse(dto({ ...resolved, status: 'bogus' })).success).toBe(false);
+    expect(connectorSettingsDtoSchema.safeParse(dto({ notifierId: 'nf_1', confirmedFrom: 'x@y.com' })).success).toBe(false);
   });
 
   it('requires defaultQuota in the masked DTO', () => {
@@ -251,6 +333,7 @@ describe('connectorSettingsDtoSchema', () => {
       notifiers: [],
       defaultQuota: { mode: 'limited', limit: 10, windowDays },
       requesterEmailWarning: false,
+      kindleSender: null,
     });
     for (const allowed of [1, 7, 30]) {
       expect(connectorSettingsDtoSchema.safeParse(dto(allowed)).success).toBe(true);
