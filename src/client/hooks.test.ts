@@ -89,6 +89,7 @@ import {
   useUpdateMe,
   useDecide,
   useUpdateConnectors,
+  useUpdateKindleSender,
   useTestConnector,
   useCreateNotifier,
   useUpdateNotifier,
@@ -503,6 +504,27 @@ describe('useUpdateConnectors', () => {
     expect(error).toHaveBeenCalledWith('invalid url');
     h.onError(new Error('x'));
     expect(error).toHaveBeenCalledWith('Save failed');
+  });
+});
+
+describe('useUpdateKindleSender (#143)', () => {
+  // The picker gets its OWN mutation rather than reusing useUpdateConnectors, and it INVALIDATES
+  // the shared key instead of writing it wholesale — a second `setQueryData` writer behind a
+  // second Save on the same page is the issue #160 shape. It also re-runs the server's read-time
+  // resolution, which is what turns a reconfirm into `ok` on screen.
+  it('invalidates the connectors key (never setQueryData) and toasts "Kindle sender saved"', () => {
+    cb(useUpdateKindleSender()).onSuccess();
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
+    expect(hoisted.qc.setQueryData).not.toHaveBeenCalled();
+    expect(success).toHaveBeenCalledWith('Kindle sender saved');
+  });
+
+  it('surfaces the ApiError message (the case-specific KINDLE_SENDER_INVALID text), else a fallback', () => {
+    const h = cb(useUpdateKindleSender());
+    h.onError(new ApiError(400, 'KINDLE_SENDER_INVALID', 'The Kindle sender must be an email (SMTP) notifier.'));
+    expect(error).toHaveBeenCalledWith('The Kindle sender must be an email (SMTP) notifier.');
+    h.onError(new Error('x'));
+    expect(error).toHaveBeenCalledWith('Could not save the Kindle sender');
   });
 });
 

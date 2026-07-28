@@ -1,5 +1,5 @@
 import { useState, useId } from 'react';
-import type { NotifierDto, KnownNotifierDto } from '@shared/schemas/connectors';
+import type { NotifierDto, KnownNotifierDto, ResolvedKindleSender } from '@shared/schemas/connectors';
 import { NOTIFIER_REGISTRY, NOTIFIER_TYPES, type NotifierType, type NotifierField } from '@shared/notifier-registry';
 import { NOTIFICATION_EVENTS } from '@shared/notification-events';
 import { useCreateNotifier, useUpdateNotifier, useDeleteNotifier, useTestNotifier } from '../hooks';
@@ -7,6 +7,7 @@ import { Button } from '../components/Button';
 import { BellIcon, PlusIcon, PencilIcon, SendIcon, TrashIcon } from '../components/icons';
 import { Dialog } from '../components/Dialog';
 import { Field, SectionHeader, SettingsCard } from './settings-ui';
+import { KindleSenderCard } from './SettingsKindleSender';
 import { inputCls, secretPlaceholder } from './settings-fields';
 import {
   newNotifierForm,
@@ -29,10 +30,12 @@ export function NotifiersSection({
   notifiers,
   publicUrl,
   requesterEmailWarning,
+  kindleSender,
 }: {
   notifiers: NotifierDto[];
   publicUrl: string | null;
   requesterEmailWarning: boolean;
+  kindleSender: ResolvedKindleSender | null;
 }) {
   const [editing, setEditing] = useState<NotifierFormState | null>(null);
   const del = useDeleteNotifier();
@@ -70,6 +73,11 @@ export function NotifiersSection({
           notifier below to enable requester notifications.
         </div>
       )}
+
+      {/* The stable Kindle sender picks ONE of the email notifiers below (issue #143), so it
+          sits above the list it selects from — and stays mounted while notifier CRUD refetches
+          that list, which is exactly the draft-rebase case the card handles. */}
+      <KindleSenderCard notifiers={notifiers} saved={kindleSender} />
 
       {notifiers.length === 0 ? (
         <SettingsCard delay="60ms">

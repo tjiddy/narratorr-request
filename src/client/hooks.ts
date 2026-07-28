@@ -247,6 +247,26 @@ export function useUpdateConnectors() {
   });
 }
 
+/**
+ * The Kindle-sender picker's own save (issue #143). It hits the SAME connectors PUT but
+ * INVALIDATES `qk.connectors` rather than writing it wholesale, mirroring the notifier-CRUD
+ * mutations it sits beside. `useUpdateConnectors`'s `setQueryData` is safe only because one
+ * mutation instance sits behind one Save; adding a second wholesale writer to the same key is
+ * the issue #160 shape. Invalidating also re-runs the server's read-time resolution, which is
+ * what turns a reconfirm into `ok` on screen.
+ */
+export function useUpdateKindleSender() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: UpdateConnectorSettingsBody) => updateConnectorSettings(body),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: qk.connectors });
+      toast.success('Kindle sender saved');
+    },
+    onError: (err) => toast.error(err instanceof ApiError ? err.message : 'Could not save the Kindle sender'),
+  });
+}
+
 export function useTestConnector() {
   return useMutation({
     mutationFn: (body: TestConnectorBody) => testConnector(body),

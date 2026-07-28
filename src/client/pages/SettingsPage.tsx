@@ -70,6 +70,7 @@ export function SettingsPage() {
                 notifiers={data.notifiers}
                 publicUrl={data.publicUrl}
                 requesterEmailWarning={data.requesterEmailWarning}
+                kindleSender={data.kindleSender}
               />
             )}
             {active === 'system' && <SystemSection />}
