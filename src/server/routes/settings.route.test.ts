@@ -42,16 +42,16 @@ let db: Db;
 let connectorSettings: ConnectorSettingsService;
 let narratorr: NarratorrClientHolder;
 let features: FeatureService;
-let invalidate: ReturnType<typeof vi.spyOn>;
 let capability: CountingCapabilityClient;
 
 /**
  * The upstream the capability resolver probes (issue #144), counting calls so a test can tell a
- * cache hit from a re-probe. Deliberately handed to `FeatureService` DIRECTLY rather than through
- * `narratorr`: `reconfigure()` replaces the holder's inner client with a REAL `NarratorrClient`
+ * cache hit from a re-probe. Deliberately handed to `FeatureService` as its CLIENT directly rather
+ * than through `narratorr`: `reconfigure()` replaces the holder's inner clients with REAL ones
  * pointed at the saved URL, which would turn every probe here into an actual socket. Bypassing the
- * holder isolates what these tests are about — whether the generation was bumped — from the
- * network. The holder swap itself is asserted separately via `narratorr.configured`.
+ * holder on the client side isolates what these tests are about — whether the connection
+ * generation moved — from the network. The resolver's GENERATION still comes from the real holder
+ * (issue #145), which is precisely the seam under test.
  */
 class CountingCapabilityClient {
   calls = 0;
@@ -68,8 +68,7 @@ async function buildApp(): Promise<FastifyInstance> {
   connectorSettings = new ConnectorSettingsService(db, codec);
   narratorr = new NarratorrClientHolder(null);
   capability = new CountingCapabilityClient();
-  features = new FeatureService(capability);
-  invalidate = vi.spyOn(features, 'invalidate');
+  features = new FeatureService(capability, narratorr);
   deps = {
     connectorSettings,
     narratorr,
@@ -91,7 +90,7 @@ async function buildApp(): Promise<FastifyInstance> {
   });
   registerSettingsRoutes(f, deps);
   // Registered alongside so the AC16 tests can observe the generation through the real consumer
-  // surface (`/api/features` re-probes vs. serves the cached value), not just the spy.
+  // surface (`/api/features` re-probes vs. serves the cached value), not just the counter.
   registerFeatureRoutes(f, deps);
   await f.ready();
   return f;
@@ -627,12 +626,13 @@ describe('settings routes — write mutex (no clobber on overlapping writes)', (
   });
 });
 
-// AC16.7 (issue #144): a narratorr CONNECTION CHANGE must retire the cached companion-ebook
-// capability, and nothing else may. The generation bump sits on the statement immediately after
-// `deps.narratorr.set(...)` — before `reconfigure()`'s two remaining awaits — so a concurrent
-// `/api/features` read (which deliberately does NOT take the settings write mutex) can never
-// observe the new holder paired with the old generation's cache.
-describe('settings routes — capability invalidation on a narratorr change (#144)', () => {
+// AC16.7 (#144) / AC17-18 (#145): a narratorr CONNECTION CHANGE must install new clients AND
+// retire the cached companion-ebook capability — and nothing else may do either. Since #145 those
+// are the SAME event: the holder's generation is the resolver's cache key, so one synchronous
+// `deps.narratorr.set(...)` — before `reconfigure()`'s remaining awaits — is the whole mechanism.
+// A concurrent `/api/features` read (which deliberately does NOT take the settings write mutex)
+// therefore can never observe the new connection paired with the old generation's cache.
+describe('settings routes — connection swap on a narratorr change (#144/#145)', () => {
   const FEATURES_URL = '/api/features';
   const emailCreate = (from: string): CreateNotifierBody => ({
     name: 'Mail',
@@ -655,21 +655,77 @@ describe('settings routes — capability invalidation on a narratorr change (#14
     expect(capability.calls).toBe(1);
   }
 
-  it('invalidates on a PUT carrying narratorr — the next read RE-PROBES instead of serving the cache', async () => {
+  it('swaps on a PUT carrying narratorr — the next read RE-PROBES instead of serving the cache', async () => {
     await primeCachedCapability();
+    expect(narratorr.generation).toBe(0);
 
     const res = await putConnectors({ narratorr: { url: 'http://n:3000', apiKey: 'k' } });
     expect(res.statusCode).toBe(200);
-    expect(invalidate).toHaveBeenCalledTimes(1);
+    expect(narratorr.generation).toBe(1);
 
     expect((await readFeatures()).json().ebooksEnabled).toBe(true);
     expect(capability.calls).toBe(2); // re-probed, despite being well inside the 60s TTL
   });
 
-  it('bumps ADJACENTLY to the holder swap — visible while reconfigure() is still parked', async () => {
-    // An ordering-only assertion (`set` before `invalidate`) cannot distinguish an adjacent bump
-    // from one deferred past the awaits. So park `reconfigure()` INSIDE itself, right after the
-    // swap, and assert the new generation is already observable from a concurrent reader.
+  it('rebuilds BOTH clients from ONE read of the saved config, observed with no restart', async () => {
+    // AC15/AC18/AC25. `fetch` is stubbed, so this asserts on what each half would put on the wire
+    // without opening a socket — the JSON and stream clients must carry the SAME freshly-saved
+    // base URL and api key, from a single `getNarratorrConfig()` read.
+    const reads = vi.spyOn(connectorSettings, 'getNarratorrConfig');
+    const before = narratorr.generation;
+
+    expect((await putConnectors({ narratorr: { url: 'http://new-n:3000', apiKey: 'fresh-key' } })).statusCode).toBe(200);
+    expect(narratorr.generation).toBe(before + 1);
+    expect(reads).toHaveBeenCalledTimes(1);
+
+    const seen: Array<{ url: string; apiKey: string | null }> = [];
+    vi.stubGlobal('fetch', (input: RequestInfo | URL, init?: RequestInit) => {
+      seen.push({ url: String(input), apiKey: new Headers(init?.headers).get('x-api-key') });
+      return Promise.resolve(new Response(null, { status: 500 }));
+    });
+    await narratorr.getBook('bk_1').catch(() => {});
+    await narratorr.openCompanionEpub('bk_1').catch(() => {});
+
+    expect(seen).toHaveLength(2);
+    expect(seen[0]?.url).toBe('http://new-n:3000/api/v1/books/bk_1');
+    expect(seen[1]?.url).toBe('http://new-n:3000/api/v1/books/bk_1/companion-epub');
+    expect(seen[0]?.apiKey).toBe('fresh-key');
+    expect(seen[1]?.apiKey).toBe('fresh-key');
+  });
+
+  it('DISCONNECTS on a PUT carrying narratorr: null — clears both clients and retires the cache', async () => {
+    // The null arm of the swap ternary. Every other case here saves a connection, so reversing or
+    // dropping that arm (leaving the retired server's live clients and its cached capability in
+    // place) would keep the whole suite green.
+    expect((await putConnectors({ narratorr: { url: 'http://n:3000', apiKey: 'k' } })).statusCode).toBe(200);
+    await primeCachedCapability();
+    expect(narratorr.configured).toBe(true);
+    const before = narratorr.generation;
+
+    expect((await putConnectors({ narratorr: null })).statusCode).toBe(200);
+
+    // Exactly one bump, and the connection is genuinely gone…
+    expect(narratorr.generation).toBe(before + 1);
+    expect(narratorr.configured).toBe(false);
+    await expect(Promise.resolve().then(() => narratorr.getBook('bk_1'))).rejects.toMatchObject({
+      statusCode: 502,
+      upstreamCode: 'NOT_CONFIGURED',
+    });
+    await expect(Promise.resolve().then(() => narratorr.openCompanionEpub('bk_1'))).rejects.toMatchObject({
+      statusCode: 502,
+      upstreamCode: 'NOT_CONFIGURED',
+    });
+    // …and the disconnected server's cached `true` is unreadable — the read re-probes rather than
+    // serving it, well inside the 60s TTL.
+    const callsBefore = capability.calls;
+    expect((await readFeatures()).json().ebooksEnabled).toBe(true);
+    expect(capability.calls).toBe(callsBefore + 1);
+  });
+
+  it('swaps ADJACENTLY to the DB write — visible while reconfigure() is still parked', async () => {
+    // An ordering-only assertion cannot distinguish an adjacent swap from one deferred past the
+    // awaits. So park `reconfigure()` INSIDE itself, right after the swap, and assert the new
+    // generation is already observable from a concurrent reader.
     await primeCachedCapability();
 
     let release!: () => void;
@@ -684,11 +740,11 @@ describe('settings routes — capability invalidation on a narratorr change (#14
 
     const put = putConnectors({ narratorr: { url: 'http://n:3000', apiKey: 'k' } });
     // Let the PUT run up to the parked await.
-    await vi.waitFor(() => expect(invalidate).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(narratorr.generation).toBe(1));
     // The holder has already swapped…
     expect(narratorr.configured).toBe(true);
     // …and a concurrent read is ALREADY in the new generation: it re-probes rather than serving
-    // the cached `true`. A bump deferred past the awaits would still serve the cache here.
+    // the cached `true`. A swap deferred past the awaits would still serve the cache here.
     expect((await readFeatures()).json().ebooksEnabled).toBe(true);
     expect(capability.calls).toBe(2);
 
@@ -699,34 +755,38 @@ describe('settings routes — capability invalidation on a narratorr change (#14
   it.each([
     ['getNotificationsConfig', 'getNotificationsConfig' as const],
     ['getDefaultQuota', 'getDefaultQuota' as const],
-  ])('survives a REJECTING %s tail — the bump already happened', async (_label, method) => {
-    // The DB update and the holder swap are already durable when the tail runs. A bump placed
-    // after it would be skipped entirely by the rejection, stranding the new connection with the
-    // previous generation's cache — indefinitely, since nothing retries.
+  ])('survives a REJECTING %s tail — the swap already happened', async (_label, method) => {
+    // The DB update is already durable when the tail runs. A swap placed after it would be
+    // skipped entirely by the rejection, stranding the saved connection behind the previous
+    // one's clients and cache — indefinitely, since nothing retries.
     await primeCachedCapability();
     vi.spyOn(connectorSettings, method).mockRejectedValue(new Error('tail exploded'));
 
     const res = await putConnectors({ narratorr: { url: 'http://n:3000', apiKey: 'k' } });
     expect(res.statusCode).toBe(500);
-    expect(invalidate).toHaveBeenCalledTimes(1);
+    expect(narratorr.generation).toBe(1);
+    expect(narratorr.configured).toBe(true);
 
     vi.restoreAllMocks();
     expect((await readFeatures()).json().ebooksEnabled).toBe(true);
     expect(capability.calls).toBe(2); // the new generation, not the stranded old one
   });
 
-  // The F13 regressions: `reconfigure()` rebuilds the narratorr client on EVERY save, so an
-  // unconditional bump would discard a valid capability result — and its 15-minute stale budget —
-  // on each of these. One row per non-narratorr write path.
-  describe('does NOT invalidate on a save that cannot change the connection', () => {
+  // The F13 regressions: `reconfigure()` runs on EVERY save, so an unconditional swap would
+  // discard a valid capability result — and its 15-minute stale budget — on each of these, and
+  // would silently replace live client instances for no reason. One row per non-narratorr write
+  // path. `generation` is exactly the "no silent rebuild" assertion: `set()` is the holder's only
+  // writer and always bumps, so an unchanged generation means the SAME client instances.
+  describe('does NOT swap on a save that cannot change the connection', () => {
     it.each([
       ['ebooksEnabled only', () => putConnectors({ ebooksEnabled: true })],
       ['defaultQuota only', () => putConnectors({ defaultQuota: { mode: 'limited', limit: 3, windowDays: 7 } })],
       ['publicUrl only', () => putConnectors({ publicUrl: 'https://app.example.com' })],
     ])('%s', async (_label, save) => {
       await primeCachedCapability();
+      const before = narratorr.generation;
       expect((await save()).statusCode).toBe(200);
-      expect(invalidate).not.toHaveBeenCalled();
+      expect(narratorr.generation).toBe(before);
       // The cached value — and its stale budget — survives.
       expect((await readFeatures()).json().ebooksEnabled).toBe(true);
       expect(capability.calls).toBe(1);
@@ -734,10 +794,11 @@ describe('settings routes — capability invalidation on a narratorr change (#14
 
     it('kindleSender only', async () => {
       await primeCachedCapability();
+      const before = narratorr.generation;
       const nf = (await createNotifier(emailCreate('bot@ex.com'))).json();
       // (notifier CREATE also ran reconfigure() — assert across both writes)
       expect((await putConnectors({ kindleSender: { notifierId: nf.id } })).statusCode).toBe(200);
-      expect(invalidate).not.toHaveBeenCalled();
+      expect(narratorr.generation).toBe(before);
       expect((await readFeatures()).json().kindleSenderEmail).toBe('bot@ex.com');
       expect(capability.calls).toBe(1);
     });
@@ -767,8 +828,9 @@ describe('settings routes — capability invalidation on a narratorr change (#14
       ],
     ])('%s', async (_label, save) => {
       await primeCachedCapability();
+      const before = narratorr.generation;
       expect(await save()).toBe(200);
-      expect(invalidate).not.toHaveBeenCalled();
+      expect(narratorr.generation).toBe(before);
       expect((await readFeatures()).json().ebooksEnabled).toBe(true);
       expect(capability.calls).toBe(1);
     });
