@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { bookStatusSchema } from '../book.js';
+import { v1CompanionEbookSchema } from './companion-ebook.js';
 import { authorRefSchema, narratorRefSchema, seriesRefSchema } from './refs.js';
 
 // =============================================================================
@@ -40,8 +41,28 @@ export const v1AudibleResultSchema = z.object({
   // isn't owned, and `.catch(undefined)` degrades a malformed/unknown-status annotation to
   // "not owned" rather than 502-ing the whole search — this is decoration, never
   // load-bearing like the poll `status` in ./books.ts. `bookId` is an opaque `bk_…`.
+  //
+  // `companionEbook` (narratorr #1961) nests INSIDE the annotation — a companion belongs
+  // to a book narratorr owns, so it can only exist where `library` does. This is the LIVE
+  // consumer surface for the whole companion feature (the top-level field in ./books.ts is
+  // contract substrate). We hold it `.optional()` even though the producer makes it
+  // REQUIRED inside `library`: a pre-#1961 narratorr emits `library` with no such key and
+  // that must keep parsing with `bookId`/`status` intact. Absent and `null` both read as
+  // "no companion ebook" — we deliberately do NOT preserve that distinction, because the
+  // authoritative "old narratorr" signal is the `404` from the capability probe, not the
+  // shape of this field.
+  //
+  // The INNER `.catch(undefined)` is LOAD-BEARING and must not be dropped. Without it any
+  // companion drift fails the whole `library` object, the OUTER catch swallows that, and
+  // the annotation collapses to `undefined` — silently regressing the "In library" / "On
+  // the way" badges (client/components/book-card-state.ts) for EVERY result. The inner
+  // catch confines companion drift to the companion field.
   library: z
-    .object({ bookId: z.string(), status: bookStatusSchema })
+    .object({
+      bookId: z.string(),
+      status: bookStatusSchema,
+      companionEbook: v1CompanionEbookSchema.nullable().optional().catch(undefined),
+    })
     .nullable()
     .optional()
     .catch(undefined),

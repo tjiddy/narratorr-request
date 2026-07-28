@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { bookStatusSchema } from '../book.js';
+import { v1CompanionEbookSchema } from './companion-ebook.js';
 import { isoDateString, prefixedId } from './common.js';
 import { authorRefSchema, narratorRefSchema, seriesRefSchema } from './refs.js';
 
@@ -70,6 +71,14 @@ export const v1BookSchema = z.object({
   coverUrl: z.string().nullable().optional(),
   asin: z.string().nullable().optional(),
   status: bookStatusSchema,
+  // Companion ebook (narratorr #1961). Contract substrate, not the live surface: the
+  // consumer surface is the nested `library.companionEbook` annotation in ./metadata.ts.
+  // `.optional()` for the same reason as there (a pre-#1961 narratorr omits the key), and
+  // `.catch(undefined)` is LOAD-BEARING here for a sharper reason: this schema backs both
+  // addBook() and the poller's getBook() (narratorr-client.ts), which is what drives
+  // `acquiring → available`. A drifted companion field must never turn a poll into a
+  // 502 CONTRACT_MISMATCH and strand a request at `acquiring` forever.
+  companionEbook: v1CompanionEbookSchema.nullable().optional().catch(undefined),
   createdAt: isoDateString.optional(),
 });
 export type V1Book = z.infer<typeof v1BookSchema>;
