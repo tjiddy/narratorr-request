@@ -2,7 +2,8 @@ import { http, HttpResponse, type RequestHandler } from 'msw';
 import type { V1AudibleResult } from '../../shared/schemas/v1/metadata.js';
 import { ADD_BOOK_ERROR_CODES, type AddBookErrorCode, type V1Book } from '../../shared/schemas/v1/books.js';
 import type { BookStatus } from '../../shared/schemas/book.js';
-import { errorBody } from '../../shared/schemas/v1/common.js';
+import type { V1CompanionEbook } from '../../shared/schemas/v1/companion-ebook.js';
+import { errorBody, type ErrorEnvelope } from '../../shared/schemas/v1/common.js';
 import { publicId } from '../util/ids.js';
 import { MOCK_BASE_URL } from './constants.js';
 
@@ -123,6 +124,60 @@ const ADD_ERROR_MARKERS: Record<string, AddBookErrorCode> = {
 const PRE_IMPORTED = new Set<string>(['B017V4IM1G', 'B075FYBP8H']);
 
 // ---------------------------------------------------------------------------
+// Companion ebooks (narratorr #1961). ASIN → the companion value narratorr advertises.
+// ONE table feeds both surfaces (the search `library` annotation and the book DTO), so
+// the two can never disagree for the same ASIN.
+//
+// narratorr exposes a companion only when `enabled && imported && available`, so
+// `companionFor()` gates on the PROJECTED status and the designated ASINs are drawn from
+// PRE_IMPORTED — the fixture can never emit a companion on a `searching`/`downloading`
+// book, a state narratorr itself never produces.
+//
+// The three UI states downstream stories render are all reachable here:
+//   - in library WITH a companion  → B017V4IM1G (Mistborn)
+//   - in library WITHOUT one       → B075FYBP8H (Dune, pre-imported, absent from the table)
+//   - not in library at all        → any ASIN that hasn't been added (no `library` key)
+// ---------------------------------------------------------------------------
+const COMPANION_EBOOKS: Record<string, V1CompanionEbook> = {
+  B017V4IM1G: { format: 'epub', sizeBytes: 4096 },
+};
+
+function companionFor(asin: string, status: BookStatus): V1CompanionEbook | null {
+  if (status !== 'imported') return null;
+  return COMPANION_EBOOKS[asin] ?? null;
+}
+
+/**
+ * Marker publicIds reaching the companion-epub handler's non-404 negatives, in the spirit
+ * of ADD_ERROR_MARKERS: the mock has no feature flag and no stream limiter, so `409`/`503`
+ * are otherwise unreachable from fixture state. Bodies are the producer's verbatim
+ * module-level constants — the lowercase `companion_epub_*` codes are frozen contract and
+ * consumers branch on them, so do not "fix" the casing.
+ */
+const COMPANION_EPUB_ERROR_MARKERS: Record<string, { status: number; body: ErrorEnvelope }> = {
+  bk_companiondisabled: {
+    status: 409,
+    body: errorBody('companion_epub_disabled', 'Companion ebooks are disabled'),
+  },
+  bk_companionbusy: {
+    status: 503,
+    body: errorBody('companion_epub_busy', 'Too many concurrent companion ebook downloads'),
+  },
+};
+
+/** `404` — EVERY other negative, without exception, so the endpoint can't be used as an
+ *  existence oracle: no such book, book present but no companion, open failed. */
+const COMPANION_EPUB_UNAVAILABLE = errorBody('companion_epub_unavailable', 'Companion ebook is unavailable');
+
+function decodeParam(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // In-memory book state with a time-based lifecycle. A freshly-added book advances
 // searching → downloading → importing → imported over ~9s so the status poller can
 // be observed driving a request to `available`.
@@ -159,15 +214,21 @@ function projectStatus(state: BookState, nowMs: number): BookStatus {
  * iff narratorr already has a book record for that ASIN (added in this session), with
  * the live projected status. Absent otherwise — exactly the contract the consumer codes
  * against. So: search → request → search again now shows "On the way" / "In library".
+ *
+ * `companionEbook` (#1961) is emitted with the key ALWAYS PRESENT whenever `library` is,
+ * mirroring the producer where it is required-and-nullable inside the annotation: `null`
+ * means "no companion ebook", never "old narratorr".
  */
 function libraryFor(asin: string, nowMs: number): V1AudibleResult['library'] {
   const state = bookByAsin.get(asin);
   if (!state) return undefined;
-  return { bookId: state.id, status: projectStatus(state, nowMs) };
+  const status = projectStatus(state, nowMs);
+  return { bookId: state.id, status, companionEbook: companionFor(asin, status) };
 }
 
 function toBook(state: BookState, nowMs: number): V1Book {
   const f = byAsin.get(state.asin)!;
+  const status = projectStatus(state, nowMs);
   return {
     id: state.id,
     title: f.title,
@@ -176,7 +237,9 @@ function toBook(state: BookState, nowMs: number): V1Book {
     series: f.series ?? null,
     coverUrl: f.cover,
     asin: f.asin,
-    status: projectStatus(state, nowMs),
+    status,
+    // Same table as the search annotation, so the two surfaces agree by construction.
+    companionEbook: companionFor(state.asin, status),
     createdAt: new Date(state.createdAtMs).toISOString(),
   };
 }
@@ -270,6 +333,56 @@ export function narratorrV1Handlers(baseUrl: string = MOCK_BASE_URL): RequestHan
         buildTime: '2026-06-01T00:00:00.000Z',
         nodeVersion: 'v24.10.0',
         os: 'Linux 6.8.0',
+      });
+    }),
+
+    // 5. Capability probe (narratorr #1961). Its OWN endpoint, deliberately not a key on
+    //    /api/v1/system: a pre-#1961 narratorr answers a plain 404, which is the only
+    //    "unsupported" signal. Per-test variation (disabled / 404 / 401 / network error)
+    //    is expressed with `server.use(...)` overrides — no toggle plumbing here.
+    http.get(`${baseUrl}/api/v1/capabilities`, ({ request }) => {
+      const unauth = requireApiKey(request);
+      if (unauth) return unauth;
+      return HttpResponse.json({ companionEpub: { enabled: true } });
+    }),
+
+    // 6. Companion-ebook byte stream (narratorr #1961).
+    //
+    //    ENVELOPE + HAPPY-PATH FIXTURE ONLY. This is explicitly NOT the vehicle for
+    //    mid-body abort, truncation, or backpressure tests: MSW honors an abort only while
+    //    a resolver is still pending and cannot interrupt an already-returned in-memory
+    //    body, so such a test behaves identically for correct and broken code. Those need a
+    //    real `node:http` server (see the body-stall test in narratorr-client.test.ts) and
+    //    belong to the streaming-client / hardening stories.
+    http.get(`${baseUrl}/api/v1/books/:publicId/companion-epub`, ({ request, params }) => {
+      const unauth = requireApiKey(request);
+      if (unauth) return unauth;
+
+      // narratorr validates the path param (`z.string().trim().min(1)`) BEFORE the
+      // resolver runs, so a whitespace-only segment is a plain 400 rather than the
+      // companion 404. The code/message of that validation envelope is not load-bearing
+      // for us — the consumer maps any upstream 400 onto its own 404.
+      const id = decodeParam(String(params.publicId));
+      if (id.trim() === '') {
+        return HttpResponse.json(errorBody('BAD_REQUEST', 'publicId is required'), { status: 400 });
+      }
+
+      const marker = COMPANION_EPUB_ERROR_MARKERS[id];
+      if (marker) return HttpResponse.json(marker.body, { status: marker.status });
+
+      const state = bookById.get(id);
+      const companion = state ? companionFor(state.asin, projectStatus(state, Date.now())) : null;
+      if (!state || !companion) return HttpResponse.json(COMPANION_EPUB_UNAVAILABLE, { status: 404 });
+
+      // The body's byte length EQUALS the advertised sizeBytes: a consumer that counts
+      // bytes and compares against the annotation must never be tripped by the fixture.
+      const filename = `${byAsin.get(state.asin)!.title.replace(/[^a-zA-Z0-9._-]/g, '-')}.epub`;
+      return HttpResponse.arrayBuffer(new ArrayBuffer(companion.sizeBytes), {
+        headers: {
+          'Content-Type': 'application/epub+zip',
+          'Content-Length': String(companion.sizeBytes),
+          'Content-Disposition': `attachment; filename="${filename}"`,
+        },
       });
     }),
   ];
