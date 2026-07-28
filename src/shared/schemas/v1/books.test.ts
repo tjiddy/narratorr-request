@@ -35,6 +35,29 @@ describe('v1Book (the bare resource we poll)', () => {
   });
 });
 
+describe('v1Book.companionEbook (#1961)', () => {
+  it('retains a companion, retains null, and tolerates the key being absent (old narratorr)', () => {
+    expect(v1BookSchema.parse({ ...book, companionEbook: { format: 'epub', sizeBytes: 42 } }).companionEbook).toEqual({
+      format: 'epub',
+      sizeBytes: 42,
+    });
+    expect(v1BookSchema.parse({ ...book, companionEbook: null }).companionEbook).toBeNull();
+    expect(v1BookSchema.parse(book).companionEbook).toBeUndefined();
+  });
+
+  it('never fails the poll on companion drift (the .catch keeps acquiring → available alive)', () => {
+    // v1BookSchema backs both addBook() and the poller's getBook(); a CONTRACT_MISMATCH
+    // here would 502 the poll and strand the request at `acquiring` forever.
+    for (const companionEbook of [{ format: 'pdf' }, 'nope', 7]) {
+      const parsed = v1BookSchema.safeParse({ ...book, companionEbook });
+      expect(parsed.success).toBe(true);
+      expect(parsed.data?.id).toBe('bk_abc123');
+      expect(parsed.data?.status).toBe('imported');
+      expect(parsed.data?.companionEbook).toBeUndefined();
+    }
+  });
+});
+
 describe('v1AddBookBody (POST /books command)', () => {
   it('requires a non-empty asin and is strict (rejects extra keys)', () => {
     expect(v1AddBookBodySchema.safeParse({ asin: 'B08GB58KD5' }).success).toBe(true);

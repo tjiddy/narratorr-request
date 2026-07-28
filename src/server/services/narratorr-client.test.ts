@@ -4,7 +4,8 @@ import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest
 import { http, HttpResponse, delay } from 'msw';
 import { setupServer } from 'msw/node';
 import { NarratorrClient, NarratorrError } from './narratorr-client.js';
-import { errorBody } from '../../shared/schemas/v1/common.js';
+import { errorBody, errorEnvelopeSchema } from '../../shared/schemas/v1/common.js';
+import { v1CapabilitiesSchema } from '../../shared/schemas/v1/capabilities.js';
 import { narratorrV1Handlers, resetMockNarratorrState, MOCK_BASE_URL } from '../mocks/narratorr-v1.js';
 
 const server = setupServer(...narratorrV1Handlers());
@@ -251,5 +252,112 @@ describe('NarratorrClient.ping (Settings "Test" probe)', () => {
   it('rejects on a transport failure', async () => {
     server.use(http.get(`${MOCK_BASE_URL}/api/v1/books/:id`, () => HttpResponse.error()));
     await expect(client.ping()).rejects.toMatchObject({ upstreamCode: 'NETWORK' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Companion ebooks (narratorr #1961) — the vendored contract, exercised end to end
+// against the MSW fixture. The mock designates its companion-bearing ASINs from
+// PRE_IMPORTED and gates the projection on `imported`, mirroring narratorr's
+// exposure predicate (`enabled && imported && available`), so no fixture state
+// here is one narratorr can never emit.
+// ---------------------------------------------------------------------------
+const COMPANION_ASIN = 'B017V4IM1G'; // Mistborn — pre-imported, HAS a companion
+const NO_COMPANION_ASIN = 'B075FYBP8H'; // Dune — pre-imported, no companion (the null control)
+const COMPANION_SIZE_BYTES = 4096;
+
+describe('companion ebooks — search annotation + book DTO (#1961)', () => {
+  it('carries library.companionEbook through the client schema parse', async () => {
+    await client.addBook(COMPANION_ASIN);
+    const [result] = await client.searchMetadata('mistborn');
+    expect(result?.library?.companionEbook).toEqual({ format: 'epub', sizeBytes: COMPANION_SIZE_BYTES });
+  });
+
+  it('annotates an in-library book WITHOUT a companion as null', async () => {
+    await client.addBook(NO_COMPANION_ASIN);
+    const [result] = await client.searchMetadata('dune');
+    expect(result?.library?.bookId).toEqual(expect.stringMatching(/^bk_/));
+    expect(result?.library?.companionEbook).toBeNull();
+  });
+
+  it('leaves a NOT-in-library result with no library annotation at all', async () => {
+    // The third UI state: the fixture must not annotate every result.
+    const [result] = await client.searchMetadata('hail mary');
+    expect(result?.asin).toBe('B07KCQDQR9');
+    expect(result?.library).toBeUndefined();
+  });
+
+  it('never disagrees between the search annotation and the book DTO for the same ASIN', async () => {
+    const added = await client.addBook(COMPANION_ASIN);
+    const [result] = await client.searchMetadata('mistborn');
+    const book = await client.getBook(added.id);
+    expect(book.companionEbook).toEqual({ format: 'epub', sizeBytes: COMPANION_SIZE_BYTES });
+    expect(book.companionEbook).toEqual(result?.library?.companionEbook);
+  });
+
+  it('returns a null top-level companionEbook for a book without one', async () => {
+    const added = await client.addBook(NO_COMPANION_ASIN);
+    expect((await client.getBook(added.id)).companionEbook).toBeNull();
+  });
+});
+
+describe('companion ebooks — capabilities + byte-stream fixture handlers (#1961)', () => {
+  const keyed = { headers: { 'x-api-key': 'test-key' } };
+
+  it('serves the capability probe under the api key and 401s without it', async () => {
+    const res = await fetch(`${MOCK_BASE_URL}/api/v1/capabilities`, keyed);
+    expect(res.status).toBe(200);
+    expect(v1CapabilitiesSchema.parse(await res.json())).toEqual({ companionEpub: { enabled: true } });
+
+    const anon = await fetch(`${MOCK_BASE_URL}/api/v1/capabilities`);
+    expect(anon.status).toBe(401);
+  });
+
+  it('streams a body whose byte length equals the advertised sizeBytes, with the download headers', async () => {
+    const added = await client.addBook(COMPANION_ASIN);
+    const res = await fetch(`${MOCK_BASE_URL}/api/v1/books/${added.id}/companion-epub`, keyed);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('application/epub+zip');
+    expect(res.headers.get('content-length')).toBe(String(COMPANION_SIZE_BYTES));
+    expect(res.headers.get('content-disposition')).toMatch(/^attachment; filename="[^"]+\.epub"$/);
+    expect((await res.arrayBuffer()).byteLength).toBe(COMPANION_SIZE_BYTES);
+  });
+
+  it('guards the byte stream with the api key too', async () => {
+    const added = await client.addBook(COMPANION_ASIN);
+    const res = await fetch(`${MOCK_BASE_URL}/api/v1/books/${added.id}/companion-epub`);
+    expect(res.status).toBe(401);
+    expect(errorEnvelopeSchema.parse(await res.json()).error.code).toBe('UNAUTHORIZED');
+  });
+
+  it('reproduces the three frozen companion_epub_* envelopes verbatim', async () => {
+    const cases = [
+      ['bk_companiondisabled', 409, 'companion_epub_disabled', 'Companion ebooks are disabled'],
+      ['bk_companionbusy', 503, 'companion_epub_busy', 'Too many concurrent companion ebook downloads'],
+      ['bk_nosuchbook', 404, 'companion_epub_unavailable', 'Companion ebook is unavailable'],
+    ] as const;
+    for (const [id, status, code, message] of cases) {
+      const res = await fetch(`${MOCK_BASE_URL}/api/v1/books/${id}/companion-epub`, keyed);
+      expect(res.status).toBe(status);
+      expect(errorEnvelopeSchema.parse(await res.json())).toEqual({ error: { code, message } });
+    }
+  });
+
+  it('404s an in-library book with no companion (never a distinguishable code)', async () => {
+    const added = await client.addBook(NO_COMPANION_ASIN);
+    const res = await fetch(`${MOCK_BASE_URL}/api/v1/books/${added.id}/companion-epub`, keyed);
+    expect(res.status).toBe(404);
+    expect(errorEnvelopeSchema.parse(await res.json()).error.code).toBe('companion_epub_unavailable');
+  });
+
+  it('rejects a whitespace-only publicId with a plain 400 (narratorr validates before resolving)', async () => {
+    // The producer's param validator is `z.string().trim().min(1)`, so `%20` is a 400
+    // while any other nonempty marker resolves to the 404. The validation message is
+    // not a stable producer contract — only the status is asserted in substance.
+    const res = await fetch(`${MOCK_BASE_URL}/api/v1/books/%20/companion-epub`, keyed);
+    expect(res.status).toBe(400);
+    const body = errorEnvelopeSchema.parse(await res.json());
+    expect(body.error.code).toBe('BAD_REQUEST');
+    expect(typeof body.error.message).toBe('string');
   });
 });
