@@ -280,13 +280,20 @@ describe('streaming and backpressure over a real socket (AC10, F24)', () => {
     // F24, asserted as a STALL rather than as a byte threshold: three hops of pipeline buffering
     // (fake -> undici, undici -> our wrapper, our response -> client socket) make any absolute
     // margin a guess, but the property is exact — with nobody reading downstream, the producer
-    // must come to a complete stop and stay there. A wrapper that eagerly read the upstream into
-    // memory would keep climbing here, and would have finished the whole body.
-    await new Promise((r) => setTimeout(r, 200));
-    const parked = written;
+    // must come to a complete stop, and it must do so BEFORE the body is finished. Polling for
+    // that rest (rather than sampling at a fixed instant) is what keeps it honest under a loaded
+    // suite, where the buffers can still be filling well past any hard-coded delay.
+    let previous = -1;
+    let parked = written;
+    for (let i = 0; i < 40 && parked !== previous; i += 1) {
+      previous = parked;
+      await new Promise((r) => setTimeout(r, 50));
+      parked = written;
+    }
+    expect(parked, 'the upstream producer never came to rest while the consumer was paused').toBe(previous);
+    // ...and it came to rest SHORT of the whole body. A wrapper that eagerly drained the upstream
+    // into memory would also be "at rest" here — at 32 MiB.
     expect(parked).toBeLessThan(TOTAL);
-    await new Promise((r) => setTimeout(r, 300));
-    expect(written).toBe(parked);
 
     let total = first.value!.byteLength;
     const seen = [first.value!];
