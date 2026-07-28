@@ -120,6 +120,9 @@ interface Liveness {
  */
 function trackLiveness(request: FastifyRequest, reply: FastifyReply): Liveness {
   const controller = new AbortController();
+  // Seeding from current state is what carries an already-fired `close` into the SIGNAL (so the
+  // upstream fetch starts pre-aborted). The `gone()` predicate below re-reads the socket every
+  // time it is called, so the two together cover the disconnect whichever way it arrived.
   if (request.raw.aborted || reply.raw.destroyed) controller.abort();
   reply.raw.on('close', () => {
     if (!reply.raw.writableFinished) controller.abort();
