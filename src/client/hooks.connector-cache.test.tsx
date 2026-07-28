@@ -21,6 +21,10 @@ import { qk, useConnectorSettings, useUpdateConnectors, useUpdateEbooksEnabled }
  * therefore carries a snapshot that may predate a sibling's committed write — so a mutation that
  * writes its response wholesale silently rolls the sibling's field back in the UI while the DB
  * holds the opposite. Converging requires that no save blind-writes the shared entry.
+ *
+ * Scope note: this file covers convergence when the writes SUCCEED. The other half — a write that
+ * commits and then answers 500 from the reconfiguration tail — lives in
+ * `hooks.settings-error-path.test.tsx`. Both belong at this layer for the same reason.
  */
 
 vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn() } }));

@@ -570,9 +570,13 @@ describe('useUpdateConnectors', () => {
 
   // F5 — the route persists BEFORE awaiting its fallible reconfiguration tail
   // (`routes/settings.ts`), so a 500 is not evidence that nothing was written; the server's own
-  // rejecting-tail tests assert exactly that pairing. Reconciling only on success would strand the
-  // SPA on pre-write state for a change that actually landed.
-  it('reconciles BOTH keys when a narratorr write commits and then 500s', () => {
+  // rejecting-tail tests assert exactly that pairing.
+  //
+  // SCOPE OF THIS ROW: it proves only that the error path REQUESTS the right invalidations. That
+  // the mounted observers then converge on the committed row is a consequence this mocked
+  // modality structurally cannot express (no cache, no observer, no refetch — see the file
+  // header), and is proven at the API boundary in `hooks.settings-error-path.test.tsx`.
+  it('requests BOTH invalidations when a narratorr write commits and then 500s', () => {
     cb(useUpdateConnectors()).onSettled(undefined, new ApiError(500, 'E', 'reconfigure blew up'), {
       narratorr: { url: 'http://n:3000', apiKey: 'k' },
     });
@@ -627,7 +631,7 @@ describe('useUpdateEbooksEnabled (#144)', () => {
   // F5 — the toggle write commits before the route's fallible reconfiguration tail, so an
   // errored save still has to refresh both keys or the admin sees the old gating for a flag
   // that is durably set.
-  it('reconciles both keys when the toggle commits and then 500s', () => {
+  it('requests both invalidations when the toggle commits and then 500s', () => {
     cb(useUpdateEbooksEnabled()).onSettled(undefined, new ApiError(500, 'E', 'reconfigure blew up'));
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
@@ -693,7 +697,7 @@ describe('useUpdateKindleSender (#143)', () => {
   });
 
   // F5 — the sender write commits before the fallible tail, so a 500 still has to reconcile.
-  it('reconciles both keys when a sender selection commits and then 500s', () => {
+  it('requests both invalidations when a sender selection commits and then 500s', () => {
     cb(useUpdateKindleSender()).onSettled(undefined, new ApiError(500, 'E', 'reconfigure blew up'));
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
@@ -753,7 +757,7 @@ describe('notifier mutation hooks — cache invalidation + toast contract', () =
 
   // F6 sibling — create cannot change the SENDER, but its own write is just as durable-before-500
   // as the others, so the notifier list still has to reconcile on the error path.
-  it('useCreateNotifier reconciles the connectors key when the create commits and then 500s', () => {
+  it('useCreateNotifier requests only the connectors invalidation when the create commits and then 500s', () => {
     cb(useCreateNotifier()).onSettled(undefined, new ApiError(500, 'E', 'reconfigure blew up'));
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
     expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalledWith({ queryKey: qk.features });
@@ -781,7 +785,7 @@ describe('notifier mutation hooks — cache invalidation + toast contract', () =
 
   // F6 — notifier edit persists before the fallible tail, so a 500 must still
   // reconcile the Kindle-derived feature state.
-  it('useUpdateNotifier reconciles both keys when the write commits and then 500s', () => {
+  it('useUpdateNotifier requests both invalidations when the write commits and then 500s', () => {
     cb(useUpdateNotifier()).onSettled(undefined, new ApiError(500, 'E', 'reconfigure blew up'));
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
@@ -809,7 +813,7 @@ describe('notifier mutation hooks — cache invalidation + toast contract', () =
 
   // F6 — notifier delete persists before the fallible tail, so a 500 must still
   // reconcile the Kindle-derived feature state.
-  it('useDeleteNotifier reconciles both keys when the write commits and then 500s', () => {
+  it('useDeleteNotifier requests both invalidations when the write commits and then 500s', () => {
     cb(useDeleteNotifier()).onSettled(undefined, new ApiError(500, 'E', 'reconfigure blew up'));
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
