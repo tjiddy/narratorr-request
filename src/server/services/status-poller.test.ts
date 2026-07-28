@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { eq } from 'drizzle-orm';
 import { StatusPoller } from './status-poller.js';
 import { RequestService, BOOK_VANISHED_REASON } from './request.service.js';
-import { NarratorrError, type INarratorrClient } from './narratorr-client.js';
+import { NarratorrError, type IBookStatusClient } from './narratorr-client.js';
 import { UserService } from './user.service.js';
 import type { Notifier, NotificationPayload } from './notifications/index.js';
 import { createTestDb, insertUser } from '../test-support/db.js';
@@ -26,7 +26,7 @@ const noopLogger = {
   level: 'silent',
 } as unknown as FastifyBaseLogger;
 
-class PollClient implements INarratorrClient {
+class PollClient implements IBookStatusClient {
   status: BookStatus = 'downloading';
   error: NarratorrError | null = null;
   throwOnAdd: NarratorrError | null = null;

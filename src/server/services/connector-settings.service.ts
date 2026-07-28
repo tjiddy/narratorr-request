@@ -22,6 +22,7 @@ import type {
   UpdateNotifierBody,
   NotifierTestBody,
   DefaultQuota,
+  ResolvedKindleSender,
 } from '../../shared/schemas/connectors.js';
 import {
   NOTIFIER_REGISTRY,
@@ -243,6 +244,27 @@ export class ConnectorSettingsService {
       // Resolved at READ time against the live decrypted notifiers (no cross-write coordination:
       // notifier CRUD never touches the stored pair — see resolveKindleSender in kindle-sender.ts).
       kindleSender: resolveKindleSender(c.kindleSender, c.notifiers.map((n) => this.toRuntimeNotifier(n))),
+      // Off the row we already fetched (issue #144) — a column, not the blob, so a degraded
+      // envelope read can't flip it. `?? false` covers a row shape older than the column.
+      ebooksEnabled: row?.ebooksEnabled ?? false,
+    };
+  }
+
+  /**
+   * The NARROW read `/api/features` needs (issue #144): the companion-ebook opt-in plus the
+   * resolved Kindle sender, off ONE row read.
+   *
+   * Deliberately not `getDto()`: that endpoint is polled by every active client, and `getDto()`
+   * also computes `requesterEmailWarning`, which sweeps the `users` table. This accessor does the
+   * same single SELECT and reuses the same read-time sender resolution, so the two surfaces can
+   * never disagree about a sender's status.
+   */
+  async getEbookSettings(): Promise<{ ebooksEnabled: boolean; kindleSender: ResolvedKindleSender | null }> {
+    const row = await this.db.query.appSettings.findFirst({ where: eq(appSettings.id, SINGLETON_ID) });
+    const c = this.connectorsFrom(row);
+    return {
+      ebooksEnabled: row?.ebooksEnabled ?? false,
+      kindleSender: resolveKindleSender(c.kindleSender, c.notifiers.map((n) => this.toRuntimeNotifier(n))),
     };
   }
 
@@ -305,6 +327,10 @@ export class ConnectorSettingsService {
           defaultQuotaLimit: q.mode === 'limited' ? q.limit : null,
           defaultQuotaWindowDays: q.windowDays,
         }),
+        // Issue #144 — omit-to-keep, branched on `!== undefined` and NEVER on truthiness: an
+        // explicit `false` is a real write (turning the feature back off), not a no-op. Rides the
+        // same single atomic UPDATE as the quota columns.
+        ...(body.ebooksEnabled !== undefined && { ebooksEnabled: body.ebooksEnabled }),
         updatedAt: new Date(),
       })
       .where(eq(appSettings.id, SINGLETON_ID))

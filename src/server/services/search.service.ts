@@ -1,5 +1,5 @@
 import type { V1AudibleResult } from '../../shared/schemas/v1/metadata.js';
-import type { INarratorrClient } from './narratorr-client.js';
+import type { IMetadataSearchClient } from './narratorr-client.js';
 import { tooManyRequests } from '../util/errors.js';
 
 export interface SearchServiceOptions {
@@ -50,7 +50,7 @@ export class SearchService {
   private readonly maxCacheEntries: number;
 
   constructor(
-    private readonly client: INarratorrClient,
+    private readonly client: IMetadataSearchClient,
     opts: SearchServiceOptions = {},
   ) {
     this.cacheTtlMs = opts.cacheTtlMs ?? 60_000;

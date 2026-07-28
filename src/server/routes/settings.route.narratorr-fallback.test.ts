@@ -28,6 +28,7 @@ import { SettingsService } from '../services/settings.service.js';
 import { ConnectorSettingsService } from '../services/connector-settings.service.js';
 import { SecretCodec, deriveSettingsKey } from '../util/secret-codec.js';
 import { NarratorrClientHolder } from '../services/narratorr-client-holder.js';
+import { FeatureService } from '../services/feature.service.js';
 import { Notifier } from '../services/notifications/index.js';
 import { errorHandlerPlugin } from '../plugins/error-handler.js';
 import { registerSettingsRoutes } from './settings.js';
@@ -48,6 +49,9 @@ async function buildApp(): Promise<FastifyInstance> {
   const deps = {
     connectorSettings,
     narratorr: new NarratorrClientHolder(null),
+    // `reconfigure()` calls `deps.features.invalidate()` on a narratorr save (#144) — wired here
+    // too so the save path can't fail at runtime through this casted builder.
+    features: new FeatureService(new NarratorrClientHolder(null)),
     notifier: new Notifier([], null, silentLog),
     requests: { reconfigureQuota: vi.fn() },
   } as unknown as AppDeps;

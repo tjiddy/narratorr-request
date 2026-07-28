@@ -2,6 +2,7 @@ import type { z } from 'zod';
 import { v1AudibleSearchSchema, type V1AudibleResult } from '../../shared/schemas/v1/metadata.js';
 import { v1BookSchema, type V1Book } from '../../shared/schemas/v1/books.js';
 import { v1SystemSchema, type V1System } from '../../shared/schemas/v1/system.js';
+import { v1CapabilitiesSchema, type V1Capabilities } from '../../shared/schemas/v1/capabilities.js';
 import { errorEnvelopeSchema } from '../../shared/schemas/v1/common.js';
 import { ApiError } from '../util/errors.js';
 
@@ -102,6 +103,19 @@ export class NarratorrClient {
   }
 
   /**
+   * Feature discovery (narratorr #1961) — its OWN endpoint, deliberately not a key on
+   * `/api/v1/system`. Probed WITH the API key (a keyless probe cannot tell "old narratorr" from
+   * "bad key": both answer without the capability body). Contract: a `404` is the ONLY
+   * "unsupported" signal; a `401` is an auth problem and never means unsupported; a 200 body
+   * missing `companionEpub.enabled` is provider drift → CONTRACT_MISMATCH, which the resolver
+   * must treat as transient. Callers branch on `upstreamStatus`, not the code string —
+   * a Fastify JSON 404 yields `HTTP_404` while a reverse-proxy HTML 404 page yields `NON_JSON`.
+   */
+  async getCapabilities(): Promise<V1Capabilities> {
+    return this.request('GET', '/api/v1/capabilities', v1CapabilitiesSchema);
+  }
+
+  /**
    * Connectivity probe for the Settings "Test" button. A bogus book id that returns a
    * structured 404 proves the URL is reachable AND the API key authenticated — so we
    * treat a 404 as success and let any other error (network, 401/403, contract) surface.
@@ -191,4 +205,18 @@ export class NarratorrClient {
   }
 }
 
-export type INarratorrClient = Pick<NarratorrClient, 'searchMetadata' | 'addBook' | 'getBook' | 'getSystem'>;
+export type INarratorrClient = Pick<
+  NarratorrClient,
+  'searchMetadata' | 'addBook' | 'getBook' | 'getSystem' | 'getCapabilities'
+>;
+
+// Per-consumer slices of the full client surface. Each service depends only on the calls it
+// actually makes, so widening `INarratorrClient` (as `getCapabilities` did in issue #144) doesn't
+// structurally force a capability method onto search/handoff/poller fakes that never call one.
+// The swappable `NarratorrClientHolder` satisfies all of them, so production wiring is unchanged.
+/** `SearchService` — metadata search only. */
+export type IMetadataSearchClient = Pick<INarratorrClient, 'searchMetadata'>;
+/** `RequestService` — the approved-request handoff only. */
+export type IBookHandoffClient = Pick<INarratorrClient, 'addBook'>;
+/** `StatusPoller` — lifecycle polling only. */
+export type IBookStatusClient = Pick<INarratorrClient, 'getBook'>;

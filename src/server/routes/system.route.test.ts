@@ -8,6 +8,7 @@ import { NarratorrError, type INarratorrClient } from '../services/narratorr-cli
 import type { V1Book } from '../../shared/schemas/v1/books.js';
 import type { V1System } from '../../shared/schemas/v1/system.js';
 import { systemInfoSchema } from '../../shared/schemas/system.js';
+import type { V1Capabilities } from '../../shared/schemas/v1/capabilities.js';
 
 // A narratorr client whose only interesting method is getSystem — the System card never
 // touches the book methods, so they reject if (unexpectedly) reached.
@@ -20,6 +21,9 @@ function systemClient(getSystem: () => Promise<V1System>): INarratorrClient {
       throw new Error('n/a');
     },
     async getBook(): Promise<V1Book> {
+      throw new Error('n/a');
+    },
+    async getCapabilities(): Promise<V1Capabilities> {
       throw new Error('n/a');
     },
     getSystem,

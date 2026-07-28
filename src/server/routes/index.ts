@@ -8,6 +8,7 @@ import { registerRequestRoutes } from './requests.js';
 import { registerAdminRoutes } from './admin.js';
 import { registerSettingsRoutes } from './settings.js';
 import { registerSystemRoutes } from './system.js';
+import { registerFeatureRoutes } from './features.js';
 
 export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
   registerHealthRoutes(app, deps);
@@ -18,4 +19,5 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
   registerAdminRoutes(app, deps);
   registerSettingsRoutes(app, deps);
   registerSystemRoutes(app, deps);
+  registerFeatureRoutes(app, deps);
 }

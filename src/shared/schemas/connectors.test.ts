@@ -261,6 +261,21 @@ describe('updateConnectorSettingsBodySchema — kindleSender (#143)', () => {
   });
 });
 
+describe('updateConnectorSettingsBodySchema — ebooksEnabled (#144)', () => {
+  it('accepts true, false, and omission (omit-to-keep); there is no null clear', () => {
+    expect(parse({ ebooksEnabled: true }).ebooksEnabled).toBe(true);
+    // The load-bearing half: an explicit `false` must survive as `false`, distinguishable from
+    // the omitted case below. A write path branching on truthiness would collapse the two.
+    expect(parse({ ebooksEnabled: false }).ebooksEnabled).toBe(false);
+    expect(parse({}).ebooksEnabled).toBeUndefined();
+    expect(accepts({ ebooksEnabled: null })).toBe(false);
+  });
+
+  it('rejects a non-boolean (no string/number coercion)', () => {
+    for (const bad of ['true', 'false', 1, 0, {}]) expect(accepts({ ebooksEnabled: bad })).toBe(false);
+  });
+});
+
 describe('storedNotifierSchema — type-lenient persistence boundary', () => {
   it('parses a row whose type is NOT in the registry (round-trips, type: string)', () => {
     const row = { id: 'nf_x', name: 'Legacy', type: 'apprise', events: ['user.pending'], config: { token: 'enc:v1:abc' } };
@@ -323,6 +338,7 @@ describe('connectorSettingsDtoSchema', () => {
       defaultQuota: { mode: 'limited', limit: 10, windowDays: 30 },
       requesterEmailWarning: false,
       kindleSender: null,
+      ebooksEnabled: false,
     };
     expect(connectorSettingsDtoSchema.safeParse(dto).success).toBe(true);
   });
@@ -335,6 +351,7 @@ describe('connectorSettingsDtoSchema', () => {
       defaultQuota: { mode: 'unlimited', windowDays: 30 },
       requesterEmailWarning: false,
       kindleSender: null,
+      ebooksEnabled: true,
     };
     expect(connectorSettingsDtoSchema.parse(dto)).toEqual(dto);
   });
@@ -349,6 +366,7 @@ describe('connectorSettingsDtoSchema', () => {
       defaultQuota: { mode: 'unlimited' as const, windowDays: 30 },
       requesterEmailWarning: false,
       kindleSender,
+      ebooksEnabled: false,
     });
     const resolved = { notifierId: 'nf_1', confirmedFrom: 'Bot@Ex.com', status: 'sender-changed', currentFrom: 'new@ex.com' };
     expect(connectorSettingsDtoSchema.parse(dto(resolved)).kindleSender).toEqual(resolved);
@@ -357,6 +375,28 @@ describe('connectorSettingsDtoSchema', () => {
     }
     expect(connectorSettingsDtoSchema.safeParse(dto({ ...resolved, status: 'bogus' })).success).toBe(false);
     expect(connectorSettingsDtoSchema.safeParse(dto({ notifierId: 'nf_1', confirmedFrom: 'x@y.com' })).success).toBe(false);
+  });
+
+  // Same non-`.strict()` trap as kindleSender above (issue #144): a field added to the
+  // hand-written `ConnectorSettingsDto` interface but FORGOTTEN in this schema compiles fine and
+  // is then silently stripped off the wire, so the Settings page reads the toggle as absent. This
+  // must be asserted on the PARSED OUTPUT — `safeParse().success` stays true either way.
+  it('retains ebooksEnabled through the response schema (both true and false)', () => {
+    const dto = (ebooksEnabled: unknown) => ({
+      publicUrl: null,
+      narratorr: null,
+      notifiers: [],
+      defaultQuota: { mode: 'unlimited' as const, windowDays: 30 },
+      requesterEmailWarning: false,
+      kindleSender: null,
+      ebooksEnabled,
+    });
+    expect(connectorSettingsDtoSchema.parse(dto(true)).ebooksEnabled).toBe(true);
+    expect(connectorSettingsDtoSchema.parse(dto(false)).ebooksEnabled).toBe(false);
+    // Required, and a boolean — not coerced from a truthy/falsy stand-in.
+    expect(connectorSettingsDtoSchema.safeParse(dto(undefined)).success).toBe(false);
+    expect(connectorSettingsDtoSchema.safeParse(dto('true')).success).toBe(false);
+    expect(connectorSettingsDtoSchema.safeParse(dto(1)).success).toBe(false);
   });
 
   it('requires defaultQuota in the masked DTO', () => {
@@ -371,6 +411,7 @@ describe('connectorSettingsDtoSchema', () => {
       defaultQuota: { mode: 'limited', limit: 10, windowDays },
       requesterEmailWarning: false,
       kindleSender: null,
+      ebooksEnabled: false,
     });
     for (const allowed of [1, 7, 30]) {
       expect(connectorSettingsDtoSchema.safeParse(dto(allowed)).success).toBe(true);

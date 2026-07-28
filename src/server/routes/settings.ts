@@ -98,9 +98,26 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: AppDeps): voi
   // Rebuild the live narratorr client + notifier from the freshly-saved DB settings, and
   // refresh the request-quota policy so an edited default limit/window takes effect on the
   // next request (no restart). Notifier-only saves re-apply the same quota — a cheap no-op read.
-  async function reconfigure(): Promise<void> {
+  //
+  // `narratorrChanged` (issue #144) retires the cached companion-ebook capability. Three things
+  // about that call are load-bearing:
+  //   • It sits on the statement IMMEDIATELY after the holder swap, with no `await` between them.
+  //     `/api/features` reads deliberately do NOT take `writeLock` (a capability read must not
+  //     block on a settings save), so a bump placed after this function's remaining awaits would
+  //     leave a real window in which a concurrent read sees the NEW holder paired with the OLD
+  //     generation's entry. One synchronous run-to-completion step closes that window by
+  //     construction — it is what substitutes for a shared lock here.
+  //   • It runs BEFORE the fallible tail. If either later read rejects, the PUT 500s — but the DB
+  //     update has already committed and the holder has already swapped, so a bump after the tail
+  //     would be skipped and strand the new connection with the previous generation's cache.
+  //   • It is CONDITIONAL. This function rebuilds the client on every notifier save even when the
+  //     connection didn't change; bumping unconditionally would discard a valid capability result
+  //     and its 15-minute stale budget on every notifier save, quota edit, public-URL edit,
+  //     Kindle-sender selection and ebook-toggle save.
+  async function reconfigure(narratorrChanged = false): Promise<void> {
     const ncfg = await deps.connectorSettings.getNarratorrConfig();
     deps.narratorr.set(ncfg ? new NarratorrClient({ baseUrl: ncfg.url, apiKey: ncfg.apiKey }) : null);
+    if (narratorrChanged) deps.features.invalidate();
     deps.notifier = buildNotifier(await deps.connectorSettings.getNotificationsConfig(), app.log);
     deps.requests.reconfigureQuota(await deps.connectorSettings.getDefaultQuota());
   }
@@ -121,7 +138,11 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: AppDeps): voi
       requireAdmin(request);
       return writeLock.run(async () => {
         await deps.connectorSettings.update(request.body);
-        await reconfigure();
+        // `body.narratorr !== undefined` is exhaustive: it is the only input that can change the
+        // stored connection (`ConnectorSettingsService.update()` assigns `next.narratorr` solely
+        // under that condition). Re-saving the card with unchanged values does invalidate — one
+        // redundant probe, accepted over a before/after config comparison.
+        await reconfigure(request.body.narratorr !== undefined);
         return deps.connectorSettings.getDto();
       });
     },

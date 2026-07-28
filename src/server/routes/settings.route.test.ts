@@ -20,12 +20,15 @@ import { SettingsService } from '../services/settings.service.js';
 import { ConnectorSettingsService } from '../services/connector-settings.service.js';
 import { SecretCodec, deriveSettingsKey } from '../util/secret-codec.js';
 import { NarratorrClientHolder } from '../services/narratorr-client-holder.js';
+import { FeatureService } from '../services/feature.service.js';
 import { Notifier } from '../services/notifications/index.js';
 import { errorHandlerPlugin } from '../plugins/error-handler.js';
 import { registerSettingsRoutes } from './settings.js';
+import { registerFeatureRoutes } from './features.js';
 import type { AppDeps } from '../services/deps.js';
 import type { AuthUser } from '../types.js';
 import type { CreateNotifierBody } from '../../shared/schemas/connectors.js';
+import type { V1Capabilities } from '../../shared/schemas/v1/capabilities.js';
 
 const codec = new SecretCodec(deriveSettingsKey({ sessionSecret: 'route-test' }));
 const silentLog = { info() {}, warn() {}, error() {}, debug() {} };
@@ -38,15 +41,39 @@ let deps: AppDeps;
 let db: Db;
 let connectorSettings: ConnectorSettingsService;
 let narratorr: NarratorrClientHolder;
+let features: FeatureService;
+let invalidate: ReturnType<typeof vi.spyOn>;
+let capability: CountingCapabilityClient;
+
+/**
+ * The upstream the capability resolver probes (issue #144), counting calls so a test can tell a
+ * cache hit from a re-probe. Deliberately handed to `FeatureService` DIRECTLY rather than through
+ * `narratorr`: `reconfigure()` replaces the holder's inner client with a REAL `NarratorrClient`
+ * pointed at the saved URL, which would turn every probe here into an actual socket. Bypassing the
+ * holder isolates what these tests are about — whether the generation was bumped — from the
+ * network. The holder swap itself is asserted separately via `narratorr.configured`.
+ */
+class CountingCapabilityClient {
+  calls = 0;
+  enabled = true;
+  async getCapabilities(): Promise<V1Capabilities> {
+    this.calls += 1;
+    return { companionEpub: { enabled: this.enabled } };
+  }
+}
 
 async function buildApp(): Promise<FastifyInstance> {
   db = await createTestDb();
   await new SettingsService(db).ensure();
   connectorSettings = new ConnectorSettingsService(db, codec);
   narratorr = new NarratorrClientHolder(null);
+  capability = new CountingCapabilityClient();
+  features = new FeatureService(capability);
+  invalidate = vi.spyOn(features, 'invalidate');
   deps = {
     connectorSettings,
     narratorr,
+    features,
     notifier: new Notifier([], null, silentLog),
     // reconfigure() refreshes the request-quota policy on every connector/notifier save.
     requests: { reconfigureQuota: vi.fn() },
@@ -63,6 +90,9 @@ async function buildApp(): Promise<FastifyInstance> {
     else if (role === 'user') req.user = USER;
   });
   registerSettingsRoutes(f, deps);
+  // Registered alongside so the AC16 tests can observe the generation through the real consumer
+  // surface (`/api/features` re-probes vs. serves the cached value), not just the spy.
+  registerFeatureRoutes(f, deps);
   await f.ready();
   return f;
 }

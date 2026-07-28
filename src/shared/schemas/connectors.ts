@@ -290,6 +290,10 @@ export const connectorSettingsDtoSchema = z.object({
   // AND the hand-written interface below must carry it: the response object is non-`.strict()`,
   // so a field the mapper emits but the schema omits is silently stripped off the wire.
   kindleSender: resolvedKindleSenderSchema.nullable(),
+  // The Requests-side companion-ebook opt-in (issue #144) — the app-side half of `ebooksEnabled`
+  // (AND-ed with narratorr's own capability at `/api/features`). Column-backed, NOT part of the
+  // encrypted `connectors` blob. Same schema+interface pairing trap as `kindleSender` above.
+  ebooksEnabled: z.boolean(),
 });
 /** Hand-written (the runtime schema's `notifiers` infers `unknown[]`; this keeps it typed). */
 export interface ConnectorSettingsDto {
@@ -299,6 +303,7 @@ export interface ConnectorSettingsDto {
   defaultQuota: DefaultQuota;
   requesterEmailWarning: boolean;
   kindleSender: ResolvedKindleSender | null;
+  ebooksEnabled: boolean;
 }
 
 // ---- narratorr connector (shared by PUT + Test) -----------------------------
@@ -328,6 +333,11 @@ export const updateConnectorSettingsBodySchema = z
     // trusted. Field semantics mirror publicUrl: omitted → keep, null → clear, object → set
     // (re-sending an unchanged id is the meaningful RECONFIRM write).
     kindleSender: z.object({ notifierId: z.string().min(1) }).strict().nullable().optional(),
+    // The companion-ebook opt-in (issue #144). Omitted → keep, `true`/`false` → set (mirroring
+    // `defaultQuota`'s omit-to-keep semantics; there is no `null` clear for a boolean). The write
+    // path must branch on `!== undefined`, never on truthiness — a truthiness test would turn an
+    // explicit `false` into a silent no-op and make the feature impossible to turn back off.
+    ebooksEnabled: z.boolean().optional(),
   })
   .strict();
 export type UpdateConnectorSettingsBody = z.infer<typeof updateConnectorSettingsBodySchema>;

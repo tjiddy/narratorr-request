@@ -6,6 +6,7 @@ import { registerSettingsRoutes } from './settings.js';
 import { NarratorrError, type INarratorrClient } from '../services/narratorr-client.js';
 import type { V1Book } from '../../shared/schemas/v1/books.js';
 import type { V1System } from '../../shared/schemas/v1/system.js';
+import type { V1Capabilities } from '../../shared/schemas/v1/capabilities.js';
 
 let h: RouteHarness;
 beforeEach(async () => {
@@ -77,6 +78,9 @@ describe('POST /api/requests — terminal handoff failure emits request.failed',
     }
     async getSystem(): Promise<V1System> {
       return { version: 'v1.0.0' };
+    }
+    async getCapabilities(): Promise<V1Capabilities> {
+      return { companionEpub: { enabled: false } };
     }
   }
 

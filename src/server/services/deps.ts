@@ -9,6 +9,7 @@ import type { OidcProviderConfig } from '../config.js';
 import type { Notifier } from './notifications/index.js';
 import type { ConnectorSettingsService } from './connector-settings.service.js';
 import type { NarratorrClientHolder } from './narratorr-client-holder.js';
+import type { FeatureService } from './feature.service.js';
 
 /** Wired-up service container handed to the route registrars. */
 export interface AppDeps {
@@ -22,6 +23,8 @@ export interface AppDeps {
   connectorSettings: ConnectorSettingsService;
   /** Swappable narratorr client — rebuilt live when the connection is saved. */
   narratorr: NarratorrClientHolder;
+  /** Total, cached companion-ebook capability resolver; invalidated on a narratorr connection change. */
+  features: FeatureService;
   /** Fire-and-forget notification dispatcher; reassigned live when channels are saved. */
   notifier: Notifier;
   /** Configured OIDC providers (login service + display config), keyed by provider id.

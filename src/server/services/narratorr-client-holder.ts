@@ -47,4 +47,8 @@ export class NarratorrClientHolder implements INarratorrClient {
   getSystem() {
     return this.require().getSystem();
   }
+
+  getCapabilities() {
+    return this.require().getCapabilities();
+  }
 }

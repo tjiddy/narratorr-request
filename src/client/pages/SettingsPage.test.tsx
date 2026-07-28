@@ -40,6 +40,7 @@ const dto = (over: Partial<ConnectorSettingsDto> = {}): ConnectorSettingsDto => 
   defaultQuota: { mode: 'limited', limit: 10, windowDays: 30 },
   requesterEmailWarning: false,
   kindleSender: null,
+  ebooksEnabled: false,
   ...over,
 });
 
