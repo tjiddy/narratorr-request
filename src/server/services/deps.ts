@@ -21,9 +21,10 @@ export interface AppDeps {
   search: SearchService;
   /** Connector config (narratorr + notifications) read/written by the Settings page. */
   connectorSettings: ConnectorSettingsService;
-  /** Swappable narratorr client — rebuilt live when the connection is saved. */
+  /** The swappable narratorr connection (JSON + raw stream) — rebuilt live when it is saved. */
   narratorr: NarratorrClientHolder;
-  /** Total, cached companion-ebook capability resolver; invalidated on a narratorr connection change. */
+  /** Total, cached companion-ebook capability resolver; keyed to {@link narratorr}'s generation,
+   *  so a connection swap retires the previous server's cached answer by construction. */
   features: FeatureService;
   /** Fire-and-forget notification dispatcher; reassigned live when channels are saved. */
   notifier: Notifier;
