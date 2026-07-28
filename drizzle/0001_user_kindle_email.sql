@@ -1,0 +1,1 @@
+ALTER TABLE `users` ADD `kindle_email` text;

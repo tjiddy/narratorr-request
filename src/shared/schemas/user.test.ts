@@ -10,6 +10,7 @@ import {
   hasNotifyOn,
   updateMeBodySchema,
   contactEmailSchema,
+  kindleEmailSchema,
   normalizeContactEmail,
   hasDeliverableContact,
 } from './user.js';
@@ -189,6 +190,67 @@ describe('contactEmailSchema / normalizeContactEmail / hasDeliverableContact (is
   });
 });
 
+describe('kindleEmailSchema — Send-to-Kindle device address (#142)', () => {
+  describe('accepts + normalizes a real kindle.com address', () => {
+    it('trims and lowercases before the domain check runs (post-normalization refinement)', () => {
+      expect(kindleEmailSchema.parse('  USER@KINDLE.COM ')).toBe('user@kindle.com');
+      expect(kindleEmailSchema.parse('User@Kindle.Com')).toBe('user@kindle.com');
+    });
+    it('accepts the dot/plus local-part forms Amazon issues', () => {
+      expect(kindleEmailSchema.parse('a.b+tag@kindle.com')).toBe('a.b+tag@kindle.com');
+    });
+  });
+
+  // Each rejection is asserted individually so a broadened matcher (a bare `.endsWith` or
+  // `.includes`) fails loudly on the exact case it would let through.
+  describe('rejects anything whose domain is not exactly kindle.com', () => {
+    it('rejects a subdomain (a@sub.kindle.com)', () => {
+      expect(kindleEmailSchema.safeParse('a@sub.kindle.com').success).toBe(false);
+    });
+    it('rejects a suffix-match lookalike (a@notkindle.com)', () => {
+      expect(kindleEmailSchema.safeParse('a@notkindle.com').success).toBe(false);
+    });
+    it('rejects a suffix-match lookalike (a@evilkindle.com)', () => {
+      expect(kindleEmailSchema.safeParse('a@evilkindle.com').success).toBe(false);
+    });
+    it('rejects a contains-match lookalike (a@kindle.com.evil.io)', () => {
+      expect(kindleEmailSchema.safeParse('a@kindle.com.evil.io').success).toBe(false);
+    });
+    it('rejects a near-miss TLD (a@kindle.co)', () => {
+      expect(kindleEmailSchema.safeParse('a@kindle.co').success).toBe(false);
+    });
+    it('rejects an ordinary contact domain (a@example.com)', () => {
+      expect(kindleEmailSchema.safeParse('a@example.com').success).toBe(false);
+    });
+    // Amazon's Wi-Fi-only free-delivery domain is deliberately NOT accepted (spec Open Question):
+    // widening the domain set is a product decision, not something to broaden silently.
+    it('rejects the free-delivery domain (a@free.kindle.com) — deliberately out of scope', () => {
+      expect(kindleEmailSchema.safeParse('a@free.kindle.com').success).toBe(false);
+    });
+  });
+
+  describe('inherits the shared mailbox contract from contactEmailSchema', () => {
+    it('rejects a structurally invalid address', () => {
+      expect(kindleEmailSchema.safeParse('not-an-email').success).toBe(false);
+      expect(kindleEmailSchema.safeParse('kindle.com').success).toBe(false);
+    });
+    it('rejects "" and whitespace-only (clearing is kindleEmail: null only)', () => {
+      expect(kindleEmailSchema.safeParse('').success).toBe(false);
+      expect(kindleEmailSchema.safeParse('   ').success).toBe(false);
+    });
+    it('rejects an over-254 address', () => {
+      expect(kindleEmailSchema.safeParse(`${'a'.repeat(250)}@kindle.com`).success).toBe(false);
+    });
+  });
+
+  it('does NOT leak its domain constraint back into the shared contactEmailSchema', () => {
+    // kindleEmailSchema is DERIVED from contactEmailSchema; a refinement applied to the shared
+    // schema in place (rather than to a derived copy) would break every contact-email caller.
+    expect(contactEmailSchema.parse('a@example.com')).toBe('a@example.com');
+    expect(contactEmailSchema.parse('  Todd@Example.COM ')).toBe('todd@example.com');
+  });
+});
+
 describe('NOTIFIABLE_TRANSITIONS — requester opt-in (#50/#131)', () => {
   it('ships approved/denied/available in lifecycle order — each has a live emit site', () => {
     expect(NOTIFIABLE_TRANSITIONS).toEqual(['approved', 'denied', 'available']);
@@ -271,6 +333,50 @@ describe('updateMeBodySchema (PATCH /api/me)', () => {
       expect(updateMeBodySchema.safeParse({ email: 'not-an-email' }).success).toBe(false);
       expect(updateMeBodySchema.safeParse({ email: '   ' }).success).toBe(false);
       expect(updateMeBodySchema.safeParse({ email: `${'a'.repeat(250)}@example.com` }).success).toBe(false);
+    });
+  });
+
+  describe('kindleEmail — set / clear / omit contract (#142)', () => {
+    it('a valid Kindle address is normalized by the shared kindleEmailSchema', () => {
+      const parsed = updateMeBodySchema.safeParse({ kindleEmail: '  Todd@KINDLE.com ' });
+      expect(parsed.success).toBe(true);
+      if (parsed.success) expect(parsed.data.kindleEmail).toBe('todd@kindle.com');
+    });
+    it('kindleEmail null is valid — the clear sentinel', () => {
+      const parsed = updateMeBodySchema.safeParse({ kindleEmail: null });
+      expect(parsed.success).toBe(true);
+      if (parsed.success) expect(parsed.data.kindleEmail).toBeNull();
+    });
+    it('omitting kindleEmail is valid — no change (an empty body stays a no-op)', () => {
+      expect(updateMeBodySchema.safeParse({}).success).toBe(true);
+      expect(updateMeBodySchema.safeParse({ notifyOn: ['available'] }).success).toBe(true);
+    });
+    it('kindleEmail "" is a 400 (NOT a clear) — same semantics as email', () => {
+      expect(updateMeBodySchema.safeParse({ kindleEmail: '' }).success).toBe(false);
+      expect(updateMeBodySchema.safeParse({ kindleEmail: '   ' }).success).toBe(false);
+    });
+    it('rejects a non-kindle.com domain (→ 400)', () => {
+      expect(updateMeBodySchema.safeParse({ kindleEmail: 'a@example.com' }).success).toBe(false);
+      expect(updateMeBodySchema.safeParse({ kindleEmail: 'a@evilkindle.com' }).success).toBe(false);
+    });
+
+    // The three self-scoped fields are mutually independent: every subset must parse.
+    it('parses every subset of { notifyOn, email, kindleEmail }', () => {
+      const subsets: Record<string, unknown>[] = [
+        {},
+        { notifyOn: ['approved'] },
+        { email: 'a@b.com' },
+        { kindleEmail: 'a@kindle.com' },
+        { notifyOn: ['approved'], email: 'a@b.com' },
+        { notifyOn: ['approved'], kindleEmail: 'a@kindle.com' },
+        { email: 'a@b.com', kindleEmail: 'a@kindle.com' },
+        { notifyOn: ['approved'], email: 'a@b.com', kindleEmail: 'a@kindle.com' },
+        { email: null, kindleEmail: null },
+      ];
+      for (const body of subsets) expect(updateMeBodySchema.safeParse(body).success).toBe(true);
+    });
+    it('stays strict — a stray key alongside kindleEmail is rejected', () => {
+      expect(updateMeBodySchema.safeParse({ kindleEmail: 'a@kindle.com', role: 'admin' }).success).toBe(false);
     });
   });
 });
