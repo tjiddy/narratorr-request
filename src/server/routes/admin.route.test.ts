@@ -256,6 +256,49 @@ describe('GET /api/admin/users — no passwordHash leak', () => {
   });
 });
 
+// issue #142 — the Send-to-Kindle device address is SELF-SCOPED PII: it lives on `MeDto` only and
+// must never reach an admin surface, neither as a key nor as a value. Mirrors the passwordHash pair
+// above: a direct `toDto` assertion (the mapper is the real guard) plus route-body assertions.
+describe('admin surfaces never expose users.kindle_email (#142)', () => {
+  const KINDLE = 'seeded-device@kindle.com';
+
+  it('toDto() omits kindleEmail even when the source UserRow carries one', async () => {
+    const seeded = await insertUser(h.db, { role: 'user', status: 'active', kindleEmail: KINDLE });
+    const row = await h.users.getById(seeded.id);
+    expect(row?.kindleEmail).toBe(KINDLE); // the source genuinely has it
+    // The mapper — not the HTTP serializer — is the guard. `userDtoSchema` is a NON-strict
+    // z.object, so Zod would silently strip an added key on the way out and a response-body
+    // assertion alone would still pass with a leaking mapper.
+    const dto = h.users.toDto(row!);
+    expect('kindleEmail' in dto).toBe(false);
+  });
+
+  it('GET /api/admin/users carries neither the key nor the address value', async () => {
+    const admin = await insertUser(h.db, { role: 'admin', status: 'active' });
+    await insertUser(h.db, { role: 'user', status: 'active', username: 'kindler', kindleEmail: KINDLE });
+
+    const res = await h.app.inject({ method: 'GET', url: '/api/admin/users', cookies: h.cookieFor(admin) });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().data.some((u: Record<string, unknown>) => 'kindleEmail' in u)).toBe(false);
+    // Assert on the RAW payload string: a value smuggled under any key name still fails here.
+    expect(res.payload).not.toContain('kindleEmail');
+    expect(res.payload).not.toContain(KINDLE);
+  });
+
+  it('PATCH /api/admin/users/:publicId carries neither the key nor the address value', async () => {
+    const admin = await insertUser(h.db, { role: 'admin', status: 'active' });
+    const target = await insertUser(h.db, { role: 'user', status: 'active', username: 'kindler', kindleEmail: KINDLE });
+
+    const res = await patchUser(h.cookieFor(admin), target.publicId, { autoApprove: true });
+    expect(res.statusCode).toBe(200);
+    expect('kindleEmail' in res.json()).toBe(false);
+    expect(res.payload).not.toContain('kindleEmail');
+    expect(res.payload).not.toContain(KINDLE);
+    // The admin write left the column alone — it isn't reachable from this surface at all.
+    expect((await h.users.getById(target.id))?.kindleEmail).toBe(KINDLE);
+  });
+});
+
 // F2 — the two userDtoSchema-bearing surfaces (GET list + PATCH response) must carry the
 // mode-based `requestQuota` union, not the old nullable number. These assert the response BODY
 // shape at the route boundary so a regression to the old shape, a dropped `limit` on a limited

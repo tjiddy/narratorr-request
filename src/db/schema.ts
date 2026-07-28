@@ -28,6 +28,13 @@ export const users = sqliteTable(
     // authenticate via the password path).
     passwordHash: text('password_hash'),
     email: text('email'),
+    // The user's own Send-to-Kindle device address (issue #142) — the destination an ebook is
+    // delivered to, NEVER a contact/notification address. Self-scoped: written only via
+    // `PATCH /api/me` and read only onto `MeDto`; no admin surface exposes or edits it.
+    // Nullable and INDEPENDENT of `email` — deliberately NO CHECK coupling the two columns:
+    // a predicate over two nullable columns hits the sqlite-check-null-is-satisfied trap (see
+    // the request_quota check below), and the two addresses have genuinely unrelated lifecycles.
+    kindleEmail: text('kindle_email'),
     thumb: text('thumb'),
     role: text('role', { enum: USER_ROLES }).notNull().default('user'),
     // Approval state (orthogonal to role). New users land 'pending'; an admin

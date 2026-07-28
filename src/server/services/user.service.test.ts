@@ -141,6 +141,45 @@ describe('UserService OIDC upsert + approval queue', () => {
     });
   });
 
+  describe('setKindleEmail — self-scoped Kindle-address write (#142)', () => {
+    it('sets then clears the Kindle address, touching no other column on the row', async () => {
+      const seeded = await insertUser(db, { role: 'admin', status: 'active', email: 'contact@x.com' });
+      await svc.setNotifyOn(seeded.id, ['approved']);
+      const before = await svc.getById(seeded.id);
+      expect(before?.kindleEmail).toBeNull(); // a user who never set one reads null
+
+      const set = await svc.setKindleEmail(seeded.id, 'device@kindle.com');
+      expect(set.kindleEmail).toBe('device@kindle.com');
+      // The sibling columns a shared write path could clobber.
+      expect(set).toMatchObject({
+        email: 'contact@x.com',
+        notifyOn: ['approved'],
+        role: 'admin',
+        status: 'active',
+        requestQuotaMode: before?.requestQuotaMode,
+        authSubject: seeded.authSubject,
+      });
+
+      const cleared = await svc.setKindleEmail(seeded.id, null);
+      expect(cleared.kindleEmail).toBeNull();
+      expect(cleared).toMatchObject({ email: 'contact@x.com', notifyOn: ['approved'], role: 'admin', status: 'active' });
+    });
+
+    it('mutates only the target row — a second user is unaffected', async () => {
+      const alice = await insertUser(db, { username: 'alice' });
+      const bob = await insertUser(db, { username: 'bob' });
+
+      await svc.setKindleEmail(bob.id, 'bob@kindle.com');
+
+      expect((await svc.getById(alice.id))?.kindleEmail).toBeNull();
+      expect((await svc.getById(bob.id))?.kindleEmail).toBe('bob@kindle.com');
+    });
+
+    it('throws not-found for an unknown user id', async () => {
+      await expect(svc.setKindleEmail(9999, 'x@kindle.com')).rejects.toMatchObject({ statusCode: 404 });
+    });
+  });
+
   // issue #120: an OIDC email claim now passes through the deliverability gate in the mapper
   // before reaching upsert. These pin the mapper→upsert chain: a garbage/over-length claim maps
   // to null, and null routes through the existing coalesce exactly like an absent claim.

@@ -32,8 +32,13 @@ export async function insertUser(
     provider?: string;
     subject?: string;
     passwordHash?: string | null;
+    /** Stored CONTACT address (`users.email`) — the notification destination, not the login subject. */
+    email?: string | null;
+    /** Stored Send-to-Kindle device address (`users.kindle_email`, issue #142). Self-scoped PII;
+     *  seeded directly here so the non-exposure tests can prove no admin surface serializes it. */
+    kindleEmail?: string | null;
   } = {},
-): Promise<{ id: number; publicId: string; role: Role; status: UserStatus }> {
+): Promise<{ id: number; publicId: string; role: Role; status: UserStatus; authSubject: string }> {
   const quota = opts.requestQuota ?? { mode: 'inherit' };
   const [row] = await db
     .insert(users)
@@ -43,6 +48,8 @@ export async function insertUser(
       authSubject: opts.subject ?? publicId('sub'),
       username: opts.username ?? 'tester',
       passwordHash: opts.passwordHash ?? null,
+      email: opts.email ?? null,
+      kindleEmail: opts.kindleEmail ?? null,
       // Default to active so existing tests that create requesters keep working; the
       // approval queue is exercised explicitly where it matters.
       status: opts.status ?? 'active',
@@ -53,7 +60,7 @@ export async function insertUser(
     })
     .returning();
   if (!row) throw new Error('failed to insert test user');
-  return { id: row.id, publicId: row.publicId, role: row.role, status: row.status };
+  return { id: row.id, publicId: row.publicId, role: row.role, status: row.status, authSubject: row.authSubject };
 }
 
 /** Delete a user row by id — exercises the real session-lookup-miss boundary in tests. */
