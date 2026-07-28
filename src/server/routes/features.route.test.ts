@@ -1,9 +1,9 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { buildRouteApp, type RouteHarness } from '../test-support/route-harness.js';
 import { insertUser } from '../test-support/db.js';
-import { registerFeatureRoutes, deriveFeatures } from './features.js';
+import { registerFeatureRoutes } from './features.js';
 import { FEATURES_OFF, featuresDtoSchema } from '../../shared/schemas/features.js';
-import type { ResolvedKindleSender, CreateNotifierBody } from '../../shared/schemas/connectors.js';
+import type { CreateNotifierBody } from '../../shared/schemas/connectors.js';
 
 // `GET /api/features` (issue #144). The endpoint is polled by every active client and is the SPA's
 // only view of derived feature state, so the two properties it must never violate are: it is
@@ -178,52 +178,5 @@ describe('GET /api/features — instance-level, not per-user', () => {
   });
 });
 
-// The response schema is non-`.strict()`, so it silently strips anything the mapper leaks —
-// meaning a route-body assertion alone cannot prove the DERIVATION is right. Pin it directly.
-describe('deriveFeatures (the derivation itself)', () => {
-  const ok: ResolvedKindleSender = {
-    notifierId: 'nf_1',
-    confirmedFrom: 'bot@ex.com',
-    status: 'ok',
-    currentFrom: 'bot@ex.com',
-  };
-
-  it('ANDs the two flags', () => {
-    expect(deriveFeatures({ adminToggle: true, capability: true, kindleSender: null }).ebooksEnabled).toBe(true);
-    for (const [adminToggle, capability] of [
-      [true, false],
-      [false, true],
-      [false, false],
-    ] as const) {
-      expect(deriveFeatures({ adminToggle, capability, kindleSender: ok })).toEqual(FEATURES_OFF);
-    }
-  });
-
-  it('yields the confirmed address only at status `ok`', () => {
-    expect(deriveFeatures({ adminToggle: true, capability: true, kindleSender: ok })).toEqual({
-      ebooksEnabled: true,
-      kindleDeliveryAvailable: true,
-      kindleSenderEmail: 'bot@ex.com',
-    });
-    for (const status of ['notifier-missing', 'not-email', 'config-unusable', 'from-unparseable', 'sender-changed'] as const) {
-      expect(deriveFeatures({ adminToggle: true, capability: true, kindleSender: { ...ok, status } })).toEqual({
-        ebooksEnabled: true,
-        kindleDeliveryAvailable: false,
-        kindleSenderEmail: null,
-      });
-    }
-  });
-
-  it('holds the invariant chain for every input combination', () => {
-    for (const adminToggle of [true, false]) {
-      for (const capability of [true, false]) {
-        for (const kindleSender of [null, ok, { ...ok, status: 'sender-changed' as const }]) {
-          const dto = deriveFeatures({ adminToggle, capability, kindleSender });
-          if (!dto.ebooksEnabled) expect(dto.kindleDeliveryAvailable).toBe(false);
-          if (!dto.kindleDeliveryAvailable) expect(dto.kindleSenderEmail).toBeNull();
-          expect(featuresDtoSchema.parse(dto)).toEqual(dto);
-        }
-      }
-    }
-  });
-});
+// The derivation itself (`deriveFeatures`) moved to `services/feature-state.ts` with the shared
+// resolver (issue #146 AC5); its unit tests live beside it in `services/feature-state.test.ts`.

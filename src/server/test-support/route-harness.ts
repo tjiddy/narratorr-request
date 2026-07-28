@@ -17,6 +17,7 @@ import { SecretCodec, deriveSettingsKey } from '../util/secret-codec.js';
 import { errorHandlerPlugin } from '../plugins/error-handler.js';
 import { authRateLimitOptions } from '../plugins/rate-limit.js';
 import { authPlugin, SESSION_COOKIE } from '../plugins/auth.js';
+import { registerNotFoundHandler } from '../routes/not-found.js';
 import { createSessionToken } from '../util/session.js';
 import type { Db } from '../../db/client.js';
 import type { AppConfig } from '../config.js';
@@ -96,17 +97,51 @@ export class FakeEbookStreamClient implements IEbookStreamClient {
   contentType: string | null = 'application/epub+zip';
   /** The bytes the returned stream yields — set to size the fake companion per test. */
   bytes: Uint8Array = new Uint8Array([1, 2, 3]);
+  /**
+   * Split {@link bytes} across this many chunks (default: one). The proxy route reads the FIRST
+   * chunk before committing any header, so a multi-chunk body is what distinguishes "streamed"
+   * from "buffered whole and re-emitted".
+   */
+  chunks = 1;
+  /**
+   * Override the advertised content-length. `undefined` means "the real byte length"; `null`
+   * means the header was absent upstream (chunked). Set `0` for the zero-length companion.
+   */
+  contentLength: number | null | undefined = undefined;
+  /** Reject `openCompanionEpub()` itself — the header-phase failure. */
+  openError: unknown = null;
+  /** Reject the FIRST `read()`, before any header can be committed (AC25). */
+  firstReadError: unknown = null;
+  /** Reject AFTER the first chunk has been handed over (AC24's mid-body failure). */
+  midStreamError: unknown = null;
+  /** The `opts.signal` of the most recent open, so a test can observe the abort wiring. */
+  lastSignal: AbortSignal | undefined = undefined;
+  /** Awaited before the open resolves — lets a test park the handler mid-header-phase. */
+  beforeOpen: (() => Promise<void>) | null = null;
 
-  async openCompanionEpub(publicId: string): Promise<NarratorrEbookStream> {
+  async openCompanionEpub(publicId: string, opts: { signal?: AbortSignal } = {}): Promise<NarratorrEbookStream> {
+    this.lastSignal = opts.signal;
+    if (this.beforeOpen) await this.beforeOpen();
     this.opened.push(publicId);
-    const bytes = this.bytes;
+    if (this.openError) throw this.openError;
+    const { bytes, chunks, firstReadError, midStreamError } = this;
+    const size = Math.max(1, Math.ceil(bytes.byteLength / Math.max(1, chunks)));
+    let offset = 0;
+    let served = 0;
     return {
       contentType: this.contentType,
-      contentLength: bytes.byteLength,
+      contentLength: this.contentLength === undefined ? bytes.byteLength : this.contentLength,
       body: new ReadableStream<Uint8Array>({
-        start(controller) {
-          controller.enqueue(bytes);
-          controller.close();
+        pull(controller) {
+          if (served === 0 && firstReadError) throw firstReadError;
+          if (served > 0 && midStreamError) throw midStreamError;
+          if (offset >= bytes.byteLength) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(bytes.subarray(offset, offset + size));
+          offset += size;
+          served += 1;
         },
       }),
     };
@@ -287,6 +322,11 @@ export async function buildRouteApp(opts: BuildRouteAppOpts): Promise<RouteHarne
     });
   }
   opts.register(app, deps);
+  // Production's 404, via the SHARED registrar (issue #146 AC35). Without it a route test would
+  // assert Fastify's default not-found body, which no client of this app ever receives — and the
+  // router-miss shapes for `/api/ebooks/:bookId/download` are precisely the ones that answer here
+  // rather than in a handler. `serveClient: false` matches the API-only boot branch.
+  registerNotFoundHandler(app, { serveClient: false });
   await app.ready();
 
   return {

@@ -9,6 +9,7 @@ import { registerAdminRoutes } from './admin.js';
 import { registerSettingsRoutes } from './settings.js';
 import { registerSystemRoutes } from './system.js';
 import { registerFeatureRoutes } from './features.js';
+import { registerEbookRoutes } from './ebooks.js';
 
 export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
   registerHealthRoutes(app, deps);
@@ -20,4 +21,5 @@ export function registerRoutes(app: FastifyInstance, deps: AppDeps): void {
   registerSettingsRoutes(app, deps);
   registerSystemRoutes(app, deps);
   registerFeatureRoutes(app, deps);
+  registerEbookRoutes(app, deps);
 }

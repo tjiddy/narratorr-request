@@ -26,7 +26,7 @@ import { authRateLimitOptions } from './plugins/rate-limit.js';
 import { authPlugin } from './plugins/auth.js';
 import { buildHelmetOptions } from './plugins/helmet-options.js';
 import { registerRoutes } from './routes/index.js';
-import { errorBody } from '../shared/schemas/v1/common.js';
+import { registerNotFoundHandler } from './routes/not-found.js';
 import type { AppDeps } from './services/deps.js';
 import './types.js';
 
@@ -135,19 +135,9 @@ async function main(): Promise<void> {
 
   registerRoutes(app, deps);
 
-  if (serveClient) {
-    await app.register(fastifyStatic, { root: clientDir, wildcard: false });
-    app.setNotFoundHandler((request, reply) => {
-      if (request.method === 'GET' && !request.url.startsWith('/api/')) {
-        return reply.sendFile('index.html');
-      }
-      return reply.status(404).send(errorBody('NOT_FOUND', `Route ${request.method} ${request.url} not found`));
-    });
-  } else {
-    app.setNotFoundHandler((request, reply) =>
-      reply.status(404).send(errorBody('NOT_FOUND', `Route ${request.method} ${request.url} not found`)),
-    );
-  }
+  if (serveClient) await app.register(fastifyStatic, { root: clientDir, wildcard: false });
+  // One registrar, shared with the route-test harness (issue #146 AC35) — the two cannot drift.
+  registerNotFoundHandler(app, { serveClient });
 
   await app.listen({ port: config.port, host: config.bindHost });
   app.log.info(
