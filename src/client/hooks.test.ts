@@ -422,11 +422,41 @@ describe('useUpdateMe — account save with proportional feedback (#50, #134)', 
     expect(hoisted.api.updateMe).toHaveBeenCalledWith({ notifyOn: ['available'] });
   });
 
-  it('writes the returned DTO into the me cache directly (not invalidate) for every payload shape', () => {
-    cb(useUpdateMe()).onSuccess(dto, { email: 'new@x.com' });
-    expect(hoisted.qc.setQueryData).toHaveBeenCalledWith(qk.me, dto);
-    expect(hoisted.qc.setQueryData).toHaveBeenCalledWith(['me'], dto); // key verbatim, no drift
-    cb(useUpdateMe()).onSuccess(dto, { notifyOn: ['available'] });
+  // The cache write is a FUNCTIONAL update (#142 F1): the two account rows own independent mutation
+  // instances, so an earlier request settling last must not roll back a newer sibling save. Drive the
+  // updater the hook handed to setQueryData and assert the folded RESULT, not just that it was called.
+  const applyMeUpdate = (call: number, prev: MeDto | undefined): MeDto => {
+    const [key, updater] = hoisted.qc.setQueryData.mock.calls[call] as [
+      unknown,
+      (p: MeDto | undefined) => MeDto,
+    ];
+    expect(key).toEqual(['me']); // key verbatim, no drift
+    return updater(prev);
+  };
+
+  it('folds the returned DTO into the me cache directly (not invalidate) for every payload shape', () => {
+    const cached = { email: 'old@x.com', kindleEmail: 'old@kindle.com', notifyOn: [] } as unknown as MeDto;
+    const response = {
+      email: 'new@x.com',
+      kindleEmail: null, // a stale sibling snapshot from a concurrent save
+      notifyOn: ['available'],
+    } as unknown as MeDto;
+
+    cb(useUpdateMe()).onSuccess(response, { email: 'new@x.com' });
+    // The body wrote only `email`, so only `email` is taken from the response.
+    expect(applyMeUpdate(0, cached)).toMatchObject({
+      email: 'new@x.com',
+      kindleEmail: 'old@kindle.com',
+      notifyOn: [],
+    });
+
+    cb(useUpdateMe()).onSuccess(response, { notifyOn: ['available'] });
+    expect(applyMeUpdate(1, cached)).toMatchObject({
+      email: 'old@x.com',
+      kindleEmail: 'old@kindle.com',
+      notifyOn: ['available'],
+    });
+
     expect(hoisted.qc.setQueryData).toHaveBeenCalledTimes(2);
     expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalled();
   });
@@ -444,7 +474,8 @@ describe('useUpdateMe — account save with proportional feedback (#50, #134)', 
     cb(useUpdateMe()).onSuccess(dto, { notifyOn: ['available'] });
     expect(success).not.toHaveBeenCalled();
     // Cache write still happens — silence is only about the toast.
-    expect(hoisted.qc.setQueryData).toHaveBeenCalledWith(qk.me, dto);
+    expect(hoisted.qc.setQueryData).toHaveBeenCalledWith(qk.me, expect.any(Function));
+    expect(applyMeUpdate(0, undefined)).toBe(dto); // no prior entry ⇒ the response is taken whole
   });
 
   it('surfaces ApiError message, else "Could not save preferences", on error (unchanged for both shapes)', () => {

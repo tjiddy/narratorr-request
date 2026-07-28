@@ -8,9 +8,10 @@ import {
   emailFieldPatchValue,
   reconciledEmailFieldDraft,
   meSuccessToast,
+  mergeMeCache,
   KINDLE_EMAIL_HELP,
 } from './notify-prefs.js';
-import { NOTIFIABLE_TRANSITIONS } from '@shared/schemas/user';
+import { NOTIFIABLE_TRANSITIONS, type MeDto } from '@shared/schemas/user';
 
 describe('NOTIFY_TRANSITION_LABELS', () => {
   it('has a label for every transition, in const order (approved/denied/ready to listen)', () => {
@@ -216,5 +217,103 @@ describe('meSuccessToast — success feedback proportional to the payload (#134)
       expect(meSuccessToast({ email: 'new@x.com', kindleEmail: 'device@kindle.com' })).toBe('Email saved');
       expect(meSuccessToast({ email: null, kindleEmail: null })).toBe('Email saved');
     });
+  });
+});
+
+// #142 F1 — the race-safe cache fold. The account rows own independent mutation instances, so their
+// PATCHes overlap; each response is a snapshot in which the SIBLING field still holds its pre-write
+// value. Replacing the whole cache entry with whichever response lands last rolls the newer sibling
+// save back. These pin the rule: a response is authoritative only for the fields its body wrote.
+describe('mergeMeCache — a response is authoritative only for what it wrote (#142 F1)', () => {
+  const cached = {
+    email: 'old@x.com',
+    emailNotifyAvailable: false,
+    kindleEmail: 'old@kindle.com',
+    notifyOn: ['approved'],
+    quota: { mode: 'limited', limit: 10, used: 1, remaining: 9, windowDays: 30 },
+    username: 'todd',
+  } as unknown as MeDto;
+
+  /** A response carrying every field, with each SIBLING at a value that must not be adopted. */
+  const response = {
+    email: 'new@x.com',
+    emailNotifyAvailable: true,
+    kindleEmail: null,
+    notifyOn: [],
+    quota: { mode: 'limited', limit: 10, used: 4, remaining: 6, windowDays: 30 },
+    username: 'todd',
+  } as unknown as MeDto;
+
+  it('takes the response whole when there is no prior cache entry', () => {
+    expect(mergeMeCache(undefined, response, { email: 'new@x.com' })).toBe(response);
+  });
+
+  it('an email-only body adopts email + emailNotifyAvailable and preserves the siblings', () => {
+    const merged = mergeMeCache(cached, response, { email: 'new@x.com' });
+    expect(merged.email).toBe('new@x.com');
+    expect(merged.emailNotifyAvailable).toBe(true); // derived from email — moves with it
+    expect(merged.kindleEmail).toBe('old@kindle.com'); // NOT rolled back to the response's null
+    expect(merged.notifyOn).toEqual(['approved']);
+  });
+
+  it('a kindleEmail-only body adopts kindleEmail and preserves the siblings', () => {
+    const merged = mergeMeCache(cached, { ...response, kindleEmail: 'device@kindle.com' }, {
+      kindleEmail: 'device@kindle.com',
+    });
+    expect(merged.kindleEmail).toBe('device@kindle.com');
+    expect(merged.email).toBe('old@x.com'); // NOT rolled back to the response's new@x.com
+    expect(merged.emailNotifyAvailable).toBe(false); // stays with the preserved email
+    expect(merged.notifyOn).toEqual(['approved']);
+  });
+
+  it('a notifyOn-only body adopts notifyOn and preserves both addresses', () => {
+    const merged = mergeMeCache(cached, { ...response, notifyOn: ['available'] }, { notifyOn: ['available'] });
+    expect(merged.notifyOn).toEqual(['available']);
+    expect(merged.email).toBe('old@x.com');
+    expect(merged.kindleEmail).toBe('old@kindle.com');
+  });
+
+  it('keys on the KEY, not the value — an explicit null clear is an authoritative write', () => {
+    expect(mergeMeCache(cached, { ...response, kindleEmail: null }, { kindleEmail: null }).kindleEmail).toBeNull();
+    expect(mergeMeCache(cached, { ...response, email: null }, { email: null }).email).toBeNull();
+  });
+
+  it('an empty body preserves all three self-scoped fields', () => {
+    const merged = mergeMeCache(cached, response, {});
+    expect(merged).toMatchObject({
+      email: 'old@x.com',
+      emailNotifyAvailable: false,
+      kindleEmail: 'old@kindle.com',
+      notifyOn: ['approved'],
+    });
+  });
+
+  it('takes non-self-scoped fields from the fresher response (they are not written here)', () => {
+    // `quota` moves with request activity, not with this endpoint — no sibling to roll back.
+    expect(mergeMeCache(cached, response, { kindleEmail: 'device@kindle.com' }).quota).toEqual(response.quota);
+  });
+
+  // The end-to-end property the race depends on: applying the two overlapping responses in EITHER
+  // order converges on the same cache, with both saved values intact.
+  it('converges on both saved values regardless of settlement order', () => {
+    const base = { ...cached, email: 'old@x.com', kindleEmail: null } as MeDto;
+    const contactRes = { ...base, email: 'new@x.com', kindleEmail: null } as MeDto; // sibling pre-write
+    const kindleRes = { ...base, email: 'old@x.com', kindleEmail: 'device@kindle.com' } as MeDto;
+
+    const contactLast = mergeMeCache(
+      mergeMeCache(base, kindleRes, { kindleEmail: 'device@kindle.com' }),
+      contactRes,
+      { email: 'new@x.com' },
+    );
+    const kindleLast = mergeMeCache(
+      mergeMeCache(base, contactRes, { email: 'new@x.com' }),
+      kindleRes,
+      { kindleEmail: 'device@kindle.com' },
+    );
+
+    for (const merged of [contactLast, kindleLast]) {
+      expect(merged.email).toBe('new@x.com');
+      expect(merged.kindleEmail).toBe('device@kindle.com');
+    }
   });
 });

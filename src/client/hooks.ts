@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import type { V1AudibleResult } from '@shared/schemas/v1/metadata';
 import type { RequestStatus } from '@shared/schemas/request';
-import type { UpdateUserBody, UpdateMeBody } from '@shared/schemas/user';
+import type { MeDto, UpdateUserBody, UpdateMeBody } from '@shared/schemas/user';
 import type {
   UpdateConnectorSettingsBody,
   TestConnectorBody,
@@ -37,7 +37,7 @@ import {
   ApiError,
 } from './api';
 import { decideBadge } from './instance-badge';
-import { meSuccessToast } from './pages/notify-prefs';
+import { meSuccessToast, mergeMeCache } from './pages/notify-prefs';
 
 export const qk = {
   me: ['me'] as const,
@@ -103,17 +103,21 @@ export const keepSameListData =
 export const useMe = () =>
   useQuery({ queryKey: qk.me, queryFn: getMe, retry: false, staleTime: 60_000 });
 
-/** The account modal's self-scoped save (issue #131). Backs two callers — the explicit email Save and
- *  the instant-apply notification checkboxes — both PATCHing `/api/me`. Writes the fresh MeDto straight
- *  into the `me` cache so the control reflects the new state immediately. Success feedback is
- *  proportional to the payload via `meSuccessToast` (#134): an email save toasts "Email saved", a
- *  notifyOn-only toggle is silent (the persisted checkbox is the confirmation). Errors always toast. */
+/** The account modal's self-scoped save (issue #131). Backs three callers — the explicit contact-email
+ *  Save, the explicit Kindle-address Save (#142), and the instant-apply notification checkboxes — each
+ *  PATCHing `/api/me` through its OWN instance, so two saves can be in flight at once. Folds the fresh
+ *  MeDto into the `me` cache so the control reflects the new state immediately, via `mergeMeCache`:
+ *  a response is authoritative only for the fields its own body wrote, so an earlier request settling
+ *  last can't roll back a newer sibling save (#142 F1). Still a direct cache write, not an
+ *  invalidate — no refetch round-trip. Success feedback is proportional to the payload via
+ *  `meSuccessToast` (#134): an address save acknowledges, a notifyOn-only toggle is silent (the
+ *  persisted checkbox is the confirmation). Errors always toast. */
 export function useUpdateMe() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (body: UpdateMeBody) => updateMe(body),
     onSuccess: (dto, body) => {
-      qc.setQueryData(qk.me, dto);
+      qc.setQueryData<MeDto>(qk.me, (prev) => mergeMeCache(prev, dto, body));
       const message = meSuccessToast(body);
       if (message) toast.success(message);
     },

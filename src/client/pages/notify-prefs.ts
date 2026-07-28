@@ -1,4 +1,4 @@
-import { NOTIFIABLE_TRANSITIONS, type NotifiableTransition, type UpdateMeBody } from '@shared/schemas/user';
+import { NOTIFIABLE_TRANSITIONS, type MeDto, type NotifiableTransition, type UpdateMeBody } from '@shared/schemas/user';
 
 // Pure logic for the account modal (issue #131): the requester-notification opt-in checkboxes, the
 // contact-email save row, the Send-to-Kindle address save row (#142), and the identity provider
@@ -121,4 +121,30 @@ export function meSuccessToast(body: UpdateMeBody): string | null {
   if ('email' in body) return 'Email saved';
   if ('kindleEmail' in body) return 'Kindle address saved';
   return null;
+}
+
+/**
+ * Fold a `PATCH /api/me` response into the cached `MeDto` — the RACE-SAFE cache write for
+ * `useUpdateMe` (#142 F1). Each row of the account modal owns an independent mutation instance, so
+ * a contact save and a Kindle save can be in flight at once. Every response is a snapshot of the row
+ * as the server read it, which means a request that STARTED earlier carries the sibling field's
+ * PRE-write value; blindly replacing the whole cache entry with the last response to arrive would
+ * roll the newer sibling save back, leaving that row falsely dirty (its draft holds the saved value
+ * while `me` reports the old one).
+ *
+ * The rule: a response is authoritative ONLY for the self-scoped fields its request actually wrote.
+ * For each of the three (`email` — with its derived `emailNotifyAvailable` — `kindleEmail`, and
+ * `notifyOn`), keep the cached value whenever this body didn't carry that key. Everything else on the
+ * DTO (quota, identity, role) isn't written by this endpoint, so the fresher response wins. Keyed on
+ * the presence of the KEY, not its value, so an explicit `null` clear is still an authoritative write.
+ * With no prior cache entry there is nothing to preserve and the response is taken whole.
+ */
+export function mergeMeCache(prev: MeDto | undefined, dto: MeDto, body: UpdateMeBody): MeDto {
+  if (!prev) return dto;
+  return {
+    ...dto,
+    ...(!('email' in body) && { email: prev.email, emailNotifyAvailable: prev.emailNotifyAvailable }),
+    ...(!('kindleEmail' in body) && { kindleEmail: prev.kindleEmail }),
+    ...(!('notifyOn' in body) && { notifyOn: prev.notifyOn }),
+  };
 }
