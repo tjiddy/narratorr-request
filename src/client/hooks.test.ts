@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { RequestDto } from '@shared/schemas/request';
 import type { UserDto, MeDto } from '@shared/schemas/user';
-import type { ConnectorSettingsDto, TestConnectorResult } from '@shared/schemas/connectors';
+import type { ConnectorSettingsDto, TestConnectorResult, UpdateConnectorSettingsBody } from '@shared/schemas/connectors';
 // Type-only namespace imports (erased at runtime, so they don't fight the mocks below) —
 // give importActual its return type without an inline `import()` annotation.
 import type * as ApiModule from './api';
@@ -24,6 +24,7 @@ const hoisted = vi.hoisted(() => ({
     listAdminQueue: vi.fn(),
     listUserRequests: vi.fn(),
     updateMe: vi.fn(),
+    updateConnectorSettings: vi.fn(),
   },
   // A module-scoped slot backing the test-only `react` useState mock so a re-invoked
   // `useTheme()` observes the value a prior `toggleTheme()` wrote.
@@ -52,6 +53,7 @@ vi.mock('./api', async (importActual) => {
     listAdminQueue: hoisted.api.listAdminQueue,
     listUserRequests: hoisted.api.listUserRequests,
     updateMe: hoisted.api.updateMe,
+    updateConnectorSettings: hoisted.api.updateConnectorSettings,
   };
 });
 
@@ -126,6 +128,11 @@ interface MutationOptions {
   onSuccess: () => unknown;
 }
 const mut = (hook: unknown): MutationOptions => hook as MutationOptions;
+
+// A hook's `mutationFn` typed to its own body — lets a test drive the real API call the
+// mutation makes (not just its settled callbacks) and assert the exact payload it sends.
+const mutFn = <TBody>(hook: unknown): ((body: TBody) => Promise<unknown>) =>
+  (hook as { mutationFn: (body: TBody) => Promise<unknown> }).mutationFn;
 
 // `useQuery` now returns the raw options too — read the derived enabled/queryKey plus the
 // paging wiring (queryFn / refetchInterval / placeholderData) the paged hooks set.
@@ -512,6 +519,26 @@ describe('useUpdateKindleSender (#143)', () => {
   // the shared key instead of writing it wholesale — a second `setQueryData` writer behind a
   // second Save on the same page is the issue #160 shape. It also re-runs the server's read-time
   // resolution, which is what turns a reconfirm into `ok` on screen.
+  // The picker's Save must actually reach the connectors PUT carrying the body it built —
+  // driving only onSuccess/onError would leave `mutationFn` free to drop, rewrite, or route the
+  // selection somewhere else with every test still green.
+  it('puts the submitted body on the wire through updateConnectorSettings, unmodified', async () => {
+    const dto = { publicUrl: null } as ConnectorSettingsDto;
+    hoisted.api.updateConnectorSettings.mockResolvedValue(dto);
+    const body: UpdateConnectorSettingsBody = { kindleSender: { notifierId: 'nf_1' } };
+
+    await expect(mutFn(useUpdateKindleSender())(body)).resolves.toBe(dto);
+
+    expect(hoisted.api.updateConnectorSettings).toHaveBeenCalledTimes(1);
+    expect(hoisted.api.updateConnectorSettings).toHaveBeenCalledWith({ kindleSender: { notifierId: 'nf_1' } });
+  });
+
+  it('forwards a clear body verbatim too (null is a value, not an omission)', async () => {
+    hoisted.api.updateConnectorSettings.mockResolvedValue({} as ConnectorSettingsDto);
+    await mutFn(useUpdateKindleSender())({ kindleSender: null });
+    expect(hoisted.api.updateConnectorSettings).toHaveBeenCalledWith({ kindleSender: null });
+  });
+
   it('invalidates the connectors key (never setQueryData) and toasts "Kindle sender saved"', () => {
     cb(useUpdateKindleSender()).onSuccess();
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
