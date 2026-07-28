@@ -1,5 +1,6 @@
 import { useState, useId } from 'react';
-import type { NotifierDto, KnownNotifierDto } from '@shared/schemas/connectors';
+import { isKnownNotifierDto } from '@shared/schemas/connectors';
+import type { NotifierDto, KnownNotifierDto, ResolvedKindleSender } from '@shared/schemas/connectors';
 import { NOTIFIER_REGISTRY, NOTIFIER_TYPES, type NotifierType, type NotifierField } from '@shared/notifier-registry';
 import { NOTIFICATION_EVENTS } from '@shared/notification-events';
 import { useCreateNotifier, useUpdateNotifier, useDeleteNotifier, useTestNotifier } from '../hooks';
@@ -7,6 +8,7 @@ import { Button } from '../components/Button';
 import { BellIcon, PlusIcon, PencilIcon, SendIcon, TrashIcon } from '../components/icons';
 import { Dialog } from '../components/Dialog';
 import { Field, SectionHeader, SettingsCard } from './settings-ui';
+import { KindleSenderCard } from './SettingsKindleSender';
 import { inputCls, secretPlaceholder } from './settings-fields';
 import {
   newNotifierForm,
@@ -20,19 +22,16 @@ import {
   type NotifierFormState,
 } from './settings-notifiers';
 
-/** Discriminate the masked notifier DTO: a known type carries `config`; unknown carries `unknown`. */
-function isKnownNotifier(n: NotifierDto): n is KnownNotifierDto {
-  return !('unknown' in n && n.unknown);
-}
-
 export function NotifiersSection({
   notifiers,
   publicUrl,
   requesterEmailWarning,
+  kindleSender,
 }: {
   notifiers: NotifierDto[];
   publicUrl: string | null;
   requesterEmailWarning: boolean;
+  kindleSender: ResolvedKindleSender | null;
 }) {
   const [editing, setEditing] = useState<NotifierFormState | null>(null);
   const del = useDeleteNotifier();
@@ -71,6 +70,11 @@ export function NotifiersSection({
         </div>
       )}
 
+      {/* The stable Kindle sender picks ONE of the email notifiers below (issue #143), so it
+          sits above the list it selects from — and stays mounted while notifier CRUD refetches
+          that list, which is exactly the draft-rebase case the card handles. */}
+      <KindleSenderCard notifiers={notifiers} saved={kindleSender} />
+
       {notifiers.length === 0 ? (
         <SettingsCard delay="60ms">
           <p className="p-8 text-center text-sm text-muted-foreground">
@@ -84,7 +88,7 @@ export function NotifiersSection({
               key={n.id}
               notifier={n}
               delay={`${60 + i * 50}ms`}
-              {...(isKnownNotifier(n) && {
+              {...(isKnownNotifierDto(n) && {
                 onEdit: () => setEditing(formFromDto(n)),
                 // No event selected → nothing to sample → hide Test (the modal requires ≥1
                 // event, but a leniently-stored notifier can have none).
@@ -122,7 +126,7 @@ function NotifierCard({
   testing: boolean;
   deleting: boolean;
 }) {
-  const known = isKnownNotifier(notifier);
+  const known = isKnownNotifierDto(notifier);
   const typeLabel = known ? NOTIFIER_REGISTRY[notifier.type as NotifierType].label : notifier.type;
   const eventLabels = notifier.events.map((e) => NOTIFICATION_EVENTS.find((ev) => ev.key === e)?.label ?? e).join(', ');
 

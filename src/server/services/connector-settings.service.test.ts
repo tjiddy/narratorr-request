@@ -261,6 +261,7 @@ describe('ConnectorSettingsService — never-brick (undecryptable) + unknown typ
           publicUrl: null,
           narratorr: null,
           notifiers: [{ id: 'nf_legacy', name: 'Legacy', type: 'apprise', events: ['user.pending'], config: { token: 'enc:v1:x' } }],
+          kindleSender: null,
         },
       })
       .where(eq(appSettings.id, 1));
@@ -577,7 +578,7 @@ describe('ConnectorSettingsService — stored connectors envelope guard (#93)', 
     const dto = await logged.getDto(); // must not throw
     expect(dto.narratorr).toBeNull();
     expect(dto.notifiers).toEqual([]);
-    expect(await logged.getStored()).toEqual({ publicUrl: null, narratorr: null, notifiers: [] });
+    expect(await logged.getStored()).toEqual({ publicUrl: null, narratorr: null, notifiers: [], kindleSender: null });
     // getDto + getStored each read/degrade once → one warn apiece; assert the per-read unit warns exactly once.
     warn.mockClear();
     await logged.getDto();
@@ -725,6 +726,249 @@ describe('ConnectorSettingsService — stored connectors envelope guard (#93)', 
     expect(await logged.getNarratorrConfig()).toEqual({ url: 'https://n.example.com:443', apiKey: 'real-key' });
     expect((await logged.getNotificationsConfig()).notifiers[0]!.config.token).toBe('real-token');
     expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+describe('ConnectorSettingsService — Kindle sender selector (#143)', () => {
+  const emailBody = (over: Partial<CreateNotifierBody> = {}, config: Record<string, unknown> = {}): CreateNotifierBody => ({
+    name: 'Mail',
+    type: 'email',
+    events: ['request.created'],
+    config: { host: 'smtp.example.com', port: 587, secure: false, user: 'u', pass: 'p', to: 'admin@ex.com', from: 'bot@ex.com', ...config },
+    ...over,
+  });
+
+  // Write an ARBITRARY connectors blob (bypassing the write path) so a pre-feature / hand-edited
+  // shape can be read back through the service boundary.
+  const seedConnectors = (raw: unknown) =>
+    db.update(appSettings).set({ connectors: raw as unknown as StoredConnectors }).where(eq(appSettings.id, 1));
+
+  it('derives and stores the PARSED mailbox from the notifier’s live From — verbatim case, name stripped', async () => {
+    const nf = await svc.createNotifier(emailBody({}, { from: 'Narratorr <Bot@Ex.com>' }));
+    await svc.update({ kindleSender: { notifierId: nf.id } });
+
+    // Both boundaries keep the parser's casing: the stored pair AND the resolved DTO.
+    expect((await svc.getStored()).kindleSender).toEqual({ notifierId: nf.id, confirmedFrom: 'Bot@Ex.com' });
+    expect((await svc.getDto()).kindleSender).toEqual({
+      notifierId: nf.id,
+      confirmedFrom: 'Bot@Ex.com',
+      status: 'ok',
+      currentFrom: 'Bot@Ex.com',
+    });
+
+    // …and a later lowercase From still resolves ok (case-insensitive comparison, verbatim storage).
+    await svc.updateNotifier(nf.id, emailBody({}, { from: 'bot@ex.com' }));
+    expect((await svc.getDto()).kindleSender).toMatchObject({ status: 'ok', confirmedFrom: 'Bot@Ex.com', currentFrom: 'bot@ex.com' });
+  });
+
+  it('AC3: a PRE-FEATURE blob (no kindleSender key) reads back with siblings intact, null, and NO warn', async () => {
+    await seedConnectors({
+      publicUrl: 'https://app.example.com',
+      narratorr: { url: 'https://n:3000', apiKey: codec.encrypt('live-key') },
+      notifiers: [{ id: 'nf_ok', name: 'Phone', type: 'ntfy', events: ['request.created'], config: { url: 'https://ntfy.sh', topic: 't', token: null, priority: null } }],
+    });
+    const warn = vi.fn();
+    const logged = new ConnectorSettingsService(db, codec, { warn });
+
+    const stored = await logged.getStored();
+    expect(stored.kindleSender).toBeNull(); // normalized undefined → null
+    expect(stored.publicUrl).toBe('https://app.example.com');
+    expect(stored.narratorr).not.toBeNull();
+    expect(stored.notifiers).toHaveLength(1);
+
+    const dto = await logged.getDto();
+    expect(dto.kindleSender).toBeNull();
+    expect(dto.narratorr).toEqual({ url: 'https://n:3000', hasApiKey: true });
+    expect(dto.notifiers).toHaveLength(1);
+    expect(warn).not.toHaveBeenCalled(); // a missing key is a NORMAL state, not a corrupt one
+  });
+
+  it('a MALFORMED stored kindleSender degrades row-locally (siblings survive, no whole-blob reset)', async () => {
+    for (const bad of [42, { notifierId: 42 }, {}]) {
+      await seedConnectors({
+        publicUrl: 'https://app.example.com',
+        narratorr: { url: 'https://n:3000', apiKey: codec.encrypt('live-key') },
+        notifiers: [{ id: 'nf_ok', name: 'Phone', type: 'ntfy', events: ['request.created'], config: { url: 'https://ntfy.sh', topic: 't', token: null, priority: null } }],
+        kindleSender: bad,
+      });
+      const stored = await new ConnectorSettingsService(db, codec, { warn() {} }).getStored();
+      expect(stored.kindleSender, JSON.stringify(bad)).toBeNull();
+      // The narratorr key (encrypted, unrecoverable if reset) and the notifier list survive.
+      expect(stored.narratorr, JSON.stringify(bad)).not.toBeNull();
+      expect(stored.notifiers, JSON.stringify(bad)).toHaveLength(1);
+    }
+  });
+
+  it('AC4: notifier create / update / delete preserve a saved selection byte-identically', async () => {
+    const nf = await svc.createNotifier(emailBody());
+    await svc.update({ kindleSender: { notifierId: nf.id } });
+    const saved = (await svc.getStored()).kindleSender;
+
+    const other = await svc.createNotifier(ntfyBody({ name: 'Other' }));
+    expect((await svc.getStored()).kindleSender).toEqual(saved);
+    await svc.updateNotifier(other.id, ntfyBody({ name: 'Other2' }));
+    expect((await svc.getStored()).kindleSender).toEqual(saved);
+    await svc.deleteNotifier(other.id);
+    expect((await svc.getStored()).kindleSender).toEqual(saved);
+  });
+
+  it('AC9: a publicUrl-only AND a defaultQuota-only update each leave the selection byte-identical', async () => {
+    const nf = await svc.createNotifier(emailBody());
+    await svc.update({ kindleSender: { notifierId: nf.id } });
+    const saved = (await svc.getStored()).kindleSender;
+
+    await svc.update({ publicUrl: 'https://app.example.com' }); // rewrites the whole blob
+    expect((await svc.getStored()).kindleSender).toEqual(saved);
+    // A quota-only save takes the hasConnectorFields === false path — the connector column is
+    // never written at all. A regression that rebuilt the blob unconditionally would show here.
+    await svc.update({ defaultQuota: { mode: 'limited', limit: 4, windowDays: 7 } });
+    expect((await svc.getStored()).kindleSender).toEqual(saved);
+  });
+
+  it('AC6: kindleSender: null clears the selection AND actually persists', async () => {
+    const nf = await svc.createNotifier(emailBody());
+    await svc.update({ kindleSender: { notifierId: nf.id } });
+    await svc.update({ kindleSender: null });
+    // Read back from STORAGE (not the return value) — dropping kindleSender from
+    // hasConnectorFields makes update() return the right object while writing nothing.
+    expect((await svc.getStored()).kindleSender).toBeNull();
+    expect((await svc.getDto()).kindleSender).toBeNull();
+  });
+
+  it('reconfirm: re-sending the SAME id after a From change re-derives confirmedFrom and returns to ok', async () => {
+    const nf = await svc.createNotifier(emailBody());
+    await svc.update({ kindleSender: { notifierId: nf.id } });
+
+    await svc.updateNotifier(nf.id, emailBody({}, { from: 'new@ex.com' }));
+    expect((await svc.getDto()).kindleSender).toMatchObject({ status: 'sender-changed', confirmedFrom: 'bot@ex.com', currentFrom: 'new@ex.com' });
+
+    await svc.update({ kindleSender: { notifierId: nf.id } }); // the reconfirm write
+    expect((await svc.getStored()).kindleSender).toEqual({ notifierId: nf.id, confirmedFrom: 'new@ex.com' });
+    expect((await svc.getDto()).kindleSender).toMatchObject({ status: 'ok', confirmedFrom: 'new@ex.com' });
+  });
+
+  it('AC7: a SAME-ID repair needs no selector write — the stored pair is untouched and re-resolves to ok', async () => {
+    const nf = await svc.createNotifier(emailBody());
+    await svc.update({ kindleSender: { notifierId: nf.id } });
+    const saved = (await svc.getStored()).kindleSender;
+
+    await svc.updateNotifier(nf.id, emailBody({}, { from: 'a@' })); // break it
+    expect((await svc.getDto()).kindleSender).toMatchObject({ status: 'from-unparseable', currentFrom: null });
+    expect((await svc.getStored()).kindleSender).toEqual(saved);
+
+    await svc.updateNotifier(nf.id, emailBody({}, { from: 'bot@ex.com' })); // repair, no selector write
+    expect((await svc.getDto()).kindleSender).toMatchObject({ status: 'ok' });
+    expect((await svc.getStored()).kindleSender).toEqual(saved);
+  });
+
+  it('AC7/AC13: a REPLACEMENT gets a new id — no auto-adoption; only a selector save of the NEW id returns ok', async () => {
+    const nf = await svc.createNotifier(emailBody());
+    await svc.update({ kindleSender: { notifierId: nf.id } });
+
+    await svc.deleteNotifier(nf.id);
+    const replacement = await svc.createNotifier(emailBody({ name: 'Mail again' }));
+    expect(replacement.id).not.toBe(nf.id); // createNotifier always mints a fresh publicId('nf')
+
+    // The stored pair still names the DEAD id — the sole new email notifier is NOT adopted.
+    expect((await svc.getStored()).kindleSender).toEqual({ notifierId: nf.id, confirmedFrom: 'bot@ex.com' });
+    expect((await svc.getDto()).kindleSender).toMatchObject({ notifierId: nf.id, status: 'notifier-missing' });
+
+    await svc.update({ kindleSender: { notifierId: replacement.id } });
+    expect((await svc.getDto()).kindleSender).toMatchObject({ notifierId: replacement.id, status: 'ok' });
+  });
+
+  it('deleting the SELECTED notifier leaves the stored pair in place and reports notifier-missing', async () => {
+    const nf = await svc.createNotifier(emailBody());
+    await svc.update({ kindleSender: { notifierId: nf.id } });
+    await svc.deleteNotifier(nf.id);
+
+    expect((await svc.getStored()).kindleSender).toEqual({ notifierId: nf.id, confirmedFrom: 'bot@ex.com' });
+    expect((await svc.getDto()).kindleSender).toMatchObject({ status: 'notifier-missing', currentFrom: null });
+  });
+
+  it('AC13: never falls through to another usable email notifier', async () => {
+    const a = await svc.createNotifier(emailBody({ name: 'A' }, { from: 'a@ex.com' }));
+    await svc.createNotifier(emailBody({ name: 'B' }, { from: 'b@ex.com' }));
+    await svc.update({ kindleSender: { notifierId: a.id } });
+    await svc.deleteNotifier(a.id);
+
+    const dto = await svc.getDto();
+    expect(dto.kindleSender).toMatchObject({ notifierId: a.id, status: 'notifier-missing', confirmedFrom: 'a@ex.com' });
+    expect(dto.kindleSender?.currentFrom).toBeNull();
+  });
+
+  it('AC17/AC18: the email notifier’s own write path is unchanged (a From that can’t be confirmed still saves)', async () => {
+    const nf = await svc.createNotifier(emailBody({}, { from: 'ops team' }));
+    expect(nf.config.from).toBe('ops team');
+    await svc.updateNotifier(nf.id, emailBody({}, { from: 'a@x.com, b@y.com' }));
+    expect((await svc.getStored()).notifiers[0]!.config.from).toBe('a@x.com, b@y.com');
+    // …and the requester-email source selection still picks it up.
+    expect((await svc.getDto()).requesterEmailWarning).toBe(false);
+  });
+
+  describe('rejections — 400 KINDLE_SENDER_INVALID, one CASE-SPECIFIC message per class', () => {
+    it('an unknown notifierId', async () => {
+      await expect(svc.update({ kindleSender: { notifierId: 'nf_nope' } })).rejects.toMatchObject({
+        statusCode: 400,
+        code: 'KINDLE_SENDER_INVALID',
+        message: 'That notifier no longer exists — pick an email notifier that is still configured.',
+      });
+    });
+
+    it('a non-email notifier', async () => {
+      const nf = await svc.createNotifier(ntfyBody());
+      await expect(svc.update({ kindleSender: { notifierId: nf.id } })).rejects.toMatchObject({
+        code: 'KINDLE_SENDER_INVALID',
+        message: 'The Kindle sender must be an email (SMTP) notifier.',
+      });
+    });
+
+    it('an email notifier whose runtime config fails emailRuntimeSchema', async () => {
+      await seedConnectors({
+        publicUrl: null,
+        narratorr: null,
+        notifiers: [{ id: 'nf_broken', name: 'Broken', type: 'email', events: ['request.created'], config: { host: 'smtp.example.com' } }],
+        kindleSender: null,
+      });
+      await expect(svc.update({ kindleSender: { notifierId: 'nf_broken' } })).rejects.toMatchObject({
+        code: 'KINDLE_SENDER_INVALID',
+        message: 'That email notifier’s SMTP settings are incomplete or unreadable — fix the notifier, then select it again.',
+      });
+    });
+
+    it.each([
+      ['two addresses', 'a@x.com, b@y.com'],
+      ['a bare non-address token', 'ops team'],
+      ['a structurally invalid mailbox', 'a@'],
+    ])('a From that is not a single valid mailbox — %s', async (_label, from) => {
+      const nf = await svc.createNotifier(emailBody({}, { from }));
+      await expect(svc.update({ kindleSender: { notifierId: nf.id } })).rejects.toMatchObject({
+        code: 'KINDLE_SENDER_INVALID',
+        message: 'That email notifier’s From must be a single valid mailbox (e.g. narratorr@example.com).',
+      });
+    });
+
+    it('AC8 whole-row atomicity: a rejected selection in a MIXED body writes nothing at all', async () => {
+      const nf = await svc.createNotifier(emailBody());
+      await svc.update({ publicUrl: 'https://kept.example.com', kindleSender: { notifierId: nf.id } });
+      await svc.update({ defaultQuota: { mode: 'limited', limit: 4, windowDays: 7 } });
+      const blobBefore = (await svc.getStored());
+
+      await expect(
+        svc.update({
+          publicUrl: 'https://changed.example.com',
+          kindleSender: { notifierId: 'nf_nope' },
+          defaultQuota: { mode: 'limited', limit: 9, windowDays: 1 },
+        }),
+      ).rejects.toMatchObject({ statusCode: 400, code: 'KINDLE_SENDER_INVALID' });
+
+      expect(await svc.getStored()).toEqual(blobBefore); // connector blob untouched
+      expect(await db.query.appSettings.findFirst()).toMatchObject({
+        defaultQuotaMode: 'limited',
+        defaultQuotaLimit: 4,
+        defaultQuotaWindowDays: 7,
+      });
+    });
   });
 });
 

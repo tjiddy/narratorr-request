@@ -108,6 +108,25 @@ export const storedNotifierSchema = z.object({
 });
 
 /**
+ * The admin-selected STABLE Kindle sender pair (issue #143) — the CANONICAL contract for
+ * `(notifierId, confirmedFrom)`, owned here once. Amazon's Approved Personal Document E-mail
+ * List is per-sender, so Kindle delivery must come from ONE owner-confirmed mailbox — never the
+ * "first usable email notifier" the requester-email path picks. `confirmedFrom` is the PARSED
+ * mailbox as it was at confirmation time (display name stripped, case verbatim), NOT the
+ * notifier's raw `from` string.
+ *
+ * Every layer that carries the pair DERIVES from this schema rather than restating it: the
+ * contained stored member below, and `resolvedKindleSenderSchema` (which `.extend()`s it with the
+ * read-time status). A tightened constraint here therefore reaches storage and the DTO together —
+ * two hand-copied field lists could drift into "valid at storage, stripped at the wire".
+ */
+export const storedKindleSenderSchema = z.object({
+  notifierId: z.string(),
+  confirmedFrom: z.string(),
+});
+export type StoredKindleSender = z.infer<typeof storedKindleSenderSchema>;
+
+/**
  * As persisted. The narratorr secret (apiKey) holds an `enc:v1:…` string at rest;
  * `notifiers` is the generalized notifier list (secrets encrypted inside each config).
  */
@@ -115,6 +134,11 @@ export interface StoredConnectors {
   publicUrl: string | null;
   narratorr: { url: string; apiKey: string } | null;
   notifiers: StoredNotifier[];
+  /**
+   * The Kindle sender selection, or `null` when none is chosen. Validation is a READ-time
+   * concern (`resolveKindleSender`): notifier CRUD never rewrites this pair.
+   */
+  kindleSender: StoredKindleSender | null;
 }
 
 /**
@@ -141,6 +165,12 @@ export const storedConnectorsSchema = z.object({
   publicUrl: z.string().nullable(),
   narratorr: z.object({ url: z.string(), apiKey: z.unknown() }).nullable(),
   notifiers: z.array(storedNotifierSchema.omit({ events: true }).extend({ events: z.unknown() })),
+  // The Kindle sender selector carries its OWN `.catch(null)` so a malformed value degrades
+  // ROW-LOCALLY to "no selection" instead of failing the envelope — an envelope failure is a
+  // whole-blob reset that would discard the encrypted narratorr key. `.optional()` keeps a
+  // pre-feature blob (no key at all) a normal, warn-free read; `connectorsFrom()` normalizes
+  // the resulting `undefined` to `null` so every reader sees one shape.
+  kindleSender: storedKindleSenderSchema.nullable().optional().catch(null),
 });
 
 // ---- Masked notifier DTO (GET) ----------------------------------------------
@@ -192,6 +222,54 @@ export interface UnknownNotifierDto {
 }
 export type NotifierDto = KnownNotifierDto | UnknownNotifierDto;
 
+/**
+ * Discriminate the masked notifier DTO: a KNOWN row carries a typed `config`; a degraded /
+ * out-of-registry row carries `unknown: true` and no config. The SINGLE owner of that decision —
+ * every consumer (the notifier list's Edit/Test affordances, the Kindle-sender picker's
+ * eligibility rule) imports this rather than re-deriving it, so they can never disagree about
+ * whether a given degraded row has usable config. Lives beside the DTO types it discriminates and
+ * pulls in nothing Node-only, so client and server can both use it.
+ *
+ * Distinct from `isKnownNotifierType` (notifier-registry.ts), which answers a different question:
+ * whether a BARE TYPE STRING is a registry key. A row can carry a known type and still be degraded
+ * here — that is exactly the case the Kindle picker must exclude.
+ */
+export function isKnownNotifierDto(n: NotifierDto): n is KnownNotifierDto {
+  return !('unknown' in n && n.unknown);
+}
+
+// ---- Kindle sender (issue #143) ---------------------------------------------
+/**
+ * The read-time verdict on the stored Kindle-sender pair. `ok` is the ONLY status in which
+ * Kindle delivery is available; every other one is a recovery state the admin Settings card
+ * diagnoses. The failure order mirrors `resolveKindleSender`: id gone → not email → runtime
+ * config unusable → live From not a single valid mailbox → mailbox differs from the confirmed one.
+ */
+export const KINDLE_SENDER_STATUSES = [
+  'ok',
+  'notifier-missing',
+  'not-email',
+  'config-unusable',
+  'from-unparseable',
+  'sender-changed',
+] as const;
+export const kindleSenderStatusSchema = z.enum(KINDLE_SENDER_STATUSES);
+export type KindleSenderStatus = (typeof KINDLE_SENDER_STATUSES)[number];
+
+/**
+ * The RESOLVED Kindle-sender view exposed on the settings DTO — the stored pair plus the
+ * read-time status and the notifier's live mailbox. EXTENDS the canonical
+ * {@link storedKindleSenderSchema} rather than restating its fields, so the persisted contract
+ * and the wire contract can never drift apart. `currentFrom` is the live parsed mailbox when the
+ * notifier still resolves to one, else null; the UI uses it for the "now sends as X" copy on
+ * `sender-changed`.
+ */
+export const resolvedKindleSenderSchema = storedKindleSenderSchema.extend({
+  status: kindleSenderStatusSchema,
+  currentFrom: z.string().nullable(),
+});
+export type ResolvedKindleSender = z.infer<typeof resolvedKindleSenderSchema>;
+
 // ---- Masked connector-settings DTO (GET) ------------------------------------
 export const connectorSettingsDtoSchema = z.object({
   publicUrl: z.string().nullable(),
@@ -208,6 +286,10 @@ export const connectorSettingsDtoSchema = z.object({
   // nothing. Rendered on the Notifications settings section. False when there's a usable email
   // source OR nobody has opted in (nothing to warn about).
   requesterEmailWarning: z.boolean(),
+  // The resolved Kindle sender (issue #143), or null when nothing is selected. Both this schema
+  // AND the hand-written interface below must carry it: the response object is non-`.strict()`,
+  // so a field the mapper emits but the schema omits is silently stripped off the wire.
+  kindleSender: resolvedKindleSenderSchema.nullable(),
 });
 /** Hand-written (the runtime schema's `notifiers` infers `unknown[]`; this keeps it typed). */
 export interface ConnectorSettingsDto {
@@ -216,6 +298,7 @@ export interface ConnectorSettingsDto {
   notifiers: NotifierDto[];
   defaultQuota: DefaultQuota;
   requesterEmailWarning: boolean;
+  kindleSender: ResolvedKindleSender | null;
 }
 
 // ---- narratorr connector (shared by PUT + Test) -----------------------------
@@ -238,6 +321,13 @@ export const updateConnectorSettingsBodySchema = z
     // a `limited` mode carries a required positive `limit`. The whole object omitted → keep the
     // stored quota columns untouched.
     defaultQuota: defaultQuotaSchema.optional(),
+    // The Kindle sender selector (issue #143). The client sends ONLY the notifier id — the
+    // server derives `confirmedFrom` by parsing that notifier's LIVE `from` at write time, so
+    // the confirmation can't be spoofed and there is no second source of truth to drift. The
+    // inner object is `.strict()` so a client-supplied `confirmedFrom` is rejected rather than
+    // trusted. Field semantics mirror publicUrl: omitted → keep, null → clear, object → set
+    // (re-sending an unchanged id is the meaningful RECONFIRM write).
+    kindleSender: z.object({ notifierId: z.string().min(1) }).strict().nullable().optional(),
   })
   .strict();
 export type UpdateConnectorSettingsBody = z.infer<typeof updateConnectorSettingsBodySchema>;
