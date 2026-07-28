@@ -86,9 +86,21 @@ libSQL (SQLite) · Zod everywhere · TypeScript (strict) · ESM · tsup (server 
 
 ## Testing
 
-Vitest, node environment. Test glob: `src/{server,shared,db,client}/**/*.test.ts`. Client tests are
-**pure-logic only** (no DOM) — React component tests (`*.test.tsx`, jsdom) are intentionally not set
-up yet. narratorr is exercised via the MSW fixture.
+Vitest, **two projects** (`test.projects` in `vitest.config.ts`), split by file extension:
+
+- **`node`** — glob `src/{server,shared,db,client}/**/*.test.ts`, node environment. Everything
+  server/shared/db plus client **pure-logic** helpers.
+- **`client`** — glob `src/client/**/*.test.tsx`, jsdom + React Testing Library
+  (`src/client/test/setup.ts` registers the jest-dom matchers and `afterEach(cleanup)` — `globals`
+  stays off, so cleanup is explicit). `src/client/components/EmptyState.test.tsx` is the exemplar.
+
+Both projects set `extends: true` so they inherit the root `resolve.alias` (`@`, `@shared`);
+coverage stays at the root `test` level (it's global in Vitest 4). `pnpm test` runs both.
+
+jsdom is for **DOM-only** behavior — conditional rendering, focus/keyboard, multi-step side-effect
+orchestration. It is **not** a license to test logic through the DOM: payload/parse/decision logic
+still belongs in extracted pure helpers with co-located `.test.ts` coverage. narratorr is exercised
+via the MSW fixture.
 
 ## Git / releases
 
