@@ -5,7 +5,6 @@ import cors from '@fastify/cors';
 import cookie from '@fastify/cookie';
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
-import fastifyStatic from '@fastify/static';
 import { serializerCompiler, validatorCompiler, type ZodTypeProvider } from 'fastify-type-provider-zod';
 import { config, APP_ROOT } from './config.js';
 import { runMigrations } from '../db/migrate.js';
@@ -26,7 +25,7 @@ import { authRateLimitOptions } from './plugins/rate-limit.js';
 import { authPlugin } from './plugins/auth.js';
 import { buildHelmetOptions } from './plugins/helmet-options.js';
 import { registerRoutes } from './routes/index.js';
-import { errorBody } from '../shared/schemas/v1/common.js';
+import { registerClientSurface } from './routes/client-surface.js';
 import type { AppDeps } from './services/deps.js';
 import './types.js';
 
@@ -135,19 +134,10 @@ async function main(): Promise<void> {
 
   registerRoutes(app, deps);
 
-  if (serveClient) {
-    await app.register(fastifyStatic, { root: clientDir, wildcard: false });
-    app.setNotFoundHandler((request, reply) => {
-      if (request.method === 'GET' && !request.url.startsWith('/api/')) {
-        return reply.sendFile('index.html');
-      }
-      return reply.status(404).send(errorBody('NOT_FOUND', `Route ${request.method} ${request.url} not found`));
-    });
-  } else {
-    app.setNotFoundHandler((request, reply) =>
-      reply.status(404).send(errorBody('NOT_FOUND', `Route ${request.method} ${request.url} not found`)),
-    );
-  }
+  // One seam for the SPA mount + the 404 handler (issue #146 AC35). Extracted so it is reachable
+  // from a test — `main()` runs on import, so a wiring line left here is one no receipt can
+  // protect — and shared with the route-test harness, so the two cannot drift.
+  await registerClientSurface(app, { serveClient, clientDir });
 
   await app.listen({ port: config.port, host: config.bindHost });
   app.log.info(

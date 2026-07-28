@@ -15,7 +15,8 @@ import { z } from 'zod';
  * client-visible breakdown. Diagnosing *why* ebooks are off is a Settings-page concern.
  *
  * Invariants (enforced where the values are derived — see `deriveFeatures` in
- * `src/server/routes/features.ts`): `ebooksEnabled === false` ⇒ `kindleDeliveryAvailable === false`
+ * `src/server/services/feature-state.ts`, the ONE resolver `/api/features` and the companion-EPUB
+ * download proxy both go through): `ebooksEnabled === false` ⇒ `kindleDeliveryAvailable === false`
  * ⇒ `kindleSenderEmail === null`. A disabled feature never carries a dangling address.
  */
 export const featuresDtoSchema = z.object({
