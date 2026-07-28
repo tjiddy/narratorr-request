@@ -1,8 +1,9 @@
 /**
  * Pure logic for the route-level {@link ErrorBoundary}. Kept as plain functions (not
- * baked into the class) so it's unit-testable in the repo's node-only vitest project
- * without standing up jsdom — see the `frontend-logic-extract-not-jsdom` learning and the
- * co-located `book-card-state` / `status` helpers.
+ * baked into the class) so the state transitions are unit-tested directly in the node
+ * project instead of being inferred from a jsdom render — see the
+ * `frontend-logic-extract-not-jsdom` learning and the co-located `book-card-state` /
+ * `status` helpers.
  */
 
 /** Errored → carries the thrown value; recovered → no error. */

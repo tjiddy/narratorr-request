@@ -16,10 +16,10 @@ import { XIcon } from './icons';
  * and `scrollBody` caps the card height and scrolls the body so a tall form doesn't overflow the
  * viewport. The X button sits outside the scroll region, so it stays pinned while the body scrolls.
  *
- * Focus/keyboard handling is genuine DOM-only orchestration (no pure seam), so it lives here and is
- * not node-testable — consistent with the repo's extract-pure-logic-only testing stance
- * (frontend-logic-extract-not-jsdom). The decision logic the consumers need (dirty-state, provider
- * label, notifier payload/validation) is extracted into pure helpers with unit coverage instead.
+ * Focus/keyboard handling is genuine DOM-only orchestration (no pure seam), so it lives here rather
+ * than in a pure helper — it would need the jsdom `client` project to cover, not the node one. The
+ * decision logic the consumers need (dirty-state, provider label, notifier payload/validation) is
+ * extracted into pure helpers with unit coverage instead (frontend-logic-extract-not-jsdom).
  */
 export function Dialog({
   open,
