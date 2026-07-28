@@ -1,5 +1,5 @@
+import { isKnownNotifierDto } from '@shared/schemas/connectors';
 import type {
-  KnownNotifierDto,
   NotifierDto,
   ResolvedKindleSender,
   UpdateConnectorSettingsBody,
@@ -23,11 +23,6 @@ export interface KindleSenderOption {
   from: string;
 }
 
-/** Discriminate the masked notifier DTO: a known type carries `config`; unknown carries `unknown`. */
-function isKnown(n: NotifierDto): n is KnownNotifierDto {
-  return !('unknown' in n && n.unknown);
-}
-
 /**
  * The eligible picker options. Eligibility is STRUCTURAL: a row must be KNOWN (not degraded),
  * `type === 'email'`, and carry a string `config.from`.
@@ -35,7 +30,9 @@ function isKnown(n: NotifierDto): n is KnownNotifierDto {
  * Raw type alone is NOT enough — `toNotifierDto()` degrades a known email row whose config fails
  * masking into `{ type: 'email', unknown: true }` with no `config`, and the server could never
  * confirm such a row (its runtime config fails `emailRuntimeSchema` too). Offering or
- * auto-preselecting it would put a guaranteed-400 Save in front of the admin.
+ * auto-preselecting it would put a guaranteed-400 Save in front of the admin. The known/degraded
+ * call is made by the SHARED `isKnownNotifierDto` guard, the same one the notifier list uses for
+ * its Edit/Test affordances, so the two surfaces can't disagree about a given row.
  *
  * The client deliberately does NOT judge whether `from` is a valid MAILBOX — that is
  * server-derived (nodemailer is Node-only). An eligible-but-unparseable row is rejected on Save
@@ -43,7 +40,7 @@ function isKnown(n: NotifierDto): n is KnownNotifierDto {
  */
 export function eligibleKindleSenders(notifiers: NotifierDto[]): KindleSenderOption[] {
   return notifiers.flatMap((n) => {
-    if (!isKnown(n) || n.type !== 'email') return [];
+    if (!isKnownNotifierDto(n) || n.type !== 'email') return [];
     const from = n.config.from;
     return typeof from === 'string' ? [{ id: n.id, name: n.name, from }] : [];
   });

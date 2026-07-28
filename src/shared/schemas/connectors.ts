@@ -108,6 +108,25 @@ export const storedNotifierSchema = z.object({
 });
 
 /**
+ * The admin-selected STABLE Kindle sender pair (issue #143) — the CANONICAL contract for
+ * `(notifierId, confirmedFrom)`, owned here once. Amazon's Approved Personal Document E-mail
+ * List is per-sender, so Kindle delivery must come from ONE owner-confirmed mailbox — never the
+ * "first usable email notifier" the requester-email path picks. `confirmedFrom` is the PARSED
+ * mailbox as it was at confirmation time (display name stripped, case verbatim), NOT the
+ * notifier's raw `from` string.
+ *
+ * Every layer that carries the pair DERIVES from this schema rather than restating it: the
+ * contained stored member below, and `resolvedKindleSenderSchema` (which `.extend()`s it with the
+ * read-time status). A tightened constraint here therefore reaches storage and the DTO together —
+ * two hand-copied field lists could drift into "valid at storage, stripped at the wire".
+ */
+export const storedKindleSenderSchema = z.object({
+  notifierId: z.string(),
+  confirmedFrom: z.string(),
+});
+export type StoredKindleSender = z.infer<typeof storedKindleSenderSchema>;
+
+/**
  * As persisted. The narratorr secret (apiKey) holds an `enc:v1:…` string at rest;
  * `notifiers` is the generalized notifier list (secrets encrypted inside each config).
  */
@@ -116,14 +135,10 @@ export interface StoredConnectors {
   narratorr: { url: string; apiKey: string } | null;
   notifiers: StoredNotifier[];
   /**
-   * The admin-selected STABLE Kindle sender (issue #143). Amazon's Approved Personal Document
-   * E-mail List is per-sender, so Kindle delivery must come from ONE owner-confirmed mailbox —
-   * never the "first usable email notifier" the requester-email path picks. `confirmedFrom` is
-   * the PARSED mailbox as it was at confirmation time (display name stripped, case verbatim),
-   * NOT the notifier's raw `from` string. `null` = no selection. Validation is a READ-time
+   * The Kindle sender selection, or `null` when none is chosen. Validation is a READ-time
    * concern (`resolveKindleSender`): notifier CRUD never rewrites this pair.
    */
-  kindleSender: { notifierId: string; confirmedFrom: string } | null;
+  kindleSender: StoredKindleSender | null;
 }
 
 /**
@@ -155,11 +170,7 @@ export const storedConnectorsSchema = z.object({
   // whole-blob reset that would discard the encrypted narratorr key. `.optional()` keeps a
   // pre-feature blob (no key at all) a normal, warn-free read; `connectorsFrom()` normalizes
   // the resulting `undefined` to `null` so every reader sees one shape.
-  kindleSender: z
-    .object({ notifierId: z.string(), confirmedFrom: z.string() })
-    .nullable()
-    .optional()
-    .catch(null),
+  kindleSender: storedKindleSenderSchema.nullable().optional().catch(null),
 });
 
 // ---- Masked notifier DTO (GET) ----------------------------------------------
@@ -211,6 +222,22 @@ export interface UnknownNotifierDto {
 }
 export type NotifierDto = KnownNotifierDto | UnknownNotifierDto;
 
+/**
+ * Discriminate the masked notifier DTO: a KNOWN row carries a typed `config`; a degraded /
+ * out-of-registry row carries `unknown: true` and no config. The SINGLE owner of that decision —
+ * every consumer (the notifier list's Edit/Test affordances, the Kindle-sender picker's
+ * eligibility rule) imports this rather than re-deriving it, so they can never disagree about
+ * whether a given degraded row has usable config. Lives beside the DTO types it discriminates and
+ * pulls in nothing Node-only, so client and server can both use it.
+ *
+ * Distinct from `isKnownNotifierType` (notifier-registry.ts), which answers a different question:
+ * whether a BARE TYPE STRING is a registry key. A row can carry a known type and still be degraded
+ * here — that is exactly the case the Kindle picker must exclude.
+ */
+export function isKnownNotifierDto(n: NotifierDto): n is KnownNotifierDto {
+  return !('unknown' in n && n.unknown);
+}
+
 // ---- Kindle sender (issue #143) ---------------------------------------------
 /**
  * The read-time verdict on the stored Kindle-sender pair. `ok` is the ONLY status in which
@@ -231,13 +258,13 @@ export type KindleSenderStatus = (typeof KINDLE_SENDER_STATUSES)[number];
 
 /**
  * The RESOLVED Kindle-sender view exposed on the settings DTO — the stored pair plus the
- * read-time status and the notifier's live mailbox. `currentFrom` is the live parsed mailbox
- * when the notifier still resolves to one, else null; the UI uses it for the "now sends as X"
- * copy on `sender-changed`.
+ * read-time status and the notifier's live mailbox. EXTENDS the canonical
+ * {@link storedKindleSenderSchema} rather than restating its fields, so the persisted contract
+ * and the wire contract can never drift apart. `currentFrom` is the live parsed mailbox when the
+ * notifier still resolves to one, else null; the UI uses it for the "now sends as X" copy on
+ * `sender-changed`.
  */
-export const resolvedKindleSenderSchema = z.object({
-  notifierId: z.string(),
-  confirmedFrom: z.string(),
+export const resolvedKindleSenderSchema = storedKindleSenderSchema.extend({
   status: kindleSenderStatusSchema,
   currentFrom: z.string().nullable(),
 });

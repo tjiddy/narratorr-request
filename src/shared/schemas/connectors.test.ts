@@ -1,8 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import {
   connectorSettingsDtoSchema,
+  isKnownNotifierDto,
   notifierDtoSchema,
+  resolvedKindleSenderSchema,
   storedConnectorsSchema,
+  storedKindleSenderSchema,
   storedNotifierSchema,
   testConnectorBodySchema,
   testConnectorResultSchema,
@@ -220,6 +223,22 @@ describe('storedConnectorsSchema — kindleSender containment (#143)', () => {
   it('accepts an explicit null (a cleared selection)', () => {
     expect(storedConnectorsSchema.parse(blob({ kindleSender: null })).kindleSender).toBeNull();
   });
+
+  // Both boundaries DERIVE from `storedKindleSenderSchema`, so a constraint tightened there must
+  // reach storage and the wire together. Restating the pair in the resolved schema is the drift
+  // shape this pins: with two hand-copied field lists, a value can be valid at one layer and
+  // rejected (or silently stripped) at the other.
+  it('the stored member and the resolved DTO share ONE pair contract', () => {
+    const pairKeys = Object.keys(storedKindleSenderSchema.shape).sort();
+    expect(pairKeys).toEqual(['confirmedFrom', 'notifierId']);
+    // The resolved schema is the pair PLUS the read-time fields — nothing dropped, nothing renamed.
+    expect(Object.keys(resolvedKindleSenderSchema.shape).sort()).toEqual(
+      [...pairKeys, 'currentFrom', 'status'].sort(),
+    );
+    // …and the shared members are the very same schema objects, not look-alike copies.
+    expect(resolvedKindleSenderSchema.shape.notifierId).toBe(storedKindleSenderSchema.shape.notifierId);
+    expect(resolvedKindleSenderSchema.shape.confirmedFrom).toBe(storedKindleSenderSchema.shape.confirmedFrom);
+  });
 });
 
 describe('updateConnectorSettingsBodySchema — kindleSender (#143)', () => {
@@ -271,6 +290,24 @@ describe('notifierDtoSchema — discriminated known | unknown', () => {
   it('accepts an unknown-type DTO (deletable, no config)', () => {
     const dto = { id: 'nf_3', name: 'Legacy', type: 'apprise', events: ['user.pending'], unknown: true };
     expect(notifierDtoSchema.safeParse(dto).success).toBe(true);
+  });
+});
+
+describe('isKnownNotifierDto — the one owner of the DTO known/degraded decision', () => {
+  const known = { id: 'nf_1', name: 'Mail', type: 'email' as const, events: [], config: { from: 'a@ex.com' } };
+  const degraded = { id: 'nf_2', name: 'Broken', type: 'email', events: [], unknown: true as const };
+
+  it('accepts a known row and rejects a degraded one', () => {
+    expect(isKnownNotifierDto(known)).toBe(true);
+    expect(isKnownNotifierDto(degraded)).toBe(false);
+  });
+
+  // The whole point of one owner: the notifier list's affordances and the Kindle picker's
+  // eligibility must agree about the SAME row. A degraded row carries a known-looking raw
+  // `type`, so a type-only check would classify it differently on each surface.
+  it('classifies a degraded row by its `unknown` marker, not its raw type', () => {
+    expect(degraded.type).toBe('email'); // raw type alone would say "known"
+    expect(isKnownNotifierDto(degraded)).toBe(false);
   });
 });
 
