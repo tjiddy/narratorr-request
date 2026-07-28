@@ -20,6 +20,9 @@ import { registerRequestRoutes } from './requests.js';
 import type { AppConfig } from '../config.js';
 import type { AppDeps } from '../services/deps.js';
 import type { INarratorrClient } from '../services/narratorr-client.js';
+import { buildRouteApp } from '../test-support/route-harness.js';
+import { insertUser } from '../test-support/db.js';
+import { meDtoSchema } from '../../shared/schemas/user.js';
 
 const SESSION_SECRET = 'auth-route-test-secret';
 
@@ -731,5 +734,64 @@ describe('PATCH /api/me kindleEmail contract (#142)', () => {
       const res = await patchMe(cookie, { email: 'contact@x.com' });
       expect(res.json().emailNotifyAvailable).toBe(true);
     });
+  });
+});
+
+// AC23 (issue #144): `/api/me` must stay ISOLATED from the companion-ebook capability. It is
+// `requireUser` (a pending/rejected account can call it) and it is the SPA bootstrap request —
+// `App.tsx` white-screens on a non-401 failure — so it must never make, or wait on, a narratorr
+// probe. Driven through the shared harness because that wires a real narratorr holder and a real
+// capability resolver, i.e. the state a leaking implementation would reach for.
+describe('GET /api/me — isolation from narratorr / feature state (#144)', () => {
+  const FEATURE_KEYS = ['ebooksEnabled', 'kindleDeliveryAvailable', 'kindleSenderEmail'];
+
+  /** Every narratorr method rejects — a total upstream outage — while counting probe attempts. */
+  function deadNarratorr(): INarratorrClient & { capabilityCalls: number } {
+    const down = () => Promise.reject(new Error('narratorr down'));
+    const client = {
+      capabilityCalls: 0,
+      searchMetadata: down,
+      addBook: down,
+      getBook: down,
+      getSystem: down,
+      getCapabilities: () => {
+        client.capabilityCalls += 1;
+        return down();
+      },
+    };
+    return client as unknown as INarratorrClient & { capabilityCalls: number };
+  }
+
+  it.each([
+    ['a total narratorr outage', () => ({ narratorr: deadNarratorr() })],
+    ['an unconfigured narratorr', () => ({ narratorrConfigured: false })],
+  ])('returns 200 with an unchanged body under %s', async (_label, build) => {
+    const over = build();
+    const h = await buildRouteApp({ register: registerAuthRoutes, ...over });
+    try {
+      // The admin toggle is ON, so a `/api/me` that consulted feature state would probe.
+      await h.connectorSettings.update({ ebooksEnabled: true });
+      const user = await insertUser(h.db, { role: 'user', status: 'active' });
+      const res = await h.app.inject({ method: 'GET', url: '/api/me', cookies: h.cookieFor(user) });
+
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.publicId).toBe(user.publicId);
+      for (const key of FEATURE_KEYS) expect(body).not.toHaveProperty(key);
+      // …and no probe was attempted on this path at all (the unconfigured case has no client
+      // to count on — the holder itself refuses, which the assertion above already covers).
+      expect(('narratorr' in over ? over.narratorr : h.narratorr).capabilityCalls).toBe(0);
+    } finally {
+      await h.app.close();
+    }
+  });
+
+  it('keeps the feature keys out of the mapper as well as the wire', async () => {
+    // `meDtoSchema` is non-`.strict()`, so it silently strips unknown keys — a route-body
+    // assertion alone cannot catch a mapper that started emitting them. Assert the schema itself
+    // has no such field (learned in #142/#159).
+    for (const key of FEATURE_KEYS) {
+      expect(meDtoSchema.shape).not.toHaveProperty(key);
+    }
   });
 });
