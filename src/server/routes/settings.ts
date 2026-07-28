@@ -15,6 +15,7 @@ import {
 import type { TestConnectorResult } from '../../shared/schemas/connectors.js';
 import { requireAdmin } from '../plugins/auth.js';
 import { NarratorrClient, NarratorrError } from '../services/narratorr-client.js';
+import { buildNarratorrClients } from '../services/narratorr-clients.js';
 import { Mutex } from '../util/mutex.js';
 import {
   buildNotifier,
@@ -95,29 +96,34 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: AppDeps): voi
   // DB-level locking instead — see Mutex.)
   const writeLock = new Mutex();
 
-  // Rebuild the live narratorr client + notifier from the freshly-saved DB settings, and
+  // Rebuild the live narratorr connection + notifier from the freshly-saved DB settings, and
   // refresh the request-quota policy so an edited default limit/window takes effect on the
   // next request (no restart). Notifier-only saves re-apply the same quota — a cheap no-op read.
   //
-  // `narratorrChanged` (issue #144) retires the cached companion-ebook capability. Three things
-  // about that call are load-bearing:
-  //   • It sits on the statement IMMEDIATELY after the holder swap, with no `await` between them.
-  //     `/api/features` reads deliberately do NOT take `writeLock` (a capability read must not
-  //     block on a settings save), so a bump placed after this function's remaining awaits would
-  //     leave a real window in which a concurrent read sees the NEW holder paired with the OLD
-  //     generation's entry. One synchronous run-to-completion step closes that window by
-  //     construction — it is what substitutes for a shared lock here.
+  // `narratorrChanged` (issues #144/#145) gates the CONNECTION SWAP, which is also what retires
+  // the cached companion-ebook capability (the holder's generation is the resolver's cache key,
+  // so the swap IS the invalidation — there is no separate call to forget). Three things about
+  // that statement are load-bearing:
+  //   • It is ONE synchronous step: both inner clients and the generation move together, with no
+  //     `await` in between. `/api/features` reads deliberately do NOT take `writeLock` (a
+  //     capability read must not block on a settings save), so anything less would leave a real
+  //     window in which a concurrent read sees the NEW connection paired with the OLD
+  //     generation's cache entry. Run-to-completion closes that window by construction — it is
+  //     what substitutes for a shared lock here.
   //   • It runs BEFORE the fallible tail. If either later read rejects, the PUT 500s — but the DB
-  //     update has already committed and the holder has already swapped, so a bump after the tail
-  //     would be skipped and strand the new connection with the previous generation's cache.
-  //   • It is CONDITIONAL. This function rebuilds the client on every notifier save even when the
-  //     connection didn't change; bumping unconditionally would discard a valid capability result
-  //     and its 15-minute stale budget on every notifier save, quota edit, public-URL edit,
-  //     Kindle-sender selection and ebook-toggle save.
+  //     update has already committed, so a swap placed after the tail would be skipped and strand
+  //     the saved connection behind the previous one's clients and cache.
+  //   • It is CONDITIONAL. A save that cannot change the connection must not rebuild it:
+  //     re-installing an identical client would bump the generation and discard a valid
+  //     capability result and its 15-minute stale budget on every notifier save, quota edit,
+  //     public-URL edit, Kindle-sender selection and ebook-toggle save.
   async function reconfigure(narratorrChanged = false): Promise<void> {
-    const ncfg = await deps.connectorSettings.getNarratorrConfig();
-    deps.narratorr.set(ncfg ? new NarratorrClient({ baseUrl: ncfg.url, apiKey: ncfg.apiKey }) : null);
-    if (narratorrChanged) deps.features.invalidate();
+    if (narratorrChanged) {
+      // ONE config read feeds BOTH clients through the shared factory, so the JSON and stream
+      // halves can never end up built from different credentials.
+      const ncfg = await deps.connectorSettings.getNarratorrConfig();
+      deps.narratorr.set(ncfg ? buildNarratorrClients({ baseUrl: ncfg.url, apiKey: ncfg.apiKey }) : null);
+    }
     deps.notifier = buildNotifier(await deps.connectorSettings.getNotificationsConfig(), app.log);
     deps.requests.reconfigureQuota(await deps.connectorSettings.getDefaultQuota());
   }
@@ -140,7 +146,7 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: AppDeps): voi
         await deps.connectorSettings.update(request.body);
         // `body.narratorr !== undefined` is exhaustive: it is the only input that can change the
         // stored connection (`ConnectorSettingsService.update()` assigns `next.narratorr` solely
-        // under that condition). Re-saving the card with unchanged values does invalidate — one
+        // under that condition). Re-saving the card with unchanged values does swap — one
         // redundant probe, accepted over a before/after config comparison.
         await reconfigure(request.body.narratorr !== undefined);
         return deps.connectorSettings.getDto();

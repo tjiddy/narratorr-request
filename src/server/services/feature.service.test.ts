@@ -7,6 +7,8 @@ import {
 } from './feature.service.js';
 import { NarratorrError, type ICapabilityClient, type INarratorrClient } from './narratorr-client.js';
 import { NarratorrClientHolder } from './narratorr-client-holder.js';
+import type { NarratorrClientPair } from './narratorr-clients.js';
+import type { IEbookStreamClient } from './narratorr-stream-client.js';
 import type { V1Capabilities } from '../../shared/schemas/v1/capabilities.js';
 
 // The capability resolver (issue #144), driven with an explicit `nowMs` and a stub upstream — no
@@ -51,20 +53,39 @@ class StubClient {
 }
 
 /**
- * Widen a capability-only stub to the holder's full `INarratorrClient` slot. The holder is the
- * production seam for the NOT_CONFIGURED / live-reconnect cases, and it delegates every method;
- * these tests only ever reach `getCapabilities`, so the other members are deliberately absent.
+ * Widen a capability-only stub to a whole connection pair. The holder is the production seam for
+ * the NOT_CONFIGURED / live-reconnect cases and it delegates every method; these tests only ever
+ * reach `getCapabilities`, so the other members are deliberately absent. The stream half is never
+ * called here — it exists because a connection is installed as a PAIR, never a lone client.
  */
-const asClient = (stub: ICapabilityClient): INarratorrClient => stub as INarratorrClient;
+const asPair = (stub: ICapabilityClient): NarratorrClientPair => ({
+  json: stub as INarratorrClient,
+  stream: {} as IEbookStreamClient,
+});
 
 const upstream = (status: number, code: string) => new NarratorrError(status, code, `upstream ${code}`);
 const NETWORK = upstream(0, 'NETWORK');
 const CONTRACT_MISMATCH = upstream(200, 'CONTRACT_MISMATCH');
 
+/**
+ * A hand-driven connection generation. The resolver reads `generation` per call and owns none of
+ * its own, so a test can retire its cache exactly the way `reconfigure()`'s holder swap does —
+ * without standing up clients it never calls. (`NarratorrClientHolder` satisfies this
+ * structurally; the holder-driven cases below use the real thing.)
+ */
+class FakeConnection {
+  generation = 0;
+  /** What a `holder.set(...)` does to the resolver's view of the world. */
+  swap(): void {
+    this.generation += 1;
+  }
+}
+
 /** A stub + resolver pair wired the way production wires them (resolver reads the client live). */
-function build(): { client: StubClient; features: FeatureService } {
+function build(): { client: StubClient; connection: FakeConnection; features: FeatureService } {
   const client = new StubClient();
-  return { client, features: new FeatureService(client) };
+  const connection = new FakeConnection();
+  return { client, connection, features: new FeatureService(client, connection) };
 }
 
 describe('FeatureService — outcome classification', () => {
@@ -114,7 +135,7 @@ describe('FeatureService — outcome classification', () => {
     // Through a real unconfigured holder — the exact production path for a fresh install.
     const inner = new StubClient();
     const holder = new NarratorrClientHolder(null);
-    const features = new FeatureService(holder);
+    const features = new FeatureService(holder, holder);
 
     await expect(features.ebooksCapability(T0)).resolves.toBe(false);
     expect(inner.calls).toBe(0);
@@ -123,7 +144,7 @@ describe('FeatureService — outcome classification', () => {
     // IS configured, the first real success behaves exactly like a first success — a later
     // transient failure inside the window still stale-serves it.
     inner.resolves(true);
-    holder.set(asClient(inner));
+    holder.set(asPair(inner));
     await expect(features.ebooksCapability(T0 + 1000)).resolves.toBe(true);
     inner.rejects(NETWORK);
     await expect(features.ebooksCapability(T0 + 1000 + CAPABILITY_STALE_WINDOW_MS - 1)).resolves.toBe(true);
@@ -243,37 +264,39 @@ describe('FeatureService — single flight', () => {
   });
 });
 
-describe('FeatureService — invalidation (generation)', () => {
-  it('re-probes after invalidate(), even inside both TTLs', async () => {
+// Issue #145: the resolver no longer owns a generation — it reads the CONNECTION's. So every case
+// below retires the cache by swapping the connection (the real `holder.set()`, or the equivalent
+// counter bump), which is exactly what `reconfigure()` does. Nothing calls an `invalidate()`,
+// because there no longer is one to forget.
+describe('FeatureService — retirement by connection swap (generation)', () => {
+  it('re-probes after a connection swap, even inside both TTLs', async () => {
     for (const seed of [
       (c: StubClient) => c.resolves(true),
       (c: StubClient) => c.rejects(upstream(404, 'HTTP_404')),
     ]) {
-      const { client, features } = build();
+      const { client, connection, features } = build();
       seed(client);
       await features.ebooksCapability(T0);
       expect(client.calls).toBe(1);
 
-      features.invalidate();
+      connection.swap();
       client.resolves(true);
       await expect(features.ebooksCapability(T0 + 1)).resolves.toBe(true);
       expect(client.calls).toBe(2);
     }
   });
 
-  it('A→B: the first post-invalidate call starts its OWN probe and A cannot populate the cache', async () => {
+  it('A→B: the first post-swap call starts its OWN probe and A cannot populate the cache', async () => {
     // The connection changed mid-probe. A is still in flight against the OLD server; B is the new
-    // one. `holder.set(B)` and `invalidate()` are adjacent statements — the same synchronous
-    // adjacency `reconfigure()` uses.
+    // one. Installing B and retiring A's generation is ONE statement — the holder swap itself.
     const a = new StubClient();
     const b = new StubClient();
-    const holder = new NarratorrClientHolder(asClient(a));
-    const features = new FeatureService(holder);
+    const holder = new NarratorrClientHolder(asPair(a));
+    const features = new FeatureService(holder, holder);
     const settleA = a.defers();
     const first = features.ebooksCapability(T0);
 
-    holder.set(asClient(b));
-    features.invalidate();
+    holder.set(asPair(b));
 
     // (a) A fresh caller does not join A's flight — it asks B.
     b.resolves(false);
@@ -297,13 +320,12 @@ describe('FeatureService — invalidation (generation)', () => {
 
   it('A→unconfigured: the next resolve answers NOT_CONFIGURED with no upstream call', async () => {
     const a = new StubClient();
-    const holder = new NarratorrClientHolder(asClient(a));
-    const features = new FeatureService(holder);
+    const holder = new NarratorrClientHolder(asPair(a));
+    const features = new FeatureService(holder, holder);
     const settleA = a.defers();
     const first = features.ebooksCapability(T0);
 
     holder.set(null);
-    features.invalidate();
 
     await expect(features.ebooksCapability(T0 + 1)).resolves.toBe(false);
     expect(a.calls).toBe(1); // only the in-flight probe; the unconfigured read made none
@@ -315,11 +337,11 @@ describe('FeatureService — invalidation (generation)', () => {
   });
 
   it('identity-checks the in-flight release: settling the OLD flight cannot cancel the new one', async () => {
-    const { client, features } = build();
+    const { client, connection, features } = build();
     const settleOld = client.defers();
     const old = features.ebooksCapability(T0);
 
-    features.invalidate();
+    connection.swap();
     const settleNew = client.defers();
     const first = features.ebooksCapability(T0 + 1);
 
@@ -335,23 +357,23 @@ describe('FeatureService — invalidation (generation)', () => {
   });
 
   it('a new generation inherits no stale budget — the first transient failure fails closed', async () => {
-    // The load-bearing case for "invalidate() bumps, it does not clear": an implementation that
-    // still reads the previous generation's entry answers `true` here.
-    const { client, features } = build();
+    // The load-bearing case for "a swap bumps, it does not clear": an implementation that still
+    // reads the previous generation's entry answers `true` here.
+    const { client, connection, features } = build();
     client.resolves(true);
     await expect(features.ebooksCapability(T0)).resolves.toBe(true);
 
-    features.invalidate();
+    connection.swap();
     client.rejects(NETWORK);
     await expect(features.ebooksCapability(T0 + 2000)).resolves.toBe(false);
   });
 
   it('a superseded probe that FAILS does not consume the new generation window', async () => {
-    const { client, features } = build();
+    const { client, connection, features } = build();
     const settleOld = client.defers();
     const old = features.ebooksCapability(T0);
 
-    features.invalidate();
+    connection.swap();
     settleOld.reject(NETWORK);
     await expect(old).resolves.toBe(false);
 
@@ -365,7 +387,7 @@ describe('FeatureService — invalidation (generation)', () => {
   it('an old waiter keeps its OWN generation stale context, and its outcome is not written back', async () => {
     // Success at T0 (gen 0, lastSuccessAt = T0). At the TTL boundary a refresh starts against A;
     // while A is pending the connection changes (gen 1); then A fails transiently.
-    const { client, features } = build();
+    const { client, connection, features } = build();
     client.resolves(true);
     await expect(features.ebooksCapability(T0)).resolves.toBe(true);
 
@@ -373,7 +395,7 @@ describe('FeatureService — invalidation (generation)', () => {
     const refreshAt = T0 + CAPABILITY_TTL_MS;
     const waiter = features.ebooksCapability(refreshAt);
 
-    features.invalidate();
+    connection.swap();
     settleA.reject(NETWORK);
 
     // (a) The waiter asked about the OLD connection, whose 15-minute window was still open at
@@ -385,9 +407,9 @@ describe('FeatureService — invalidation (generation)', () => {
     await expect(features.ebooksCapability(refreshAt + 1)).resolves.toBe(false);
   });
 
-  it('without invalidate(), a settled result survives unrelated activity', async () => {
+  it('without a connection swap, a settled result survives unrelated activity', async () => {
     // The resolver-level half of "a non-narratorr settings save preserves capability state":
-    // only invalidate() retires an entry, so nothing else can cost a probe.
+    // only a swap retires an entry, so nothing else can cost a probe.
     const { client, features } = build();
     client.resolves(true);
     await expect(features.ebooksCapability(T0)).resolves.toBe(true);

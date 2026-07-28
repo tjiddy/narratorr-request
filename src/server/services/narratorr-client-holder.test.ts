@@ -1,17 +1,28 @@
 import { describe, it, expect, vi } from 'vitest';
 import { NarratorrClientHolder } from './narratorr-client-holder.js';
 import type { INarratorrClient } from './narratorr-client.js';
+import type { NarratorrEbookStream } from './narratorr-stream-client.js';
+import type { NarratorrClientPair } from './narratorr-clients.js';
 import type { V1Book } from '../../shared/schemas/v1/books.js';
 import type { V1System } from '../../shared/schemas/v1/system.js';
 import type { V1Capabilities } from '../../shared/schemas/v1/capabilities.js';
 
-// What every call should look like while the inner client is null — surfaced to our
+// What every call should look like while the connection is null — surfaced to our
 // own clients as a 502 (server-to-server) carrying the NOT_CONFIGURED upstream code.
 const NOT_CONFIGURED = { statusCode: 502, upstreamCode: 'NOT_CONFIGURED' };
 
 const book: V1Book = { id: 'bk_1', title: 'A Book', authors: [], narrators: [], status: 'searching' };
 const system: V1System = { version: 'v1.0.0' };
 const capabilities: V1Capabilities = { companionEpub: { enabled: true } };
+const ebook: NarratorrEbookStream = {
+  contentType: 'application/epub+zip',
+  contentLength: 0,
+  body: new ReadableStream<Uint8Array>({
+    start(c) {
+      c.close();
+    },
+  }),
+};
 
 // The holder's delegating methods aren't `async` — `require()` throws synchronously
 // when unconfigured, which every caller observes as a rejection because they `await`.
@@ -35,6 +46,23 @@ function fakeClient(): INarratorrClient & {
   };
 }
 
+/** The raw-stream half of a connection (issue #145) — its own slice, not part of INarratorrClient. */
+function fakeStreamClient() {
+  return {
+    openCompanionEpub: vi.fn(
+      async (_publicId: string, _opts?: { signal?: AbortSignal }): Promise<NarratorrEbookStream> => ebook,
+    ),
+  };
+}
+
+/** A whole connection: the two halves are only ever created and installed together. */
+function fakePair(): NarratorrClientPair & {
+  json: ReturnType<typeof fakeClient>;
+  stream: ReturnType<typeof fakeStreamClient>;
+} {
+  return { json: fakeClient(), stream: fakeStreamClient() };
+}
+
 describe('NarratorrClientHolder', () => {
   it('rejects every call with NOT_CONFIGURED while unconfigured', async () => {
     const holder = new NarratorrClientHolder();
@@ -46,13 +74,17 @@ describe('NarratorrClientHolder', () => {
     // The capability probe (issue #144) must reach the SAME NOT_CONFIGURED signal — the resolver
     // branches on that code to answer `false` immediately without burning its stale window.
     await expect(awaited(() => holder.getCapabilities())).rejects.toMatchObject(NOT_CONFIGURED);
+    // …and so must the raw stream (issue #145): the proxy route maps NOT_CONFIGURED like every
+    // other consumer instead of crashing on a missing client.
+    await expect(awaited(() => holder.openCompanionEpub('bk_1'))).rejects.toMatchObject(NOT_CONFIGURED);
   });
 
   it('delegates each method to the inner client and returns its result once configured', async () => {
-    const inner = fakeClient();
+    const pair = fakePair();
+    const inner = pair.json;
     const results = ['hit'];
     inner.searchMetadata.mockResolvedValue(results);
-    const holder = new NarratorrClientHolder(inner);
+    const holder = new NarratorrClientHolder(pair);
 
     expect(holder.configured).toBe(true);
     await expect(holder.searchMetadata('hail mary')).resolves.toBe(results);
@@ -65,11 +97,18 @@ describe('NarratorrClientHolder', () => {
     expect(inner.getSystem).toHaveBeenCalledWith();
     await expect(holder.getCapabilities()).resolves.toBe(capabilities);
     expect(inner.getCapabilities).toHaveBeenCalledWith();
+
+    // The stream half delegates with BOTH args — the caller's abort signal is what lets the
+    // proxy route cancel the upstream when the downstream consumer disconnects.
+    const ac = new AbortController();
+    await expect(holder.openCompanionEpub('bk_7', { signal: ac.signal })).resolves.toBe(ebook);
+    expect(pair.stream.openCompanionEpub).toHaveBeenCalledWith('bk_7', { signal: ac.signal });
   });
 
   it('re-arms the NOT_CONFIGURED throw after set(null)', async () => {
-    const inner = fakeClient();
-    const holder = new NarratorrClientHolder(inner);
+    const pair = fakePair();
+    const inner = pair.json;
+    const holder = new NarratorrClientHolder(pair);
     holder.set(null);
 
     expect(holder.configured).toBe(false);
@@ -80,10 +119,59 @@ describe('NarratorrClientHolder', () => {
     // The capability probe (issue #144) must reach the SAME NOT_CONFIGURED signal — the resolver
     // branches on that code to answer `false` immediately without burning its stale window.
     await expect(awaited(() => holder.getCapabilities())).rejects.toMatchObject(NOT_CONFIGURED);
-    // The disarmed inner client is never touched.
+    await expect(awaited(() => holder.openCompanionEpub('bk_1'))).rejects.toMatchObject(NOT_CONFIGURED);
+    // The disarmed inner clients are never touched.
     expect(inner.searchMetadata).not.toHaveBeenCalled();
     expect(inner.addBook).not.toHaveBeenCalled();
     expect(inner.getBook).not.toHaveBeenCalled();
     expect(inner.getSystem).not.toHaveBeenCalled();
+    expect(pair.stream.openCompanionEpub).not.toHaveBeenCalled();
+  });
+});
+
+// Issue #145: the holder is the ONE swappable connection generation. Both halves and the counter
+// move in a single synchronous assignment, so nothing can observe a half-swapped connection.
+describe('NarratorrClientHolder — connection generation', () => {
+  it('swaps both slots and bumps the generation in one step; set(null) does too', () => {
+    const a = fakePair();
+    const b = fakePair();
+    const holder = new NarratorrClientHolder(a);
+    expect(holder.generation).toBe(0);
+
+    holder.set(b);
+    expect(holder.generation).toBe(1);
+    expect(holder.configured).toBe(true);
+
+    holder.set(null);
+    expect(holder.generation).toBe(2);
+    expect(holder.configured).toBe(false);
+
+    // Monotonic: re-installing a connection never rewinds the counter, so a cache entry stamped
+    // with an earlier generation can never become readable again.
+    holder.set(a);
+    expect(holder.generation).toBe(3);
+  });
+
+  it('a caller holding only the holder reaches the NEW clients on the very next call', async () => {
+    // The "no service may retain a concrete client" guarantee, from the consumer's side: both
+    // halves are re-read per call, so a swap needs no cooperation from the caller.
+    const a = fakePair();
+    const b = fakePair();
+    const holder = new NarratorrClientHolder(a);
+
+    await holder.getBook('bk_1');
+    await holder.openCompanionEpub('bk_1');
+    expect(a.json.getBook).toHaveBeenCalledTimes(1);
+    expect(a.stream.openCompanionEpub).toHaveBeenCalledTimes(1);
+
+    holder.set(b);
+    await holder.getBook('bk_2');
+    await holder.openCompanionEpub('bk_2');
+
+    expect(b.json.getBook).toHaveBeenCalledWith('bk_2');
+    expect(b.stream.openCompanionEpub).toHaveBeenCalledWith('bk_2', undefined);
+    // Never the retired pair — a captured client would still be answering for server A.
+    expect(a.json.getBook).toHaveBeenCalledTimes(1);
+    expect(a.stream.openCompanionEpub).toHaveBeenCalledTimes(1);
   });
 });

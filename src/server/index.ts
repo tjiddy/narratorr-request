@@ -15,7 +15,7 @@ import { SettingsService } from './services/settings.service.js';
 import { RequestService, resolveRequestPolicy, sanitizeAutoApproveRoles } from './services/request.service.js';
 import { SearchService } from './services/search.service.js';
 import { StatusPoller } from './services/status-poller.js';
-import { NarratorrClient } from './services/narratorr-client.js';
+import { buildNarratorrClients } from './services/narratorr-clients.js';
 import { OidcService, makeOidcMapper, type OidcProfile } from './services/oidc.service.js';
 import { buildNotifier } from './services/notifications/index.js';
 import { RequesterEmailService } from './services/notifications/requester-email.js';
@@ -59,7 +59,7 @@ async function main(): Promise<void> {
   const connectorSettings = new ConnectorSettingsService(db, codec, app.log);
   const narratorrCfg = await connectorSettings.getNarratorrConfig();
   const narratorr = new NarratorrClientHolder(
-    narratorrCfg ? new NarratorrClient({ baseUrl: narratorrCfg.url, apiKey: narratorrCfg.apiKey }) : null,
+    narratorrCfg ? buildNarratorrClients({ baseUrl: narratorrCfg.url, apiKey: narratorrCfg.apiKey }) : null,
   );
   // Surface the unconfigured state at WARN so it survives the prod log level (info is
   // filtered in production) — the on-call breadcrumb for "search/requests don't work".
@@ -87,9 +87,10 @@ async function main(): Promise<void> {
     { getNotifier: () => deps.notifier, users, requesterEmail, logger: app.log },
   );
   const search = new SearchService(narratorr);
-  // Reads narratorr through the HOLDER (not a captured client) so a live reconnect is observed;
-  // `reconfigure()` bumps its generation beside the holder swap on a connection change.
-  const features = new FeatureService(narratorr);
+  // Reads narratorr through the HOLDER (not a captured client) so a live reconnect is observed,
+  // and sources its cache generation from that same holder — the connection swap in
+  // `reconfigure()` retires the previous server's cached capability by construction.
+  const features = new FeatureService(narratorr, narratorr);
   // One OidcService per configured provider, keyed by id. Authorization is the approval
   // queue (no per-provider gate), so the mapped profile flows straight to upsertFromOidc.
   const oidc = new Map<string, { service: OidcService<OidcProfile>; config: (typeof config.oidcProviders)[number] }>();

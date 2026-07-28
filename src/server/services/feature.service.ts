@@ -8,9 +8,10 @@ export const CAPABILITY_UNSUPPORTED_TTL_MS = 300_000;
 export const CAPABILITY_STALE_WINDOW_MS = 900_000;
 
 /**
- * An IMMUTABLE cache entry, stamped with the generation it was produced under. Nothing ever
- * mutates or clears an entry — `invalidate()` retires every prior entry by bumping the generation,
- * which makes an entry whose `generation` differs simply unreadable. That immutability is what
+ * An IMMUTABLE cache entry, stamped with the CONNECTION generation it was produced under. Nothing
+ * ever mutates or clears an entry — installing a new connection retires every prior entry by
+ * bumping that generation, which makes an entry whose `generation` differs simply unreadable
+ * (issue #145: the swap IS the invalidation). That immutability is what
  * lets a probe capture its own generation's entry at start and still evaluate the TTL / stale
  * window against it when it settles, even if the connection changed in the meantime.
  *
@@ -35,6 +36,17 @@ interface InFlight {
 }
 
 /**
+ * The connection's monotonic generation counter — `NarratorrClientHolder` satisfies this
+ * structurally. The resolver READS it and never owns one: a cache entry stamped with a
+ * superseded connection is unreadable by construction, so the holder swap itself retires the
+ * prior connection's entries and in-flight probes. There is deliberately no `invalidate()` to
+ * call beside the swap, and therefore no window in which someone could forget to.
+ */
+export interface ConnectionGeneration {
+  readonly generation: number;
+}
+
+/**
  * Resolves narratorr's companion-ebook CAPABILITY (issue #144) — the network-sourced half of
  * `ebooksEnabled` (the other half is the admin opt-in column, AND-ed at `/api/features`).
  *
@@ -54,27 +66,18 @@ interface InFlight {
  *     never extend it) is open, else fail closed.
  *
  * The narratorr client is read through the HOLDER (never a captured inner client) so a live
- * reconnect is observed. The holder guarantees the *next* call reaches the new server; the
+ * reconnect is observed. The holder guarantees the *next* call reaches the new server; its
  * generation guarantees the *previous* call's answer can't outlive the swap.
  */
 export class FeatureService {
-  /** Monotonic; bumped by {@link invalidate}. Retires all prior state without touching it. */
-  private generation = 0;
   private entry: CacheEntry | null = null;
   private inFlight: InFlight | null = null;
 
-  constructor(private readonly narratorr: ICapabilityClient) {}
-
-  /**
-   * Retire every cached/in-flight result. Synchronous, never throws, and clears NOTHING — it
-   * only increments the generation, which is sufficient because no reader may consult an entry
-   * stamped with a different one. Called beside the narratorr holder swap on a connection change
-   * (see `reconfigure()` in `routes/settings.ts`), so a saved connection is never left paired
-   * with the previous connection's cached capability.
-   */
-  invalidate(): void {
-    this.generation += 1;
-  }
+  constructor(
+    private readonly narratorr: ICapabilityClient,
+    /** The live connection — its generation is read per call, never captured. */
+    private readonly connection: ConnectionGeneration,
+  ) {}
 
   /**
    * Whether the connected narratorr supports companion ebooks. Never rejects.
@@ -83,13 +86,13 @@ export class FeatureService {
    * and `createSessionToken`) so TTL/expiry behavior is testable without fake timers.
    */
   async ebooksCapability(nowMs: number = Date.now()): Promise<boolean> {
-    const generation = this.generation;
-    // Only this generation's entry is readable — a bump retires the previous one in place.
+    const generation = this.connection.generation;
+    // Only this generation's entry is readable — a swap retires the previous one in place.
     const entry = this.entry?.generation === generation ? this.entry : null;
     if (entry && nowMs - entry.resolvedAt < entry.ttlMs) return entry.value;
 
     // Join an in-flight probe only when it belongs to the CURRENT generation; otherwise the
-    // pre-invalidation flight is answering about the previous connection, so start a fresh one.
+    // pre-swap flight is answering about the previous connection, so start a fresh one.
     const joined = this.inFlight?.generation === generation ? this.inFlight : null;
     if (joined) return joined.promise;
 
@@ -128,7 +131,7 @@ export class FeatureService {
       // Transient (401/403, CONTRACT_MISMATCH, NETWORK, any other non-2xx, or a non-NarratorrError):
       // serve the last known value while its window — anchored to the last SUCCESS — is open. A
       // failure installs nothing, so a run of failures can never extend it. No readable entry
-      // (including the first read after an invalidation) → fail closed immediately.
+      // (including the first read after a connection swap) → fail closed immediately.
       if (entry && nowMs - entry.lastSuccessAt < CAPABILITY_STALE_WINDOW_MS) return entry.value;
       return false;
     }
@@ -141,7 +144,7 @@ export class FeatureService {
    * The value is still returned to the callers who asked under the old generation.
    */
   private install(generation: number, value: boolean, nowMs: number, ttlMs: number): boolean {
-    if (generation === this.generation) {
+    if (generation === this.connection.generation) {
       this.entry = { generation, value, resolvedAt: nowMs, lastSuccessAt: nowMs, ttlMs };
     }
     return value;
