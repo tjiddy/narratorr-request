@@ -165,6 +165,10 @@ describe('local signup', () => {
         user: expect.objectContaining({ username: 'guest', authProvider: 'local', email: 'guest@example.com' }),
       }),
     );
+    // The `user` object is an EXPLICIT enumeration, not a row spread — pinned as an exact key set so
+    // a self-scoped column (e.g. `kindleEmail`, #142) can never ride out to an admin notifier.
+    const payload = notifySpy.mock.calls[0]?.[0] as { user: Record<string, unknown> };
+    expect(Object.keys(payload.user).sort()).toEqual(['authProvider', 'email', 'publicId', 'username']);
   });
 
   it('rejects a duplicate email (case-insensitive) with 409', async () => {
@@ -555,5 +559,170 @@ describe('account contact email — PATCH /api/me email contract (#131)', () => 
       payload: { email: 'todd@example.com', password: 'password123' },
     });
     expect(relogin.statusCode).toBe(200);
+  });
+});
+
+describe('PATCH /api/me kindleEmail contract (#142)', () => {
+  const me = (cookies: Record<string, string>) => app.inject({ method: 'GET', url: '/api/me', cookies });
+  const patchMe = (cookies: Record<string, string>, payload: Record<string, unknown>) =>
+    app.inject({ method: 'PATCH', url: '/api/me', cookies, payload });
+
+  // A usable email notifier, so `emailNotifyAvailable` is genuinely capable of being true. Without
+  // this the harness has NO email source and the flag is false no matter what the row holds — a
+  // contamination test on the bare harness would be vacuous.
+  const configureEmailNotifier = () =>
+    connectorSvc.createNotifier({
+      name: 'Mail',
+      type: 'email',
+      events: ['request.created'],
+      config: { host: 'smtp.example.com', port: 587, secure: false, user: 'u', pass: 'p', from: 'ops@example.com', to: 'admin@example.com' },
+    });
+
+  it('a fresh user reads kindleEmail: null', async () => {
+    const guest = await signup(app, 'guest@example.com');
+    expect((await me(sessionCookie(guest))).json().kindleEmail).toBeNull();
+  });
+
+  it('sets the Kindle address and echoes it normalized; GET reflects it', async () => {
+    const guest = await signup(app, 'guest@example.com');
+    const cookie = sessionCookie(guest);
+    const res = await patchMe(cookie, { kindleEmail: '  Device@KINDLE.COM ' });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().kindleEmail).toBe('device@kindle.com'); // normalized by kindleEmailSchema
+    expect((await me(cookie)).json().kindleEmail).toBe('device@kindle.com');
+  });
+
+  it('clears the Kindle address via kindleEmail: null', async () => {
+    const guest = await signup(app, 'guest@example.com');
+    const cookie = sessionCookie(guest);
+    await patchMe(cookie, { kindleEmail: 'device@kindle.com' });
+    const res = await patchMe(cookie, { kindleEmail: null });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().kindleEmail).toBeNull();
+    expect((await me(cookie)).json().kindleEmail).toBeNull();
+  });
+
+  it('rejects a non-kindle.com address with 400', async () => {
+    const guest = await signup(app, 'guest@example.com');
+    expect((await patchMe(sessionCookie(guest), { kindleEmail: 'a@example.com' })).statusCode).toBe(400);
+    expect((await patchMe(sessionCookie(guest), { kindleEmail: 'a@evilkindle.com' })).statusCode).toBe(400);
+  });
+
+  it('rejects kindleEmail "" with 400 and leaves the stored value unchanged', async () => {
+    const guest = await signup(app, 'guest@example.com');
+    const cookie = sessionCookie(guest);
+    await patchMe(cookie, { kindleEmail: 'device@kindle.com' });
+    const res = await patchMe(cookie, { kindleEmail: '' });
+    expect(res.statusCode).toBe(400);
+    expect((await me(cookie)).json().kindleEmail).toBe('device@kindle.com'); // unchanged
+  });
+
+  it('rejects a stray key alongside kindleEmail (strictness preserved)', async () => {
+    const guest = await signup(app, 'guest@example.com');
+    const res = await patchMe(sessionCookie(guest), { kindleEmail: 'device@kindle.com', role: 'admin' });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('401s unauthenticated', async () => {
+    const res = await app.inject({ method: 'PATCH', url: '/api/me', payload: { kindleEmail: 'a@kindle.com' } });
+    expect(res.statusCode).toBe(401);
+  });
+
+  // Three-way independence. #131 only proved email ⟂ notifyOn; a third field on the same write
+  // path needs every pair re-asserted or a shared UPDATE can clobber a sibling column.
+  describe('notifyOn / email / kindleEmail are mutually independent', () => {
+    const seedAll = async () => {
+      const guest = await signup(app, 'guest@example.com');
+      const cookie = sessionCookie(guest);
+      await patchMe(cookie, { notifyOn: ['approved'], email: 'contact@x.com', kindleEmail: 'device@kindle.com' });
+      return cookie;
+    };
+
+    it('a notifyOn-only body leaves email and kindleEmail untouched', async () => {
+      const cookie = await seedAll();
+      const res = await patchMe(cookie, { notifyOn: ['denied'] });
+      expect(res.json()).toMatchObject({
+        notifyOn: ['denied'],
+        email: 'contact@x.com',
+        kindleEmail: 'device@kindle.com',
+      });
+    });
+
+    it('an email-only body leaves notifyOn and kindleEmail untouched', async () => {
+      const cookie = await seedAll();
+      const res = await patchMe(cookie, { email: 'edited@x.com' });
+      expect(res.json()).toMatchObject({
+        notifyOn: ['approved'],
+        email: 'edited@x.com',
+        kindleEmail: 'device@kindle.com',
+      });
+    });
+
+    it('a kindleEmail-only body leaves notifyOn and email untouched', async () => {
+      const cookie = await seedAll();
+      const res = await patchMe(cookie, { kindleEmail: 'other@kindle.com' });
+      expect(res.json()).toMatchObject({
+        notifyOn: ['approved'],
+        email: 'contact@x.com',
+        kindleEmail: 'other@kindle.com',
+      });
+    });
+
+    it('a body carrying all three applies all three; an empty body is a 200 no-op', async () => {
+      const cookie = await seedAll();
+      const all = await patchMe(cookie, { notifyOn: ['available'], email: 'new@x.com', kindleEmail: 'new@kindle.com' });
+      expect(all.json()).toMatchObject({
+        notifyOn: ['available'],
+        email: 'new@x.com',
+        kindleEmail: 'new@kindle.com',
+      });
+      const noop = await patchMe(cookie, {});
+      expect(noop.statusCode).toBe(200);
+      expect(noop.json()).toMatchObject({
+        notifyOn: ['available'],
+        email: 'new@x.com',
+        kindleEmail: 'new@kindle.com',
+      });
+    });
+
+    it('clearing the contact email does not clear the Kindle address', async () => {
+      const cookie = await seedAll();
+      const res = await patchMe(cookie, { email: null });
+      expect(res.json()).toMatchObject({ email: null, kindleEmail: 'device@kindle.com' });
+    });
+  });
+
+  it('mutates only the caller — a second user keeps kindleEmail null', async () => {
+    const alice = sessionCookie(await signup(app, 'alice@example.com'));
+    const bob = sessionCookie(await signup(app, 'bob@example.com'));
+    await patchMe(bob, { kindleEmail: 'bob@kindle.com' });
+    expect((await me(alice)).json().kindleEmail).toBeNull();
+    expect((await me(bob)).json().kindleEmail).toBe('bob@kindle.com');
+  });
+
+  // Contact-predicate contamination (defect vector 8): `hasDeliverableContact` /
+  // `emailNotifyAvailable` must keep reading `users.email` ONLY. These run against a harness with a
+  // USABLE email notifier configured, so the flag can genuinely flip — the positive control below
+  // proves the setup isn't silently pinning it false.
+  describe('a Kindle address never contaminates emailNotifyAvailable', () => {
+    it('stays false for a caller with a Kindle address but NO contact email', async () => {
+      const guest = await signup(app, 'guest@example.com');
+      const cookie = sessionCookie(guest);
+      await configureEmailNotifier();
+      await patchMe(cookie, { email: null }); // no usable contact on the row
+      const res = await patchMe(cookie, { kindleEmail: 'device@kindle.com' });
+      expect(res.json()).toMatchObject({ email: null, kindleEmail: 'device@kindle.com', emailNotifyAvailable: false });
+      expect((await me(cookie)).json().emailNotifyAvailable).toBe(false);
+    });
+
+    it('positive control: a real contact email under the SAME notifier flips it true', async () => {
+      const guest = await signup(app, 'guest@example.com');
+      const cookie = sessionCookie(guest);
+      await configureEmailNotifier();
+      await patchMe(cookie, { email: null });
+      expect((await me(cookie)).json().emailNotifyAvailable).toBe(false);
+      const res = await patchMe(cookie, { email: 'contact@x.com' });
+      expect(res.json().emailNotifyAvailable).toBe(true);
+    });
   });
 });

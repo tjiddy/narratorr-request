@@ -55,6 +55,14 @@ export class UserService {
     };
   }
 
+  /**
+   * The ADMIN user mapper — an explicit allow-list, never a spread of the row. Every admin surface
+   * (`GET /api/admin/users`, `PATCH /api/admin/users/:publicId`) serializes through it, so a column
+   * absent here can never reach an admin. `passwordHash` is the credential-leak guard; `kindleEmail`
+   * (#142) and `notifyOn` are SELF-SCOPED — they belong to `MeDto` (built in `routes/auth.ts`) only.
+   * Do NOT add them here: `userDtoSchema` is a non-strict `z.object`, so the route serializer would
+   * silently strip an added key and mask the leak from a response-body assertion.
+   */
   toDto(row: UserRow): UserDto {
     return {
       publicId: row.publicId,
@@ -158,6 +166,28 @@ export class UserService {
     const [updated] = await this.db
       .update(users)
       .set({ email })
+      .where(eq(users.id, userId))
+      .returning();
+    if (!updated) throw notFound('user not found');
+    return updated;
+  }
+
+  /**
+   * Set or clear the caller's own SEND-TO-KINDLE device address (issue #142) — the destination an
+   * ebook is delivered to (`users.kindle_email`), never a contact/notification address and never the
+   * login identity. Self-scoped and INDEPENDENT of {@link setContactEmail}: the route passes the
+   * AUTHENTICATED user's id and this touches only `kindle_email`, so no path here can mutate another
+   * user or clobber a sibling column (in particular `email`, which alone drives
+   * `hasDeliverableContact` / `emailNotifyAvailable` — a Kindle address never makes requester email
+   * notifications available). `kindleEmail` is already normalized (trim + lowercase) and
+   * domain-validated by the route's `kindleEmailSchema` body, or `null` to clear. A single atomic
+   * UPDATE — no `db.transaction()` (libSQL `:memory:` breaks across transactions in tests). Returns
+   * the updated row.
+   */
+  async setKindleEmail(userId: number, kindleEmail: string | null): Promise<UserRow> {
+    const [updated] = await this.db
+      .update(users)
+      .set({ kindleEmail })
       .where(eq(users.id, userId))
       .returning();
     if (!updated) throw notFound('user not found');
