@@ -13,6 +13,10 @@ import {
   kindleEmailSchema,
   normalizeContactEmail,
   hasDeliverableContact,
+  isApprovedUser,
+  unapprovedStatus,
+  USER_ROLES,
+  USER_STATUSES,
 } from './user.js';
 
 describe('requestQuotaSchema — four-mode discriminated union', () => {
@@ -378,5 +382,39 @@ describe('updateMeBodySchema (PATCH /api/me)', () => {
     it('stays strict — a stray key alongside kindleEmail is rejected', () => {
       expect(updateMeBodySchema.safeParse({ kindleEmail: 'a@kindle.com', role: 'admin' }).success).toBe(false);
     });
+  });
+});
+
+describe('isApprovedUser / unapprovedStatus — the shared approval-queue policy (#144)', () => {
+  const MATRIX = USER_ROLES.flatMap((role) => USER_STATUSES.map((status) => ({ role, status })));
+
+  it('admits an active user and ANY admin — the queue can never lock an admin out', () => {
+    expect(isApprovedUser({ role: 'user', status: 'active' })).toBe(true);
+    // An admin is approved at every status: role is orthogonal to the queue, and the person who
+    // grants approvals must not be able to lock themselves out of the app that grants them.
+    for (const status of USER_STATUSES) {
+      expect(isApprovedUser({ role: 'admin', status }), status).toBe(true);
+    }
+  });
+
+  it('rejects a non-admin who is not active', () => {
+    expect(isApprovedUser({ role: 'user', status: 'pending' })).toBe(false);
+    expect(isApprovedUser({ role: 'user', status: 'rejected' })).toBe(false);
+  });
+
+  it('unapprovedStatus is the exact negation, carrying the state to render', () => {
+    // The two must agree on every input or `App.tsx`'s shell choice and the query/authorization
+    // gates would answer differently for the same account.
+    for (const user of MATRIX) {
+      const unapproved = unapprovedStatus(user);
+      expect(unapproved === null, JSON.stringify(user)).toBe(isApprovedUser(user));
+      // …and when it does report a state, it is the account's own — never `active`.
+      if (unapproved !== null) expect(unapproved).toBe(user.status);
+    }
+  });
+
+  it('names both unapproved states for a non-admin', () => {
+    expect(unapprovedStatus({ role: 'user', status: 'pending' })).toBe('pending');
+    expect(unapprovedStatus({ role: 'user', status: 'rejected' })).toBe('rejected');
   });
 });

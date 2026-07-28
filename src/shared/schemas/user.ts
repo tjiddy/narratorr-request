@@ -15,6 +15,40 @@ export const USER_STATUSES = ['pending', 'active', 'rejected'] as const;
 export const userStatusSchema = z.enum(USER_STATUSES);
 export type UserStatus = z.infer<typeof userStatusSchema>;
 
+/**
+ * THE approval-queue policy — the single home of "does this account count as approved?".
+ *
+ * Admins are always approved: role is orthogonal to the queue, and an admin must never be able to
+ * lock themselves out of the app that grants approvals. Everyone else needs an explicit `active`.
+ *
+ * Deliberately shared rather than restated per layer. Three call sites must agree or the app
+ * misbehaves in ways every layer's own tests would still call green:
+ *   • `requireActiveUser` (`server/plugins/auth.ts`) — the AUTHORIZATION boundary; the only one
+ *     that actually enforces anything.
+ *   • `App.tsx` — which shell an authenticated caller sees (app vs. the pending/rejected screen).
+ *   • `featuresQueryEnabled` (`client/features.ts`) — whether to issue an active-user-only request.
+ * If the client half drifted permissive the SPA would fire requests the server 403s; if it drifted
+ * restrictive it would suppress requests a valid account is entitled to make. `auth.route.test.ts`
+ * pins the server boundary against this predicate over the full role × status matrix, so a change
+ * here that the guard doesn't follow fails loudly.
+ */
+export const isApprovedUser = (user: { role: Role; status: UserStatus }): boolean =>
+  user.role === 'admin' || user.status === 'active';
+
+/** The queue states an unapproved account can be in — `active` is approved by definition. */
+export type UnapprovedStatus = Exclude<UserStatus, 'active'>;
+
+/**
+ * The same decision as {@link isApprovedUser}, but carrying WHICH unapproved state the account is
+ * in — `null` when it is approved. Lets a caller that must render a per-state screen (`App.tsx`)
+ * branch off the shared policy instead of restating it, and keeps the resulting status typed
+ * without a cast. The leading `active` test is what narrows the return type; it is not a second
+ * policy decision (an `active` account is always approved, so that arm is unreachable for a
+ * non-admin and already covered by `isApprovedUser` for an admin).
+ */
+export const unapprovedStatus = (user: { role: Role; status: UserStatus }): UnapprovedStatus | null =>
+  user.status === 'active' || isApprovedUser(user) ? null : user.status;
+
 // Per-user request-quota override as an explicit POLICY MODE (discriminated union), NOT an
 // overloaded `number | null`. The four modes are first-class admin intentions:
 //   • inherit   — no override; fall back to the app default.

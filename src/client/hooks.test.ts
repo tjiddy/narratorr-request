@@ -527,11 +527,42 @@ describe('useUpdateMe — account save with proportional feedback (#50, #134)', 
 describe('useUpdateConnectors', () => {
   const dto = { publicUrl: null } as ConnectorSettingsDto;
 
-  it('writes the connectors cache directly (not invalidate) and toasts "Settings saved"', () => {
-    cb(useUpdateConnectors()).onSuccess(dto);
-    expect(hoisted.qc.setQueryData).toHaveBeenCalledWith(qk.connectors, dto);
+  it('INVALIDATES the connectors cache (never setQueryData) and toasts "Settings saved"', () => {
+    // It used to write `dto` wholesale. That is a lost-update race now that Public URL, quota,
+    // Narratorr and the ebook toggle each own a save against this one key: the response that
+    // settles last overwrites the entry with a snapshot that may predate a sibling's committed
+    // write (#160). Convergence is asserted end-to-end against a real QueryClient in
+    // `hooks.connector-cache.test.tsx`; this row pins the operation that makes it possible.
+    cb(useUpdateConnectors()).onSuccess(dto, {});
+    expect(hoisted.qc.setQueryData).not.toHaveBeenCalled();
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
     expect(success).toHaveBeenCalledWith('Settings saved');
-    expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalled();
+  });
+
+  // F2 — a narratorr connection swap retires the server's capability generation
+  // (`reconfigure(narratorrChanged)`), so a mounted `useFeatures` must be told to refetch. A
+  // `staleTime` lapse alone only MARKS data stale; it schedules nothing.
+  it('retires the derived feature query on a NARRATORR write', () => {
+    cb(useUpdateConnectors()).onSuccess(dto, { narratorr: { url: 'http://n:3000', apiKey: 'k' } });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
+  });
+
+  it('clearing the narratorr connection (null) also retires it', () => {
+    // `null` is a real write — it disconnects narratorr, which definitively drops the capability.
+    cb(useUpdateConnectors()).onSuccess(dto, { narratorr: null });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
+  });
+
+  it.each([
+    ['publicUrl only', { publicUrl: 'https://app.example.com' }],
+    ['defaultQuota only', { defaultQuota: { mode: 'unlimited' as const, windowDays: 30 as const } }],
+  ])('does NOT retire the feature query for %s — it cannot change the derived payload', (_label, body) => {
+    // Mirrors the server's own trigger set: `reconfigure()` bumps the generation only when
+    // `body.narratorr !== undefined`. Over-invalidating here would cost a refetch on every
+    // unrelated General save.
+    cb(useUpdateConnectors()).onSuccess(dto, body);
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
+    expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalledWith({ queryKey: qk.features });
   });
 
   it('surfaces ApiError message, else "Save failed", on error', () => {
@@ -569,19 +600,14 @@ describe('useUpdateEbooksEnabled (#144)', () => {
     expect(success).toHaveBeenCalledWith('Settings saved');
   });
 
-  it('converges under REVERSE settlement with a sibling wholesale save', () => {
-    // Simulate the race: the toggle save commits first, then a publicUrl save (issued earlier,
-    // settling later) writes its pre-toggle response snapshot over the whole cache entry.
-    const staleSnapshot = { publicUrl: 'https://app.example.com', ebooksEnabled: false } as ConnectorSettingsDto;
+  it('neither the toggle nor its sibling ever blind-writes the shared connectors entry', () => {
+    // This file mocks the QueryClient, so it can only prove which cache OPERATIONS are requested —
+    // never what the cache converges on. That is the necessary condition; the sufficient one (the
+    // final value after a reverse-order settle) is asserted against a REAL QueryClient in
+    // `hooks.connector-cache.test.tsx`, which fails if either mutation reverts to setQueryData.
     cb(useUpdateEbooksEnabled()).onSuccess();
-    cb(useUpdateConnectors()).onSuccess(staleSnapshot);
-
-    // The sibling did clobber the cache with `ebooksEnabled: false`…
-    expect(hoisted.qc.setQueryData).toHaveBeenCalledWith(qk.connectors, staleSnapshot);
-    // …but the toggle asked for a REFETCH of that same key rather than a competing write, so the
-    // server's committed row is what lands last. A toggle built on setQueryData would instead
-    // leave the clobbered value on screen with no pending read to correct it.
-    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
+    cb(useUpdateConnectors()).onSuccess({} as ConnectorSettingsDto, {});
+    expect(hoisted.qc.setQueryData).not.toHaveBeenCalled();
   });
 
   it('surfaces the ApiError message, else a fallback', () => {
@@ -625,6 +651,13 @@ describe('useUpdateKindleSender (#143)', () => {
     expect(success).toHaveBeenCalledWith('Kindle sender saved');
   });
 
+  // F3 — `/api/features` derives `kindleSenderEmail` / `kindleDeliveryAvailable` from the SAME
+  // read-time sender resolution this save changes, so the selection must retire both keys.
+  it('also retires the derived feature query (selection changes Kindle readiness)', () => {
+    cb(useUpdateKindleSender()).onSuccess();
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
+  });
+
   it('surfaces the ApiError message (the case-specific KINDLE_SENDER_INVALID text), else a fallback', () => {
     const h = cb(useUpdateKindleSender());
     h.onError(new ApiError(400, 'KINDLE_SENDER_INVALID', 'The Kindle sender must be an email (SMTP) notifier.'));
@@ -665,6 +698,17 @@ describe('notifier mutation hooks — cache invalidation + toast contract', () =
     expect(success).toHaveBeenCalledWith('Notifier added');
   });
 
+  // F3 — the Kindle sender is resolved at READ time against the live notifier list, so editing
+  // the selected notifier's `from` flips it to `sender-changed` and deleting it to
+  // `notifier-missing`; both change the `/api/features` payload. CREATE is the one notifier
+  // mutation that cannot: the resolver matches the stored selection by id, and a new notifier gets
+  // a fresh `publicId('nf')` that no stored selection can already name.
+  it('useCreateNotifier does NOT retire the feature query (a new id can never be the selected sender)', () => {
+    cb(useCreateNotifier()).onSuccess();
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
+    expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalledWith({ queryKey: qk.features });
+  });
+
   it('useCreateNotifier surfaces ApiError message, else "Could not add notifier"', () => {
     const h = cb(useCreateNotifier());
     h.onError(new ApiError(400, 'B', 'bad notifier'));
@@ -679,6 +723,11 @@ describe('notifier mutation hooks — cache invalidation + toast contract', () =
     expect(success).toHaveBeenCalledWith('Notifier saved');
   });
 
+  it('useUpdateNotifier retires the feature query (an edited `from` can break the saved sender)', () => {
+    cb(useUpdateNotifier()).onSuccess();
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
+  });
+
   it('useUpdateNotifier surfaces ApiError message, else "Could not save notifier"', () => {
     const h = cb(useUpdateNotifier());
     h.onError(new ApiError(404, 'N', 'gone'));
@@ -691,6 +740,11 @@ describe('notifier mutation hooks — cache invalidation + toast contract', () =
     cb(useDeleteNotifier()).onSuccess();
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
     expect(success).toHaveBeenCalledWith('Notifier deleted');
+  });
+
+  it('useDeleteNotifier retires the feature query (deleting the selected sender ends delivery)', () => {
+    cb(useDeleteNotifier()).onSuccess();
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
   });
 
   it('useDeleteNotifier surfaces ApiError message, else "Could not delete notifier"', () => {

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import Fastify, { type FastifyInstance } from 'fastify';
+import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import cookie from '@fastify/cookie';
 import rateLimit from '@fastify/rate-limit';
 import { serializerCompiler, validatorCompiler, type ZodTypeProvider } from 'fastify-type-provider-zod';
@@ -22,7 +22,8 @@ import type { AppDeps } from '../services/deps.js';
 import type { INarratorrClient } from '../services/narratorr-client.js';
 import { buildRouteApp } from '../test-support/route-harness.js';
 import { insertUser } from '../test-support/db.js';
-import { meDtoSchema } from '../../shared/schemas/user.js';
+import { meDtoSchema, isApprovedUser, USER_ROLES, USER_STATUSES } from '../../shared/schemas/user.js';
+import { requireActiveUser } from '../plugins/auth.js';
 
 const SESSION_SECRET = 'auth-route-test-secret';
 
@@ -793,5 +794,53 @@ describe('GET /api/me — isolation from narratorr / feature state (#144)', () =
     for (const key of FEATURE_KEYS) {
       expect(meDtoSchema.shape).not.toHaveProperty(key);
     }
+  });
+});
+
+/**
+ * F4 — the approval-queue policy has ONE home (`isApprovedUser`), and the server's authorization
+ * boundary is the thing that must actually obey it.
+ *
+ * `requireActiveUser` (the enforcement), `App.tsx` (which shell an authenticated caller sees) and
+ * `featuresQueryEnabled` (whether to issue an active-user-only request) all consume the shared
+ * predicate. Each of those has its own unit tests, but per-layer tests can ALL stay green while
+ * the layers drift apart — so this asserts the cross-contract directly: over the complete
+ * role × status matrix, `requireActiveUser` admits exactly the callers `isApprovedUser` accepts.
+ *
+ * Driven through the real guard, not a re-derivation of it: if a future change reintroduces a
+ * local role/status test in `auth.ts`, this fails even though the predicate itself still passes.
+ */
+describe('requireActiveUser × isApprovedUser cross-contract (#144 F4)', () => {
+  const MATRIX = USER_ROLES.flatMap((role) => USER_STATUSES.map((status) => ({ role, status })));
+
+  it('covers the whole role × status space, with both verdicts represented', () => {
+    // Guards the guard: a matrix that accidentally became all-admit (or all-deny) would make
+    // every row below vacuous.
+    expect(MATRIX).toHaveLength(6);
+    const approved = MATRIX.filter(isApprovedUser);
+    expect(approved.length).toBeGreaterThan(0);
+    expect(approved.length).toBeLessThan(MATRIX.length);
+  });
+
+  it.each(MATRIX)('requireActiveUser admits (%s) exactly when isApprovedUser does', (user) => {
+    const request = { user: { id: 1, publicId: 'us_1', username: 'u', ...user } } as FastifyRequest;
+    const expected = isApprovedUser(user);
+
+    if (expected) {
+      expect(requireActiveUser(request)).toMatchObject(user);
+    } else {
+      // …and a rejected caller gets the account-state error, never a silent pass-through.
+      expect(() => requireActiveUser(request)).toThrowError(
+        expect.objectContaining({ statusCode: 403 }) as Error,
+      );
+    }
+  });
+
+  it('still rejects an unauthenticated request regardless of the predicate', () => {
+    // `isApprovedUser` speaks only to role/status; authentication is a separate precondition the
+    // guard owns, and sharing the predicate must not have leaked that away.
+    expect(() => requireActiveUser({} as FastifyRequest)).toThrowError(
+      expect.objectContaining({ statusCode: 401 }) as Error,
+    );
   });
 });

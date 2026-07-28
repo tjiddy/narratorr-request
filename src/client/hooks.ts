@@ -261,12 +261,33 @@ export const useConnectorSettings = () =>
     refetchOnWindowFocus: false,
   });
 
+/**
+ * The General + Narratorr cards' save. INVALIDATES `qk.connectors` rather than writing the
+ * response DTO wholesale.
+ *
+ * It used to `setQueryData(qk.connectors, dto)`, which was safe only while exactly one mutation
+ * instance existed. It hasn't been for a while: Public URL, default quota and Narratorr each
+ * instantiate their own, and the ebook toggle (#144) added a fourth save to the same key. Two
+ * concurrent saves are then a lost-update race — the server computes each response from the row as
+ * it stood when THAT request read it, so a response that settles last overwrites the whole cache
+ * entry with a snapshot predating its sibling's committed write (the #160 shape). Invalidating
+ * instead means every save converges on one authoritative re-read regardless of settle order:
+ * a later invalidation supersedes an in-flight refetch rather than racing a blind write against it.
+ *
+ * `qk.features` is retired only for a NARRATORR write — the same trigger, and the same reasoning,
+ * as `reconfigure(narratorrChanged)` on the server (`routes/settings.ts`): swapping the connection
+ * retires the cached capability generation, so an already-mounted `useFeatures` would otherwise
+ * keep serving the previous server's `ebooksEnabled` until its `staleTime` lapsed AND something
+ * happened to trigger a refetch (a stale mark alone schedules nothing). Public URL and quota saves
+ * cannot change the derived payload, so they don't pay for a refetch.
+ */
 export function useUpdateConnectors() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (body: UpdateConnectorSettingsBody) => updateConnectorSettings(body),
-    onSuccess: (dto) => {
-      qc.setQueryData(qk.connectors, dto);
+    onSuccess: (_dto, body) => {
+      void qc.invalidateQueries({ queryKey: qk.connectors });
+      if (body.narratorr !== undefined) void qc.invalidateQueries({ queryKey: qk.features });
       toast.success('Settings saved');
     },
     onError: (err) => toast.error(err instanceof ApiError ? err.message : 'Save failed'),
@@ -276,10 +297,9 @@ export function useUpdateConnectors() {
 /**
  * The Kindle-sender picker's own save (issue #143). It hits the SAME connectors PUT but
  * INVALIDATES `qk.connectors` rather than writing it wholesale, mirroring the notifier-CRUD
- * mutations it sits beside. `useUpdateConnectors`'s `setQueryData` is safe only because one
- * mutation instance sits behind one Save; adding a second wholesale writer to the same key is
- * the issue #160 shape. Invalidating also re-runs the server's read-time resolution, which is
- * what turns a reconfirm into `ok` on screen.
+ * mutations it sits beside — every save against this shared key now invalidates, which is what
+ * makes concurrent saves converge instead of racing (#160). Invalidating also re-runs the
+ * server's read-time resolution, which is what turns a reconfirm into `ok` on screen.
  */
 export function useUpdateKindleSender() {
   const qc = useQueryClient();
@@ -287,6 +307,9 @@ export function useUpdateKindleSender() {
     mutationFn: (body: UpdateConnectorSettingsBody) => updateConnectorSettings(body),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: qk.connectors });
+      // `/api/features` derives `kindleSenderEmail` / `kindleDeliveryAvailable` from exactly the
+      // read-time sender resolution this save changes (#144), so retire that key too.
+      void qc.invalidateQueries({ queryKey: qk.features });
       toast.success('Kindle sender saved');
     },
     onError: (err) => toast.error(err instanceof ApiError ? err.message : 'Could not save the Kindle sender'),
@@ -295,14 +318,13 @@ export function useUpdateKindleSender() {
 
 /**
  * The companion-ebook toggle's own save (issue #144). Like {@link useUpdateKindleSender} it hits
- * the shared connectors PUT but INVALIDATES `qk.connectors` rather than writing it wholesale.
+ * the shared connectors PUT but INVALIDATES `qk.connectors` rather than writing it wholesale, so
+ * concurrent saves converge on the server's authoritative row regardless of settle order (#160 —
+ * asserted end-to-end in `hooks.connector-cache.test.tsx`).
  *
- * `useUpdateConnectors`'s `setQueryData` is only safe because one mutation instance sits behind
- * one Save; the General section already runs Public URL and quota saves independently, so a second
- * wholesale writer on the same key is the issue #160 rollback shape — under reverse settlement an
- * earlier response snapshot overwrites a later sibling's committed field, and the toggle visibly
- * reverts even though its write succeeded. Invalidating re-reads the server's authoritative row
- * instead, so concurrent saves converge on both committed values regardless of settle order.
+ * It always retires `qk.features` as well: this flag IS half of the derived `ebooksEnabled`, so
+ * the payload is stale the moment the toggle lands, and an admin's own tab would otherwise keep
+ * the old gating until something else happened to trigger a refetch.
  */
 export function useUpdateEbooksEnabled() {
   const qc = useQueryClient();
@@ -332,6 +354,15 @@ export function useTestConnector() {
 // list reflects the committed state — and the masked secrets reset cleanly. They
 // invalidate `qk.connectors`, the same entry the connectors query reads and the save
 // writes, so all four sites agree through one registry entry.
+//
+// EDIT and DELETE also retire `qk.features` (#144): the Kindle sender is resolved at READ time
+// against the live notifier list, so editing the selected notifier's `from` flips it to
+// `sender-changed` and deleting it to `notifier-missing` — both of which change
+// `kindleDeliveryAvailable` / `kindleSenderEmail` on `/api/features`.
+//
+// CREATE deliberately does NOT: the resolver matches the stored selection by notifier id, and a
+// new notifier is assigned a fresh `publicId('nf')`, so it cannot become (or repair) the selected
+// sender. Adding one is the single notifier mutation that cannot change the derived payload.
 
 export function useCreateNotifier() {
   const qc = useQueryClient();
@@ -351,6 +382,7 @@ export function useUpdateNotifier() {
     mutationFn: ({ id, body }: { id: string; body: UpdateNotifierBody }) => updateNotifier(id, body),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: qk.connectors });
+      void qc.invalidateQueries({ queryKey: qk.features });
       toast.success('Notifier saved');
     },
     onError: (err) => toast.error(err instanceof ApiError ? err.message : 'Could not save notifier'),
@@ -363,6 +395,7 @@ export function useDeleteNotifier() {
     mutationFn: (id: string) => deleteNotifier(id),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: qk.connectors });
+      void qc.invalidateQueries({ queryKey: qk.features });
       toast.success('Notifier deleted');
     },
     onError: (err) => toast.error(err instanceof ApiError ? err.message : 'Could not delete notifier'),

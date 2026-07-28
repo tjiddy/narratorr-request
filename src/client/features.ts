@@ -1,5 +1,5 @@
 import type { FeaturesDto } from '@shared/schemas/features';
-import type { MeDto } from '@shared/schemas/user';
+import { isApprovedUser, type MeDto } from '@shared/schemas/user';
 
 // Pure feature-gating predicates for the SPA (issue #144). Kept out of the components so the
 // decision logic is unit-tested directly rather than through the DOM.
@@ -38,8 +38,11 @@ export const kindleDeliveryVisible = (state: FeaturesState): boolean =>
 /**
  * Whether the features query should run at all. `/api/features` is `requireActiveUser`, so it
  * would 401 on the login screen and 403 on the pending/rejected screen — pointless requests that
- * would also surface as query errors. Admins are always treated as active (they can't be locked
- * out by the approval queue), mirroring `requireActiveUser` on the server.
+ * would also surface as query errors.
+ *
+ * The role/status decision is NOT restated here: it comes from the shared {@link isApprovedUser},
+ * the same predicate the server guard enforces. This function owns only the client-side extra —
+ * that an unauthenticated caller (no `me` payload yet) has nothing to gate on.
  */
 export const featuresQueryEnabled = (me: MeDto | undefined): boolean =>
-  me !== undefined && (me.role === 'admin' || me.status === 'active');
+  me !== undefined && isApprovedUser(me);
