@@ -141,18 +141,30 @@ describe('SettingsPage → NotifiersSection → KindleSenderCard wiring (#143)',
  * prop chain the Kindle-sender cases above cover for the Notifications section.
  */
 describe('SettingsPage → GeneralSection → companion-ebook toggle (#144)', () => {
-  /** Render the page on the General section (where the toggle lives) and return the fetch spy. */
-  async function openGeneral(settings: ConnectorSettingsDto) {
+  /**
+   * Render the page on the General section (where the toggle lives) and return the fetch spy.
+   *
+   * `holdPut` parks every PUT on a deferred the caller releases, so a test can observe the page
+   * WHILE the request is in flight — the only way to exercise the Save button's pending lock.
+   */
+  async function openGeneral(settings: ConnectorSettingsDto, opts: { holdPut?: boolean } = {}) {
+    const releases: Array<() => void> = [];
+    // One authoritative row, as the server has: a PUT COMMITS into it and a subsequent GET (the
+    // refetch every save triggers) serves the committed state. Echoing the request body back
+    // without committing would let the post-save reseed disagree with what was written.
+    const row: ConnectorSettingsDto = { ...settings };
     vi.stubGlobal(
       'fetch',
       vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input);
         if (url.startsWith(CONNECTORS_URL)) {
-          // Echo the write back so the PUT resolves like the real route does.
           if (init?.method === 'PUT') {
-            return Promise.resolve(jsonRes(200, { ...settings, ...JSON.parse(String(init.body)) }));
+            Object.assign(row, JSON.parse(String(init.body)) as Partial<ConnectorSettingsDto>);
+            const res = jsonRes(200, { ...row });
+            if (!opts.holdPut) return Promise.resolve(res);
+            return new Promise<Response>((resolve) => releases.push(() => resolve(res)));
           }
-          return Promise.resolve(jsonRes(200, settings));
+          return Promise.resolve(jsonRes(200, { ...row }));
         }
         throw new Error(`unstubbed fetch: ${url}`);
       }),
@@ -166,7 +178,11 @@ describe('SettingsPage → GeneralSection → companion-ebook toggle (#144)', ()
     );
     // General is the default section; wait for the settings load to paint it.
     await screen.findByText('Companion eBooks');
-    return { user, fetchMock: vi.mocked(globalThis.fetch) };
+    return {
+      user,
+      fetchMock: vi.mocked(globalThis.fetch),
+      releaseAllPuts: () => releases.splice(0).forEach((r) => r()),
+    };
   }
 
   /** The PUT bodies the page sent, in order. */
@@ -197,6 +213,31 @@ describe('SettingsPage → GeneralSection → companion-ebook toggle (#144)', ()
     // ONLY the toggle: no sibling field, and no `narratorr` key (which would retire the server's
     // cached capability on every save).
     expect(putBodies(fetchMock)[0]).toEqual({ ebooksEnabled: true });
+  });
+
+  // F7 — `EbooksCard` wires `update.isPending` into `SaveButton`, but a test whose PUT resolves
+  // immediately never observes the in-flight window: replacing `pending={update.isPending}` with
+  // `pending={false}` would leave every other row green. These hold the request open instead.
+  it('locks the Save button while the PUT is in flight, and a second click cannot double-write', async () => {
+    const { user, fetchMock, releaseAllPuts } = await openGeneral(dto({ ebooksEnabled: false }), { holdPut: true });
+    await user.click(screen.getByLabelText('Companion eBooks'));
+
+    const save = await screen.findByRole('button', { name: 'Save' });
+    await user.click(save);
+
+    // In flight: the button reports busy (Button maps `loading` → `disabled`), so the browser
+    // cannot dispatch another submit from it.
+    await vi.waitFor(() => expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled());
+    expect(putBodies(fetchMock)).toHaveLength(1);
+
+    // A second click during the lock must not reach the network.
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    expect(putBodies(fetchMock)).toHaveLength(1);
+
+    // …and the lock lifts once the request settles.
+    releaseAllPuts();
+    await vi.waitFor(() => expect(screen.queryByRole('button', { name: 'Save' })).not.toBeInTheDocument());
+    expect(putBodies(fetchMock)).toHaveLength(1);
   });
 
   it('turning it OFF submits an EXPLICIT false, not an empty body', async () => {

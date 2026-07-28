@@ -61,9 +61,9 @@ export const qk = {
   users: ['admin', 'users'] as const,
   userRequests: (publicId: string, limit: number) =>
     ['admin', 'users', publicId, 'requests', limit] as const,
-  // The connectors settings blob — one entry shared by the query, its optimistic
-  // setQueryData write, and the notifier mutations that invalidate it. These must agree
-  // byte-for-byte or save → cache-write → invalidate silently no-ops.
+  // The connectors settings blob — one entry shared by the query and by every settings/notifier
+  // mutation, all of which INVALIDATE it (no writer holds a wholesale setQueryData any more; see
+  // `reconcileConnectorWrite`). These must agree byte-for-byte or an invalidation silently no-ops.
   connectors: ['admin', 'settings', 'connectors'] as const,
   system: ['admin', 'system'] as const,
   // Derived feature state (issue #144). Instance-level and identical for every active caller, so
@@ -262,6 +262,30 @@ export const useConnectorSettings = () =>
   });
 
 /**
+ * Reconcile the caches a settings write can invalidate, from the SERVER's committed state.
+ *
+ * Called from `onSettled`, never `onSuccess`. Every settings route persists FIRST and only then
+ * awaits the fallible reconfiguration tail (`routes/settings.ts` — `update()`/`createNotifier()`/
+ * `updateNotifier()`/`deleteNotifier()` all commit before `await reconfigure(...)`), so a write can
+ * be durable in the database and STILL answer 500. `settings.route.test.ts`'s rejecting-tail rows
+ * assert exactly that pairing. Reconciling only on success therefore leaves the SPA rendering
+ * pre-write state for a change that actually landed — the mirror image of the #160 race, and the
+ * reason reconciliation is a settlement concern rather than a success concern.
+ *
+ * Refetching after a genuine failure (a 400 the server rejected outright, or an unsent request) is
+ * the cheap direction: it costs one GET that returns the unchanged row. Guessing from the status
+ * code which failures committed is not something a client can do correctly.
+ *
+ * `retiresCapability` mirrors the server's own trigger — `reconfigure(narratorrChanged)` bumps the
+ * capability generation only for a narratorr write, so only that write needs `qk.features` on this
+ * path. (Writes whose OWN field feeds the derived payload pass `true` unconditionally.)
+ */
+function reconcileConnectorWrite(qc: ReturnType<typeof useQueryClient>, retiresCapability: boolean): void {
+  void qc.invalidateQueries({ queryKey: qk.connectors });
+  if (retiresCapability) void qc.invalidateQueries({ queryKey: qk.features });
+}
+
+/**
  * The General + Narratorr cards' save. INVALIDATES `qk.connectors` rather than writing the
  * response DTO wholesale.
  *
@@ -280,16 +304,16 @@ export const useConnectorSettings = () =>
  * keep serving the previous server's `ebooksEnabled` until its `staleTime` lapsed AND something
  * happened to trigger a refetch (a stale mark alone schedules nothing). Public URL and quota saves
  * cannot change the derived payload, so they don't pay for a refetch.
+ *
+ * Both reconciliations run from `onSettled` — see {@link reconcileConnectorWrite} for why a 500 is
+ * not evidence that nothing was written.
  */
 export function useUpdateConnectors() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (body: UpdateConnectorSettingsBody) => updateConnectorSettings(body),
-    onSuccess: (_dto, body) => {
-      void qc.invalidateQueries({ queryKey: qk.connectors });
-      if (body.narratorr !== undefined) void qc.invalidateQueries({ queryKey: qk.features });
-      toast.success('Settings saved');
-    },
+    onSettled: (_dto, _err, body) => reconcileConnectorWrite(qc, body.narratorr !== undefined),
+    onSuccess: () => toast.success('Settings saved'),
     onError: (err) => toast.error(err instanceof ApiError ? err.message : 'Save failed'),
   });
 }
@@ -305,13 +329,10 @@ export function useUpdateKindleSender() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (body: UpdateConnectorSettingsBody) => updateConnectorSettings(body),
-    onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: qk.connectors });
-      // `/api/features` derives `kindleSenderEmail` / `kindleDeliveryAvailable` from exactly the
-      // read-time sender resolution this save changes (#144), so retire that key too.
-      void qc.invalidateQueries({ queryKey: qk.features });
-      toast.success('Kindle sender saved');
-    },
+    // `/api/features` derives `kindleSenderEmail` / `kindleDeliveryAvailable` from exactly the
+    // read-time sender resolution this save changes (#144), so it always retires that key too.
+    onSettled: () => reconcileConnectorWrite(qc, true),
+    onSuccess: () => toast.success('Kindle sender saved'),
     onError: (err) => toast.error(err instanceof ApiError ? err.message : 'Could not save the Kindle sender'),
   });
 }
@@ -324,19 +345,15 @@ export function useUpdateKindleSender() {
  *
  * It always retires `qk.features` as well: this flag IS half of the derived `ebooksEnabled`, so
  * the payload is stale the moment the toggle lands, and an admin's own tab would otherwise keep
- * the old gating until something else happened to trigger a refetch.
+ * the old gating until something else happened to trigger a refetch. Reconciled on settlement, so
+ * a toggle that commits and then 500s in the reconfiguration tail still refreshes the UI.
  */
 export function useUpdateEbooksEnabled() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (body: UpdateConnectorSettingsBody) => updateConnectorSettings(body),
-    onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: qk.connectors });
-      // The derived feature payload is computed from this flag, so it is stale the moment the
-      // toggle lands — refresh it or the admin's own tab keeps the old gating until it refocuses.
-      void qc.invalidateQueries({ queryKey: qk.features });
-      toast.success('Settings saved');
-    },
+    onSettled: () => reconcileConnectorWrite(qc, true),
+    onSuccess: () => toast.success('Settings saved'),
     onError: (err) => toast.error(err instanceof ApiError ? err.message : 'Save failed'),
   });
 }
@@ -368,10 +385,8 @@ export function useCreateNotifier() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (body: CreateNotifierBody) => createNotifier(body),
-    onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: qk.connectors });
-      toast.success('Notifier added');
-    },
+    onSettled: () => reconcileConnectorWrite(qc, false),
+    onSuccess: () => toast.success('Notifier added'),
     onError: (err) => toast.error(err instanceof ApiError ? err.message : 'Could not add notifier'),
   });
 }
@@ -380,11 +395,8 @@ export function useUpdateNotifier() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ id, body }: { id: string; body: UpdateNotifierBody }) => updateNotifier(id, body),
-    onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: qk.connectors });
-      void qc.invalidateQueries({ queryKey: qk.features });
-      toast.success('Notifier saved');
-    },
+    onSettled: () => reconcileConnectorWrite(qc, true),
+    onSuccess: () => toast.success('Notifier saved'),
     onError: (err) => toast.error(err instanceof ApiError ? err.message : 'Could not save notifier'),
   });
 }
@@ -393,11 +405,8 @@ export function useDeleteNotifier() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => deleteNotifier(id),
-    onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: qk.connectors });
-      void qc.invalidateQueries({ queryKey: qk.features });
-      toast.success('Notifier deleted');
-    },
+    onSettled: () => reconcileConnectorWrite(qc, true),
+    onSuccess: () => toast.success('Notifier deleted'),
     onError: (err) => toast.error(err instanceof ApiError ? err.message : 'Could not delete notifier'),
   });
 }

@@ -123,6 +123,8 @@ const error = vi.mocked(toast.error);
 interface Callbacks {
   onSuccess: (...args: any[]) => unknown;
   onError: (...args: any[]) => unknown;
+  /** Cache reconciliation lives here, not on onSuccess — a settings write can commit and 500. */
+  onSettled: (...args: any[]) => unknown;
 }
 const cb = (hook: unknown): Callbacks => hook as Callbacks;
 
@@ -533,9 +535,10 @@ describe('useUpdateConnectors', () => {
     // settles last overwrites the entry with a snapshot that may predate a sibling's committed
     // write (#160). Convergence is asserted end-to-end against a real QueryClient in
     // `hooks.connector-cache.test.tsx`; this row pins the operation that makes it possible.
-    cb(useUpdateConnectors()).onSuccess(dto, {});
+    cb(useUpdateConnectors()).onSettled(dto, null, {});
     expect(hoisted.qc.setQueryData).not.toHaveBeenCalled();
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
+    cb(useUpdateConnectors()).onSuccess();
     expect(success).toHaveBeenCalledWith('Settings saved');
   });
 
@@ -543,13 +546,13 @@ describe('useUpdateConnectors', () => {
   // (`reconfigure(narratorrChanged)`), so a mounted `useFeatures` must be told to refetch. A
   // `staleTime` lapse alone only MARKS data stale; it schedules nothing.
   it('retires the derived feature query on a NARRATORR write', () => {
-    cb(useUpdateConnectors()).onSuccess(dto, { narratorr: { url: 'http://n:3000', apiKey: 'k' } });
+    cb(useUpdateConnectors()).onSettled(dto, null, { narratorr: { url: 'http://n:3000', apiKey: 'k' } });
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
   });
 
   it('clearing the narratorr connection (null) also retires it', () => {
     // `null` is a real write — it disconnects narratorr, which definitively drops the capability.
-    cb(useUpdateConnectors()).onSuccess(dto, { narratorr: null });
+    cb(useUpdateConnectors()).onSettled(dto, null, { narratorr: null });
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
   });
 
@@ -560,7 +563,27 @@ describe('useUpdateConnectors', () => {
     // Mirrors the server's own trigger set: `reconfigure()` bumps the generation only when
     // `body.narratorr !== undefined`. Over-invalidating here would cost a refetch on every
     // unrelated General save.
-    cb(useUpdateConnectors()).onSuccess(dto, body);
+    cb(useUpdateConnectors()).onSettled(dto, null, body);
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
+    expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalledWith({ queryKey: qk.features });
+  });
+
+  // F5 — the route persists BEFORE awaiting its fallible reconfiguration tail
+  // (`routes/settings.ts`), so a 500 is not evidence that nothing was written; the server's own
+  // rejecting-tail tests assert exactly that pairing. Reconciling only on success would strand the
+  // SPA on pre-write state for a change that actually landed.
+  it('reconciles BOTH keys when a narratorr write commits and then 500s', () => {
+    cb(useUpdateConnectors()).onSettled(undefined, new ApiError(500, 'E', 'reconfigure blew up'), {
+      narratorr: { url: 'http://n:3000', apiKey: 'k' },
+    });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
+  });
+
+  it('keeps the body-sensitive feature trigger on the error path too', () => {
+    // A failed publicUrl save must not start refetching features either — the trigger is the
+    // BODY, not the outcome.
+    cb(useUpdateConnectors()).onSettled(undefined, new ApiError(500, 'E', 'boom'), { publicUrl: null });
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
     expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalledWith({ queryKey: qk.features });
   });
@@ -592,12 +615,22 @@ describe('useUpdateEbooksEnabled (#144)', () => {
     // `qk.connectors` is the #160 rollback shape: under reverse settlement an earlier response
     // snapshot overwrites a later sibling's committed field, so the toggle visibly reverts even
     // though its own write succeeded. Invalidating re-reads the authoritative row instead.
-    cb(useUpdateEbooksEnabled()).onSuccess();
+    cb(useUpdateEbooksEnabled()).onSettled();
     expect(hoisted.qc.setQueryData).not.toHaveBeenCalled();
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
     // …and the derived payload is stale the moment the flag lands.
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
+    cb(useUpdateEbooksEnabled()).onSuccess();
     expect(success).toHaveBeenCalledWith('Settings saved');
+  });
+
+  // F5 — the toggle write commits before the route's fallible reconfiguration tail, so an
+  // errored save still has to refresh both keys or the admin sees the old gating for a flag
+  // that is durably set.
+  it('reconciles both keys when the toggle commits and then 500s', () => {
+    cb(useUpdateEbooksEnabled()).onSettled(undefined, new ApiError(500, 'E', 'reconfigure blew up'));
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
   });
 
   it('neither the toggle nor its sibling ever blind-writes the shared connectors entry', () => {
@@ -605,8 +638,8 @@ describe('useUpdateEbooksEnabled (#144)', () => {
     // never what the cache converges on. That is the necessary condition; the sufficient one (the
     // final value after a reverse-order settle) is asserted against a REAL QueryClient in
     // `hooks.connector-cache.test.tsx`, which fails if either mutation reverts to setQueryData.
-    cb(useUpdateEbooksEnabled()).onSuccess();
-    cb(useUpdateConnectors()).onSuccess({} as ConnectorSettingsDto, {});
+    cb(useUpdateEbooksEnabled()).onSettled();
+    cb(useUpdateConnectors()).onSettled({} as ConnectorSettingsDto, null, {});
     expect(hoisted.qc.setQueryData).not.toHaveBeenCalled();
   });
 
@@ -645,16 +678,24 @@ describe('useUpdateKindleSender (#143)', () => {
   });
 
   it('invalidates the connectors key (never setQueryData) and toasts "Kindle sender saved"', () => {
-    cb(useUpdateKindleSender()).onSuccess();
+    cb(useUpdateKindleSender()).onSettled();
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
     expect(hoisted.qc.setQueryData).not.toHaveBeenCalled();
+    cb(useUpdateKindleSender()).onSuccess();
     expect(success).toHaveBeenCalledWith('Kindle sender saved');
   });
 
   // F3 — `/api/features` derives `kindleSenderEmail` / `kindleDeliveryAvailable` from the SAME
   // read-time sender resolution this save changes, so the selection must retire both keys.
   it('also retires the derived feature query (selection changes Kindle readiness)', () => {
-    cb(useUpdateKindleSender()).onSuccess();
+    cb(useUpdateKindleSender()).onSettled();
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
+  });
+
+  // F5 — the sender write commits before the fallible tail, so a 500 still has to reconcile.
+  it('reconciles both keys when a sender selection commits and then 500s', () => {
+    cb(useUpdateKindleSender()).onSettled(undefined, new ApiError(500, 'E', 'reconfigure blew up'));
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
   });
 
@@ -692,9 +733,10 @@ describe('notifier mutation hooks — cache invalidation + toast contract', () =
   // between the four connectors sites would fail here.
 
   it('useCreateNotifier invalidates the connectors key and toasts "Notifier added"', () => {
-    cb(useCreateNotifier()).onSuccess();
+    cb(useCreateNotifier()).onSettled();
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
     expect(hoisted.qc.setQueryData).not.toHaveBeenCalled();
+    cb(useCreateNotifier()).onSuccess();
     expect(success).toHaveBeenCalledWith('Notifier added');
   });
 
@@ -704,7 +746,15 @@ describe('notifier mutation hooks — cache invalidation + toast contract', () =
   // mutation that cannot: the resolver matches the stored selection by id, and a new notifier gets
   // a fresh `publicId('nf')` that no stored selection can already name.
   it('useCreateNotifier does NOT retire the feature query (a new id can never be the selected sender)', () => {
-    cb(useCreateNotifier()).onSuccess();
+    cb(useCreateNotifier()).onSettled();
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
+    expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalledWith({ queryKey: qk.features });
+  });
+
+  // F6 sibling — create cannot change the SENDER, but its own write is just as durable-before-500
+  // as the others, so the notifier list still has to reconcile on the error path.
+  it('useCreateNotifier reconciles the connectors key when the create commits and then 500s', () => {
+    cb(useCreateNotifier()).onSettled(undefined, new ApiError(500, 'E', 'reconfigure blew up'));
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
     expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalledWith({ queryKey: qk.features });
   });
@@ -718,13 +768,22 @@ describe('notifier mutation hooks — cache invalidation + toast contract', () =
   });
 
   it('useUpdateNotifier invalidates the connectors key and toasts "Notifier saved"', () => {
-    cb(useUpdateNotifier()).onSuccess();
+    cb(useUpdateNotifier()).onSettled();
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
+    cb(useUpdateNotifier()).onSuccess();
     expect(success).toHaveBeenCalledWith('Notifier saved');
   });
 
   it('useUpdateNotifier retires the feature query (an edited `from` can break the saved sender)', () => {
-    cb(useUpdateNotifier()).onSuccess();
+    cb(useUpdateNotifier()).onSettled();
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
+  });
+
+  // F6 — notifier edit persists before the fallible tail, so a 500 must still
+  // reconcile the Kindle-derived feature state.
+  it('useUpdateNotifier reconciles both keys when the write commits and then 500s', () => {
+    cb(useUpdateNotifier()).onSettled(undefined, new ApiError(500, 'E', 'reconfigure blew up'));
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
   });
 
@@ -737,13 +796,22 @@ describe('notifier mutation hooks — cache invalidation + toast contract', () =
   });
 
   it('useDeleteNotifier invalidates the connectors key and toasts "Notifier deleted"', () => {
-    cb(useDeleteNotifier()).onSuccess();
+    cb(useDeleteNotifier()).onSettled();
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
+    cb(useDeleteNotifier()).onSuccess();
     expect(success).toHaveBeenCalledWith('Notifier deleted');
   });
 
   it('useDeleteNotifier retires the feature query (deleting the selected sender ends delivery)', () => {
-    cb(useDeleteNotifier()).onSuccess();
+    cb(useDeleteNotifier()).onSettled();
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
+  });
+
+  // F6 — notifier delete persists before the fallible tail, so a 500 must still
+  // reconcile the Kindle-derived feature state.
+  it('useDeleteNotifier reconciles both keys when the write commits and then 500s', () => {
+    cb(useDeleteNotifier()).onSettled(undefined, new ApiError(500, 'E', 'reconfigure blew up'));
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
   });
 
