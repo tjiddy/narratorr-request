@@ -8,21 +8,23 @@ import {
   toggleNotifyOn,
   optInDisabled,
   providerLabel,
-  isEmailDirty,
-  emailPatchValue,
-  reconciledEmailDraft,
+  isEmailFieldDirty,
+  emailFieldPatchValue,
+  reconciledEmailFieldDraft,
+  KINDLE_EMAIL_HELP,
 } from '../pages/notify-prefs';
 import { Dialog } from './Dialog';
 import { BellIcon } from './icons';
 
 /**
  * The account modal (issue #131), opened from the nav username. Bundles the account preferences that
- * used to live on My Requests: the contact email (with a row-scoped Save) and the requester-
- * notification opt-in checkboxes, above an identity header. Built on the reusable {@link Dialog}
- * primitive. Pure decision logic (dirty-state, provider label) lives in `notify-prefs.ts`.
+ * used to live on My Requests: the contact email and the Send-to-Kindle device address (#142), each
+ * with its own row-scoped Save, plus the requester-notification opt-in checkboxes, above an identity
+ * header. Built on the reusable {@link Dialog} primitive. Pure decision logic (dirty-state, patch
+ * value, post-save reconcile, provider label) lives in `notify-prefs.ts`.
  *
- * The inner body ({@link AccountModalContent}) only mounts while the dialog is open, so its email
- * draft `useState` initializes fresh from the stored contact on every open — no reset effect needed.
+ * The inner body ({@link AccountModalContent}) only mounts while the dialog is open, so its draft
+ * `useState`s initialize fresh from the stored values on every open — no reset effect needed.
  */
 export function AccountModal({ me, open, onClose }: { me: MeDto; open: boolean; onClose: () => void }) {
   const headingId = useId();
@@ -33,27 +35,124 @@ export function AccountModal({ me, open, onClose }: { me: MeDto; open: boolean; 
   );
 }
 
+/**
+ * One labelled email input with an always-visible, row-scoped Save and an inline error slot — the
+ * shared shape of the contact-email row and the Kindle-address row (#142). Purely presentational:
+ * every decision (dirty state, patch value, post-save reconcile) is the caller's, taken from the
+ * pure helpers in `notify-prefs.ts`. The two rows are otherwise pixel-identical, so they share this
+ * rather than each carrying a copy — a second copy is where the rows drift apart.
+ *
+ * `saveLabel` is the button's ACCESSIBLE name (the visible text is just "Save" on both rows): two
+ * identically-labelled buttons in one dialog are ambiguous to a screen reader.
+ */
+function EmailFieldRow({
+  label,
+  saveLabel,
+  placeholder,
+  help,
+  value,
+  onChange,
+  onSave,
+  dirty,
+  pending,
+  error,
+}: {
+  label: string;
+  saveLabel: string;
+  placeholder: string;
+  /** Muted copy under the field, shown whenever there is no error. */
+  help: string;
+  value: string;
+  onChange: (value: string) => void;
+  onSave: () => void;
+  dirty: boolean;
+  pending: boolean;
+  error: string | null;
+}) {
+  const active = dirty && !pending;
+  return (
+    <div>
+      <div className="flex items-end gap-2">
+        <label className="flex-1">
+          <span className="mb-1.5 block text-sm font-medium">{label}</span>
+          <input
+            type="email"
+            value={value}
+            onChange={(e) => onChange(e.target.value)}
+            className="w-full rounded-xl border border-border bg-background/60 px-3 py-2 text-sm focus-ring"
+            placeholder={placeholder}
+          />
+        </label>
+        <button
+          type="button"
+          onClick={onSave}
+          disabled={!active}
+          aria-label={saveLabel}
+          className={`rounded-xl px-4 py-2 text-sm font-medium transition-all focus-ring disabled:cursor-not-allowed ${
+            active
+              ? 'bg-primary text-primary-foreground shadow-glow hover:opacity-90'
+              : 'bg-muted text-muted-foreground disabled:opacity-70'
+          }`}
+        >
+          Save
+        </button>
+      </div>
+      {error ? (
+        <p className="mt-1.5 text-xs text-destructive">{error}</p>
+      ) : (
+        <p className="mt-1.5 text-xs text-muted-foreground/70">{help}</p>
+      )}
+    </div>
+  );
+}
+
 function AccountModalContent({ me, headingId }: { me: MeDto; headingId: string }) {
+  // The contact row + the instant-apply notification checkboxes share one mutation instance (their
+  // existing coupling, unchanged); the Kindle row gets its OWN (#142 F5). Two independent, row-scoped
+  // commit buttons must not gate on each other — a single shared instance would disable a dirty
+  // Kindle Save for the duration of an in-flight contact save, and vice versa. Each row also keeps
+  // its own error state, so a rejected save surfaces next to the field that caused it.
   const save = useUpdateMe();
+  const saveKindle = useUpdateMe();
   const { data: authProviders } = useAuthProviders();
 
   const [email, setEmail] = useState(me.email ?? '');
   const [emailError, setEmailError] = useState<string | null>(null);
+  const [kindleEmail, setKindleEmail] = useState(me.kindleEmail ?? '');
+  const [kindleError, setKindleError] = useState<string | null>(null);
 
   const initial = me.username.charAt(0).toUpperCase() || '?';
   const providers = authProviders?.providers ?? [];
-  const dirty = isEmailDirty(me.email, email);
+  const dirty = isEmailFieldDirty(me.email, email);
+  const kindleDirty = isEmailFieldDirty(me.kindleEmail, kindleEmail);
   const notifyDisabled = optInDisabled(me.emailNotifyAvailable);
 
   const saveEmail = () => {
     setEmailError(null);
     save.mutate(
-      { email: emailPatchValue(email) },
+      { email: emailFieldPatchValue(email) },
       {
         // Reconcile the draft to the server-normalized contact so a case-normalized save (e.g.
         // New@Contact.COM -> new@contact.com) doesn't leave Save falsely dirty (F2).
-        onSuccess: (dto) => setEmail(reconciledEmailDraft(dto.email)),
+        onSuccess: (dto) => setEmail(reconciledEmailFieldDraft(dto.email)),
         onError: (err) => setEmailError(err instanceof ApiError ? err.message : 'Could not save email'),
+      },
+    );
+  };
+
+  // Commits ONLY `kindleEmail` — the contact address is never carried along. An empty field sends
+  // `null` (the clear sentinel; `""` would 400), any other value goes trimmed for the server's
+  // `kindleEmailSchema` to lowercase + domain-check.
+  const saveKindleEmail = () => {
+    setKindleError(null);
+    saveKindle.mutate(
+      { kindleEmail: emailFieldPatchValue(kindleEmail) },
+      {
+        // Same reconcile as the contact row: adopt the server-normalized value so a mixed-case save
+        // (Device@KINDLE.COM -> device@kindle.com) doesn't leave this Save falsely dirty.
+        onSuccess: (dto) => setKindleEmail(reconciledEmailFieldDraft(dto.kindleEmail)),
+        onError: (err) =>
+          setKindleError(err instanceof ApiError ? err.message : 'Could not save Kindle address'),
       },
     );
   };
@@ -81,41 +180,37 @@ function AccountModalContent({ me, headingId }: { me: MeDto; headingId: string }
           </div>
         </div>
 
-        {/* Email row — an always-visible Save scoped to just this field. */}
-        <div>
-          <div className="flex items-end gap-2">
-            <label className="flex-1">
-              <span className="mb-1.5 block text-sm font-medium">Email</span>
-              <input
-                type="email"
-                value={email}
-                onChange={(e) => {
-                  setEmail(e.target.value);
-                  setEmailError(null);
-                }}
-                className="w-full rounded-xl border border-border bg-background/60 px-3 py-2 text-sm focus-ring"
-                placeholder="you@example.com"
-              />
-            </label>
-            <button
-              type="button"
-              onClick={saveEmail}
-              disabled={!dirty || save.isPending}
-              className={`rounded-xl px-4 py-2 text-sm font-medium transition-all focus-ring disabled:cursor-not-allowed ${
-                dirty && !save.isPending
-                  ? 'bg-primary text-primary-foreground shadow-glow hover:opacity-90'
-                  : 'bg-muted text-muted-foreground disabled:opacity-70'
-              }`}
-            >
-              Save
-            </button>
-          </div>
-          {emailError ? (
-            <p className="mt-1.5 text-xs text-destructive">{emailError}</p>
-          ) : (
-            <p className="mt-1.5 text-xs text-muted-foreground/70">Where notifications are sent.</p>
-          )}
-        </div>
+        <EmailFieldRow
+          label="Email"
+          saveLabel="Save email"
+          placeholder="you@example.com"
+          help="Where notifications are sent."
+          value={email}
+          onChange={(v) => {
+            setEmail(v);
+            setEmailError(null);
+          }}
+          onSave={saveEmail}
+          dirty={dirty}
+          pending={save.isPending}
+          error={emailError}
+        />
+
+        <EmailFieldRow
+          label="Kindle address"
+          saveLabel="Save Kindle address"
+          placeholder="you@kindle.com"
+          help={KINDLE_EMAIL_HELP}
+          value={kindleEmail}
+          onChange={(v) => {
+            setKindleEmail(v);
+            setKindleError(null);
+          }}
+          onSave={saveKindleEmail}
+          dirty={kindleDirty}
+          pending={saveKindle.isPending}
+          error={kindleError}
+        />
 
         {/* Notifications group under a soft hairline. */}
         <div className="border-t border-border/50 pt-5">

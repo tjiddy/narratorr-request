@@ -4,10 +4,11 @@ import {
   toggleNotifyOn,
   optInDisabled,
   providerLabel,
-  isEmailDirty,
-  emailPatchValue,
-  reconciledEmailDraft,
+  isEmailFieldDirty,
+  emailFieldPatchValue,
+  reconciledEmailFieldDraft,
   meSuccessToast,
+  KINDLE_EMAIL_HELP,
 } from './notify-prefs.js';
 import { NOTIFIABLE_TRANSITIONS } from '@shared/schemas/user';
 
@@ -79,50 +80,97 @@ describe('providerLabel — identity provider line copy (#131)', () => {
   });
 });
 
-describe('isEmailDirty — email Save enablement (#131)', () => {
+describe('isEmailFieldDirty — email Save enablement (#131)', () => {
   it('is clean when the trimmed draft equals the stored value', () => {
-    expect(isEmailDirty('todd@x.com', 'todd@x.com')).toBe(false);
-    expect(isEmailDirty('todd@x.com', '  todd@x.com  ')).toBe(false);
+    expect(isEmailFieldDirty('todd@x.com', 'todd@x.com')).toBe(false);
+    expect(isEmailFieldDirty('todd@x.com', '  todd@x.com  ')).toBe(false);
   });
   it('treats a null stored contact as the empty string', () => {
-    expect(isEmailDirty(null, '')).toBe(false);
-    expect(isEmailDirty(null, '   ')).toBe(false);
-    expect(isEmailDirty(null, 'new@x.com')).toBe(true);
+    expect(isEmailFieldDirty(null, '')).toBe(false);
+    expect(isEmailFieldDirty(null, '   ')).toBe(false);
+    expect(isEmailFieldDirty(null, 'new@x.com')).toBe(true);
   });
   it('is dirty when the draft differs (edit or clear)', () => {
-    expect(isEmailDirty('todd@x.com', 'other@x.com')).toBe(true);
-    expect(isEmailDirty('todd@x.com', '')).toBe(true); // clearing the field
+    expect(isEmailFieldDirty('todd@x.com', 'other@x.com')).toBe(true);
+    expect(isEmailFieldDirty('todd@x.com', '')).toBe(true); // clearing the field
   });
 });
 
-describe('emailPatchValue — PATCH body email from the draft (#131)', () => {
+describe('emailFieldPatchValue — PATCH body email from the draft (#131)', () => {
   it('sends null for an empty / whitespace-only field (clears the contact)', () => {
-    expect(emailPatchValue('')).toBeNull();
-    expect(emailPatchValue('   ')).toBeNull();
+    expect(emailFieldPatchValue('')).toBeNull();
+    expect(emailFieldPatchValue('   ')).toBeNull();
   });
   it('sends the trimmed value otherwise (server normalizes + validates)', () => {
-    expect(emailPatchValue('  New@X.com ')).toBe('New@X.com');
-    expect(emailPatchValue('new@x.com')).toBe('new@x.com');
+    expect(emailFieldPatchValue('  New@X.com ')).toBe('New@X.com');
+    expect(emailFieldPatchValue('new@x.com')).toBe('new@x.com');
   });
 });
 
-describe('reconciledEmailDraft — post-save draft reset leaves Save clean (#131 F2)', () => {
+describe('reconciledEmailFieldDraft — post-save draft reset leaves Save clean (#131 F2)', () => {
   it('adopts the server-normalized value so a case-normalized save is no longer dirty', () => {
     // The user typed `New@Contact.COM`; the server returns it normalized as `new@contact.com`.
     const saved = 'new@contact.com';
-    const draft = reconciledEmailDraft(saved);
+    const draft = reconciledEmailFieldDraft(saved);
     expect(draft).toBe('new@contact.com'); // reconciled to the returned DTO value
-    expect(isEmailDirty(saved, draft)).toBe(false); // Save is no longer falsely amber/enabled
+    expect(isEmailFieldDirty(saved, draft)).toBe(false); // Save is no longer falsely amber/enabled
   });
   it('maps a cleared contact (null) to an empty draft that reads clean', () => {
-    const draft = reconciledEmailDraft(null);
+    const draft = reconciledEmailFieldDraft(null);
     expect(draft).toBe('');
-    expect(isEmailDirty(null, draft)).toBe(false);
+    expect(isEmailFieldDirty(null, draft)).toBe(false);
   });
   it('reconciling the saved value is idempotent-clean for any returned contact', () => {
     for (const saved of ['todd@x.com', null]) {
-      expect(isEmailDirty(saved, reconciledEmailDraft(saved))).toBe(false);
+      expect(isEmailFieldDirty(saved, reconciledEmailFieldDraft(saved))).toBe(false);
     }
+  });
+});
+
+// The three helpers above are FIELD-GENERIC — the Kindle-address row (#142) reuses them rather than
+// owning clones. These pin the Kindle row's cases against the same functions, so a future clone that
+// re-introduces the case-normalization false-dirty bug shows up as a diverging pair of suites.
+describe('the Kindle-address row reuses the same field helpers (#142)', () => {
+  describe('isEmailFieldDirty — Kindle Save enablement', () => {
+    it('is clean when the stored address is null and the draft is empty/whitespace', () => {
+      expect(isEmailFieldDirty(null, '')).toBe(false);
+      expect(isEmailFieldDirty(null, '   ')).toBe(false);
+    });
+    it('is clean when the trimmed draft equals the stored address', () => {
+      expect(isEmailFieldDirty('device@kindle.com', 'device@kindle.com')).toBe(false);
+      expect(isEmailFieldDirty('device@kindle.com', '  device@kindle.com  ')).toBe(false);
+    });
+    it('is dirty for any different value (edit, set-from-empty, or clear)', () => {
+      expect(isEmailFieldDirty('device@kindle.com', 'other@kindle.com')).toBe(true);
+      expect(isEmailFieldDirty(null, 'device@kindle.com')).toBe(true);
+      expect(isEmailFieldDirty('device@kindle.com', '')).toBe(true);
+    });
+  });
+
+  describe('emailFieldPatchValue — the kindleEmail PATCH value', () => {
+    it('sends null for an empty / whitespace-only field (clears the address)', () => {
+      expect(emailFieldPatchValue('')).toBeNull();
+      expect(emailFieldPatchValue('   ')).toBeNull();
+    });
+    it('sends the trimmed value otherwise — the SERVER lowercases, the client only trims', () => {
+      expect(emailFieldPatchValue('  A@Kindle.com ')).toBe('A@Kindle.com');
+      expect(emailFieldPatchValue('device@kindle.com')).toBe('device@kindle.com');
+    });
+  });
+
+  describe('reconciledEmailFieldDraft — post-save reconcile invariant', () => {
+    it('leaves the Kindle row clean for a saved value and for a cleared (null) address', () => {
+      // The user typed `Device@KINDLE.COM`; the server returns `device@kindle.com`.
+      for (const saved of ['device@kindle.com', null]) {
+        expect(isEmailFieldDirty(saved, reconciledEmailFieldDraft(saved))).toBe(false);
+      }
+    });
+  });
+
+  it('KINDLE_EMAIL_HELP names where Amazon shows the device address', () => {
+    expect(KINDLE_EMAIL_HELP).toContain('Amazon');
+    expect(KINDLE_EMAIL_HELP).toContain('Devices');
+    expect(KINDLE_EMAIL_HELP).toContain('Email');
   });
 });
 
@@ -143,5 +191,30 @@ describe('meSuccessToast — success feedback proportional to the payload (#134)
   it('prefers "Email saved" when both fields ride one body (the explicit-commit action wins)', () => {
     expect(meSuccessToast({ email: 'new@x.com', notifyOn: ['available'] })).toBe('Email saved');
     expect(meSuccessToast({ email: null, notifyOn: [] })).toBe('Email saved');
+  });
+
+  // #142: without this branch a kindleEmail-only body returns null and the explicit Kindle Save
+  // applies with ZERO feedback — the field looks identical before and after.
+  describe('kindleEmail (#142)', () => {
+    it('toasts a distinct, non-null message for a kindleEmail-only body', () => {
+      const message = meSuccessToast({ kindleEmail: 'device@kindle.com' });
+      expect(message).not.toBeNull();
+      expect(message).not.toBe('Email saved'); // distinct from the contact-email ack
+      expect(message).toBe('Kindle address saved');
+    });
+    it('toasts for a kindleEmail: null clear too (keyed on the KEY, not the value)', () => {
+      expect(meSuccessToast({ kindleEmail: null })).toBe('Kindle address saved');
+    });
+    it('stays silent for a notifyOn-only body — the new branch did not widen the silent case', () => {
+      expect(meSuccessToast({ notifyOn: ['available'] })).toBeNull();
+      expect(meSuccessToast({})).toBeNull();
+    });
+    it('an email-only body still returns "Email saved" (no regression)', () => {
+      expect(meSuccessToast({ email: 'new@x.com' })).toBe('Email saved');
+    });
+    it('a body carrying BOTH addresses resolves email-first — deterministic, one toast', () => {
+      expect(meSuccessToast({ email: 'new@x.com', kindleEmail: 'device@kindle.com' })).toBe('Email saved');
+      expect(meSuccessToast({ email: null, kindleEmail: null })).toBe('Email saved');
+    });
   });
 });

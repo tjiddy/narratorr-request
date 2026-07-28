@@ -602,9 +602,16 @@ describe('PATCH /api/me kindleEmail contract (#142)', () => {
     expect((await me(cookie)).json().kindleEmail).toBeNull();
   });
 
-  it('rejects a non-kindle.com address with 400', async () => {
+  it('rejects a non-kindle.com address with 400, without echoing the address back', async () => {
     const guest = await signup(app, 'guest@example.com');
-    expect((await patchMe(sessionCookie(guest), { kindleEmail: 'a@example.com' })).statusCode).toBe(400);
+    const rejected = await patchMe(sessionCookie(guest), { kindleEmail: 'private-device@example.com' });
+    expect(rejected.statusCode).toBe(400);
+    // `redact()` has no email pattern (it scrubs URL-embedded secrets and known secret values), so
+    // the guarantee is that the address never reaches a log/error path at all — starting with the
+    // rejection message, which is the one place a validation failure could echo the input back.
+    expect(rejected.payload).not.toContain('private-device@example.com');
+    expect(rejected.payload).not.toContain('private-device');
+
     expect((await patchMe(sessionCookie(guest), { kindleEmail: 'a@evilkindle.com' })).statusCode).toBe(400);
   });
 
