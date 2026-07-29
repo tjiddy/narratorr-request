@@ -14,6 +14,8 @@ import { SettingsService } from './services/settings.service.js';
 import { RequestService, resolveRequestPolicy, sanitizeAutoApproveRoles } from './services/request.service.js';
 import { SearchService } from './services/search.service.js';
 import { CompanionEbookService } from './services/companion-ebook.service.js';
+import { KindleSendService } from './services/kindle-send.service.js';
+import { buildKindleTransport } from './services/kindle-send.transport.js';
 import { StatusPoller } from './services/status-poller.js';
 import { buildNarratorrConnection } from './services/narratorr-clients.js';
 import { OidcService, makeOidcMapper, type OidcProfile } from './services/oidc.service.js';
@@ -27,6 +29,7 @@ import { authPlugin } from './plugins/auth.js';
 import { buildHelmetOptions } from './plugins/helmet-options.js';
 import { registerRoutes } from './routes/index.js';
 import { registerClientSurface } from './routes/client-surface.js';
+import { startServing } from './boot.js';
 import type { AppDeps } from './services/deps.js';
 import './types.js';
 
@@ -90,6 +93,19 @@ async function main(): Promise<void> {
   // `/api/features` route and the download proxy resolve through — so all three agree by
   // construction and a connection swap retires the previous server's cached companions.
   const companionEbooks = new CompanionEbookService(narratorr, narratorr, { connectorSettings, features }, app.log);
+  // Send-to-Kindle (issue #148). Narrow seams only: the same swappable holder for the raw EPUB
+  // stream, the SAME companion accessor the list enrichment uses (one cache, one in-flight slot,
+  // one generation rule), and the atomic Kindle settings snapshot. It deliberately takes NO feature
+  // deps — the route's `resolveFeatures()` is the single authoritative gate, so injecting them here
+  // would be a second, undefined feature-admission path.
+  const kindleSends = new KindleSendService({
+    db,
+    narratorr,
+    companions: companionEbooks,
+    settings: connectorSettings,
+    transport: buildKindleTransport,
+    logger: app.log,
+  });
   // One OidcService per configured provider, keyed by id. Authorization is the approval
   // queue (no per-provider gate), so the mapped profile flows straight to upsertFromOidc.
   const oidc = new Map<string, { service: OidcService<OidcProfile>; config: (typeof config.oidcProviders)[number] }>();
@@ -115,6 +131,7 @@ async function main(): Promise<void> {
     narratorr,
     features,
     companionEbooks,
+    kindleSends,
     notifier,
     oidc,
   };
@@ -146,7 +163,13 @@ async function main(): Promise<void> {
   // protect — and shared with the route-test harness, so the two cannot drift.
   await registerClientSurface(app, { serveClient, clientDir });
 
-  await app.listen({ port: config.port, host: config.bindHost });
+  // Sweep, THEN listen — the ordering is the point, and it lives in a seam so a test can assert it
+  // (this file runs `main()` on import). The boot sweep is global across all users, which is only
+  // safe because nothing is in flight yet.
+  await startServing({
+    sweepKindleLeases: () => kindleSends.sweepExpiredLeasesAtBoot(),
+    listen: () => app.listen({ port: config.port, host: config.bindHost }),
+  });
   app.log.info(
     `narratorr-requests on :${config.port} (auth=${config.authMode}, narratorr=${narratorr.configured ? 'configured' : 'unconfigured'})`,
   );

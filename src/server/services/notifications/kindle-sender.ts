@@ -1,5 +1,5 @@
 import addressparser from 'nodemailer/lib/addressparser/index.js';
-import { emailRuntimeSchema } from './index.js';
+import { emailRuntimeSchema, type EmailRuntimeConfig } from './index.js';
 import type { RuntimeNotifier } from './types.js';
 import { hasDeliverableContact } from '../../../shared/schemas/user.js';
 import type { KindleSenderStatus, ResolvedKindleSender, StoredConnectors } from '../../../shared/schemas/connectors.js';
@@ -106,4 +106,65 @@ export function resolveKindleSender(
     status: same ? 'ok' : 'sender-changed',
     currentFrom: confirmation.mailbox,
   };
+}
+
+// ---- Send-time transport resolution (issue #148) ----------------------------
+
+/**
+ * Every status in which Kindle delivery is NOT available — the READ-time failure alias.
+ *
+ * Deliberately neither of the two types that already exist. The canonical
+ * {@link KindleSenderStatus} includes `'ok'`, so typing the failure branch as that would let a
+ * conforming accessor return `{ failure: 'ok' }` — an impossible state the send path would have to
+ * either reject as `no_sender` or special-case. {@link KindleSenderFailure} is the WRITE path's
+ * set and excludes `'sender-changed'`, which this branch must carry (the live From no longer
+ * matches what the admin confirmed and users allowlisted, so a send would break the allowlist).
+ */
+export type KindleSenderUnavailable = Exclude<KindleSenderStatus, 'ok'>;
+
+/**
+ * A usable sender: the confirmed mailbox plus the SELECTED notifier's SMTP transport config.
+ *
+ * There is deliberately NO outer `from`. {@link EmailRuntimeConfig} already owns `from`, and a
+ * second copy beside it would create two candidate values for "the From on the wire" with no
+ * stated equality between them. Consumers read `config.from`; `mailbox` is the PARSED address, used
+ * only for the recipient-match check.
+ */
+export interface KindleSenderTransport {
+  mailbox: string;
+  config: EmailRuntimeConfig;
+}
+
+/** A usable sender, the reason there isn't one, or `null` when nothing has been selected. */
+export type KindleSenderResolution = KindleSenderTransport | { failure: KindleSenderUnavailable } | null;
+
+/**
+ * The send path's sender resolver: a stored selection → the SELECTED notifier's transport config.
+ *
+ * It NEVER falls through to {@link selectEmailSource}'s first-usable-email-notifier rule. Amazon's
+ * Approved Personal Document E-mail List is per-sender, so a silently substituted From breaks every
+ * household member's allowlist at once — only `selection.notifierId` is ever used, and a send
+ * proceeds ONLY at status `ok`.
+ *
+ * The status ladder is {@link confirmSenderMailbox} + the same case-insensitive `confirmedFrom`
+ * comparison {@link resolveKindleSender} makes, so the send path and the Settings card can never
+ * disagree about why a sender is unusable.
+ */
+export function resolveKindleSenderTransport(
+  selection: StoredConnectors['kindleSender'],
+  notifiers: RuntimeNotifier[],
+): KindleSenderResolution {
+  if (!selection) return null;
+  const confirmation = confirmSenderMailbox(selection.notifierId, notifiers);
+  if ('failure' in confirmation) return { failure: confirmation.failure };
+  if (confirmation.mailbox.toLowerCase() !== selection.confirmedFrom.toLowerCase()) {
+    return { failure: 'sender-changed' };
+  }
+  // `confirmSenderMailbox` already proved this notifier exists, is an email notifier and parses;
+  // re-parsing is what yields the TYPED config (it validates, it doesn't just assert), and the
+  // guard keeps the function total rather than resting on that invariant.
+  const selected = notifiers.find((n) => n.id === selection.notifierId);
+  const config = emailRuntimeSchema.safeParse(selected?.config);
+  if (!config.success) return { failure: 'config-unusable' };
+  return { mailbox: confirmation.mailbox, config: config.data };
 }

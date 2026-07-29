@@ -1,9 +1,12 @@
+import { z } from 'zod';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import type { ZodTypeProvider } from 'fastify-type-provider-zod';
 import type { AppDeps } from '../services/deps.js';
 import type { NarratorrEbookStream } from '../services/narratorr-stream-client.js';
 import { NarratorrError } from '../services/narratorr-client.js';
 import { resolveFeatures } from '../services/feature-state.js';
 import { isNarratorrBookId } from '../../shared/schemas/book-id.js';
+import { ebookSendResultSchema } from '../../shared/schemas/ebooks.js';
 import { requireActiveUser } from '../plugins/auth.js';
 import { ebookDownloadRateLimitOptions } from '../plugins/rate-limit.js';
 import { epubFilename, contentDispositionAttachment } from '../util/epub-filename.js';
@@ -189,6 +192,62 @@ export function registerEbookRoutes(app: FastifyInstance, deps: AppDeps): void {
       reply.header('cache-control', 'private, no-store');
       reply.header('x-content-type-options', 'nosniff');
       return reply.send(wrapPeekedStream(reader, peeked));
+    },
+  );
+
+  registerSendToKindleRoute(app, deps);
+}
+
+/**
+ * `POST /api/ebooks/:bookId/send-to-kindle` (issue #148).
+ *
+ * There is NO recipient input of any kind — the destination is read exclusively from the caller's
+ * own `users.kindle_email`, which is what stops this endpoint being usable as a mail relay. `title`
+ * affects ONLY the attachment filename for this caller's own send: never persisted, never logged,
+ * never echoed.
+ *
+ * EVERY ADMITTED ATTEMPT ANSWERS `200 { outcome }`, the failures included. The central handler owns
+ * the `{ error: { code, message } }` envelope and would flatten a typed outcome into a code string,
+ * and the client must branch on ONE field. The non-200 answers are exactly four: the business
+ * refusals below, the pre-handler parser errors the central handler now maps, the pre-reservation
+ * infrastructure failures, and the post-admission finalization failure — the last two both
+ * surfacing as the service's thrown `500 INTERNAL`.
+ */
+function registerSendToKindleRoute(app: FastifyInstance, deps: AppDeps): void {
+  const a = app.withTypeProvider<ZodTypeProvider>();
+  a.post(
+    '/api/ebooks/:bookId/send-to-kindle',
+    {
+      // Fastify 5 passes `null` to the body validator when `request.body` is undefined, so a bare
+      // strict object would 400 every bodyless request before the lexical auth guard ever ran.
+      // Normalizing is required, not stylistic — and it must be done HERE rather than inside Zod
+      // (`.nullable()` / a preprocess) because that would also wrongly accept an explicit JSON
+      // `null`, which this route rejects. Only `undefined` is replaced.
+      preValidation: async (request) => {
+        if (request.body === undefined) request.body = {};
+      },
+      schema: {
+        // `bookId` is validated by GRAMMAR in the handler, not here: a schema rejection would 400,
+        // and a malformed id must be a 404 that answers AFTER authorization.
+        params: z.object({ bookId: z.string() }),
+        body: z.object({ title: z.string().optional() }).strict(),
+        response: { 200: ebookSendResultSchema },
+      },
+      // Deliberately no `config.rateLimit`: the per-minute cap lives in the admission service,
+      // keyed on the user and coordinated with the audit table. A second limiter here would
+      // disagree with it.
+    },
+    async (request) => {
+      // Lexically inside the handler, deliberately — the route-guard manifest guardrail greps this
+      // handler's source for a guard identifier — and before the id grammar, so a malformed id can
+      // never answer ahead of authorization.
+      const user = requireActiveUser(request);
+      if (!(await resolveFeatures(deps)).ebooksEnabled) throw ebooksDisabled();
+      const { bookId } = request.params;
+      // GRAMMAR only: 404 means "not a well-formed id", never "no such book". A well-formed id with
+      // no companion is a `200 { outcome: 'unavailable' }`, so the route is not an existence oracle.
+      if (!isNarratorrBookId(bookId)) throw ebookUnavailable();
+      return deps.kindleSends.send(user, bookId, request.body);
     },
   );
 }

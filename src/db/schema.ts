@@ -2,6 +2,7 @@ import { sqliteTable, text, integer, index, uniqueIndex, check } from 'drizzle-o
 import { sql } from 'drizzle-orm';
 import { USER_ROLES, USER_STATUSES, REQUEST_QUOTA_MODES, type Role, type NotifiableTransition } from '../shared/schemas/user.js';
 import { REQUEST_STATUSES, ACTIVE_REQUEST_STATUSES } from '../shared/schemas/request.js';
+import { KINDLE_SEND_ATTEMPT_STATUSES, KINDLE_SEND_FAILURE_CODES } from '../shared/schemas/ebooks.js';
 import type { StoredConnectors } from '../shared/schemas/connectors.js';
 
 // ============ USERS ============
@@ -177,8 +178,73 @@ export const appSettings = sqliteTable(
   ],
 );
 
+// ============ KINDLE SENDS ============
+// The Send-to-Kindle audit table (issue #148). This table IS the admission mechanism, not a log
+// beside one: the `started` row is the RESERVATION, and every guarantee that survives a crash or a
+// second process rests on it — at most one active reservation per (user, book) via the partial
+// unique index, no send without an observed durable reservation, and the honesty of every recorded
+// terminal status. The per-minute start counter is deliberately NOT here: it is in-memory by
+// design, a restart resets it, and nothing about that is worth a DB write.
+//
+// REDACTION IS ABSOLUTE (AC49): no email address (recipient or sender), no SMTP response text, no
+// filename, no content bytes. The only free-text columns are the narratorr book id and the
+// enum-constrained failure code.
+export const kindleSends = sqliteTable(
+  'kindle_sends',
+  {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    userId: integer('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    // narratorr's PUBLIC book id (`bk_…`) — the same opaque handle the download proxy takes.
+    bookId: text('book_id').notNull(),
+    status: text('status', { enum: KINDLE_SEND_ATTEMPT_STATUSES }).notNull(),
+    // Nullable until the stream establishes it: a reservation that never opened an upstream
+    // connection (a clamped-to-zero send budget) genuinely has no byte count to record.
+    byteCount: integer('byte_count'),
+    failureCode: text('failure_code', { enum: KINDLE_SEND_FAILURE_CODES }),
+    // MILLISECONDS, written from the injected clock — NOT the repo's usual second-resolution
+    // `{ mode: 'timestamp' }` / `unixepoch()` default. All four rolling windows (per-minute starts,
+    // replay, daily quota, the reservation lease) are defined as `timestamp >= now - WINDOW_MS` and
+    // distinguish 60,000 ms from 60,001 ms, while the in-memory per-minute deque already keeps
+    // milliseconds; second-resolution columns would let the two drift by up to a second and make
+    // the exact-cutoff cases unrepresentable. Deliberately NO SQL default, so the injected clock is
+    // the single time source for both the deque and the table.
+    startedAt: integer('started_at', { mode: 'timestamp_ms' }).notNull(),
+    finalizedAt: integer('finalized_at', { mode: 'timestamp_ms' }),
+  },
+  (table) => [
+    // The active-reservation guard. PARTIAL (only `started` rows), so it cannot serve the replay
+    // lookup — which is why the next index exists.
+    uniqueIndex('idx_kindle_sends_active')
+      .on(table.userId, table.bookId)
+      .where(sql`status = 'started'`),
+    // The replay lookup: user AND book AND a recent `finalized_at`.
+    index('idx_kindle_sends_replay').on(table.userId, table.bookId, table.finalizedAt),
+    // The per-user lease sweep and the active-reservation half of the daily quota count.
+    index('idx_kindle_sends_user_started').on(table.userId, table.startedAt),
+    // The acceptance-time rolling window (the `sent` half of the daily quota count).
+    index('idx_kindle_sends_user_finalized').on(table.userId, table.finalizedAt),
+    // Retention pruning, which is keyed on `finalized_at` and NEVER on `started_at` — a live
+    // owner's `started` row must never be reachable by a global delete. There is deliberately no
+    // bare `started_at` index: nothing scans `started` rows globally.
+    index('idx_kindle_sends_finalized').on(table.finalizedAt),
+    // Coherence: a row is `started` IFF it has no `finalized_at`. Written in the never-NULL boolean
+    // form — SQLite treats a NULL-evaluating CHECK as SATISFIED, so the naive
+    // `(status='started' AND finalized_at IS NULL) OR (…)` disjunction has a silent hole (see the
+    // `request_quota_mode_limit` precedent above). Retention's `status != 'started' AND
+    // finalized_at < …` predicate is total precisely because of this constraint.
+    check(
+      'kindle_sends_status_finalized',
+      sql`(${table.status} = 'started') = (${table.finalizedAt} IS NULL)`,
+    ),
+  ],
+);
+
 export type UserRow = typeof users.$inferSelect;
 export type NewUserRow = typeof users.$inferInsert;
 export type RequestRow = typeof requests.$inferSelect;
 export type NewRequestRow = typeof requests.$inferInsert;
 export type AppSettingsRow = typeof appSettings.$inferSelect;
+export type KindleSendRow = typeof kindleSends.$inferSelect;
+export type NewKindleSendRow = typeof kindleSends.$inferInsert;

@@ -12,6 +12,8 @@ import { SearchService } from '../services/search.service.js';
 import { NarratorrClientHolder } from '../services/narratorr-client-holder.js';
 import { FeatureService } from '../services/feature.service.js';
 import { CompanionEbookService } from '../services/companion-ebook.service.js';
+import { KindleSendService } from '../services/kindle-send.service.js';
+import { FakeKindleTransports } from './kindle-send.js';
 import { Notifier } from '../services/notifications/notifier.service.js';
 import type { NotifierLogger } from '../services/notifications/types.js';
 import { SecretCodec, deriveSettingsKey } from '../util/secret-codec.js';
@@ -189,6 +191,10 @@ export interface RouteHarness {
   features: FeatureService;
   /** The real connector-settings service behind `deps.connectorSettings` — write the admin flags. */
   connectorSettings: ConnectorSettingsService;
+  /** The real `KindleSendService` behind `deps.kindleSends`, wired to {@link kindleTransports}. */
+  kindleSends: KindleSendService;
+  /** The recording Kindle transport — inspect `.messages` / override `.reply` per test. */
+  kindleTransports: FakeKindleTransports;
   /** The real `SearchService` wired against {@link narratorrHolder} — spy on `.search` to force errors. */
   search: SearchService;
   config: AppConfig;
@@ -271,6 +277,18 @@ export async function buildRouteApp(opts: BuildRouteAppOpts): Promise<RouteHarne
     { connectorSettings, features },
     { warn() {} },
   );
+  // Mirrors production wiring (issue #148): the same holder for the raw EPUB stream and the SAME
+  // companion accessor the enrichment path uses, so a route test drives one cache. Only the SMTP
+  // transport is faked — a real socket is the stream file's job, not the route surface's.
+  const kindleTransports = new FakeKindleTransports();
+  const kindleSends = new KindleSendService({
+    db,
+    narratorr: narratorrHolder,
+    companions: companionEbooks,
+    settings: connectorSettings,
+    transport: kindleTransports.factory,
+    logger: { info() {}, warn() {}, error() {} },
+  });
   // A real Notifier (no channels → inert) with its `notify` swapped for a spy, so route tests
   // can assert dispatch without a structural cast. Building the genuine type means a new required
   // AppDeps field surfaces as a compile error here instead of a silent runtime `undefined`.
@@ -322,6 +340,7 @@ export async function buildRouteApp(opts: BuildRouteAppOpts): Promise<RouteHarne
     narratorr: narratorrHolder,
     features,
     companionEbooks,
+    kindleSends,
     notifier,
     oidc: new Map(),
   };
@@ -368,6 +387,8 @@ export async function buildRouteApp(opts: BuildRouteAppOpts): Promise<RouteHarne
     narratorrHolder,
     features,
     connectorSettings,
+    kindleSends,
+    kindleTransports,
     search,
     config,
     roleUsers,

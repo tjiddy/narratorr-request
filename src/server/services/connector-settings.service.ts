@@ -6,7 +6,9 @@ import { selectEmailSource } from './notifications/requester-email.js';
 import {
   confirmSenderMailbox,
   resolveKindleSender,
+  resolveKindleSenderTransport,
   KINDLE_SENDER_INVALID_MESSAGE,
+  type KindleSenderResolution,
 } from './notifications/kindle-sender.js';
 import { notificationEventSchema, type NotificationEvent } from '../../shared/notification-events.js';
 import { quotaWindowDaysSchema, storedConnectorsSchema } from '../../shared/schemas/connectors.js';
@@ -265,6 +267,30 @@ export class ConnectorSettingsService {
     return {
       ebooksEnabled: row?.ebooksEnabled ?? false,
       kindleSender: resolveKindleSender(c.kindleSender, c.notifiers.map((n) => this.toRuntimeNotifier(n))),
+    };
+  }
+
+  /**
+   * The Send-to-Kindle path's ONE settings seam (issue #148): the resolved sender AND the SELECTED
+   * notifier's transport config, both derived from a SINGLE decrypted snapshot of the singleton row.
+   *
+   * Composing `getEbookSettings()` with `getNotificationsConfig()` is NOT acceptable and this
+   * accessor exists to make that unrepresentable: each of those performs its own
+   * `appSettings.findFirst`, settings reads deliberately do not take the write mutex, and an admin
+   * switching sender A→B between the two reads would resolve stale selection A against the new
+   * notifier list and send as A — missing every household member's Amazon allowlist. What must be
+   * atomic is SELECTION ↔ TRANSPORT CONFIG, and one read is what makes it so.
+   *
+   * It deliberately does NOT return `ebooksEnabled`. The route's `resolveFeatures()` gate is
+   * authoritative for the feature flag, so a second copy here would be a field with no defined
+   * consumer semantics — there is no useful answer to "what does the service do when the snapshot
+   * flag disagrees with the gate that already admitted the request?". One gate, in one place.
+   */
+  async getKindleSendSettings(): Promise<{ sender: KindleSenderResolution }> {
+    const row = await this.db.query.appSettings.findFirst({ where: eq(appSettings.id, SINGLETON_ID) });
+    const c = this.connectorsFrom(row);
+    return {
+      sender: resolveKindleSenderTransport(c.kindleSender, c.notifiers.map((n) => this.toRuntimeNotifier(n))),
     };
   }
 

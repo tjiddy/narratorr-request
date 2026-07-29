@@ -125,7 +125,7 @@ export class CompanionEbookService {
       // async boundary (`lookup` is async), which is what keeps a synchronous holder throw —
       // `NarratorrClientHolder.getBook()` calls `require()` before it returns a promise — from
       // escaping while this list is still being built, where `allSettled` would never see it.
-      const settled = await Promise.allSettled(selected.map((id) => this.lookup(id)));
+      const settled = await Promise.allSettled(selected.map((id) => this.get(id)));
       const byId = new Map<string, V1CompanionEbook | null>();
       selected.forEach((id, i) => {
         const outcome = settled[i];
@@ -144,8 +144,18 @@ export class CompanionEbookService {
     }
   }
 
-  /** Cache read → in-flight join → fresh flight, all scoped to the CURRENT generation. */
-  private async lookup(bookId: string): Promise<V1CompanionEbook | null> {
+  /**
+   * The SINGLE-BOOK companion accessor: cache read → in-flight join → fresh flight, all scoped to
+   * the CURRENT generation.
+   *
+   * Public (issue #148) so the Send-to-Kindle preflight reuses this exact resolver instead of
+   * opening an uncached `getBook` per send — {@link enrich} calls it too, so both paths share ONE
+   * cache, ONE in-flight slot and ONE generation rule, in either call order. `fetchOne` absorbs
+   * every upstream failure — a rejection, a contract mismatch, and the holder's SYNCHRONOUS
+   * `NOT_CONFIGURED` throw on a disconnect race — into a failure-TTL `null`, so a caller sees
+   * "no companion" rather than an error, exactly as the enrichment path does.
+   */
+  async get(bookId: string): Promise<V1CompanionEbook | null> {
     const generation = this.connection.generation;
 
     const entry = this.cache.get(bookId);
