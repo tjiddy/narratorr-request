@@ -418,7 +418,7 @@ describe('GET /api/requests — companion-ebook enrichment (issue #147)', () => 
       (await h.requests.list({ userId: admin.id, limit: 50, offset: 0 })).data[0]!.publicId,
     );
 
-    const dto = h.requests.toDto(stored!, { publicId: admin.publicId, username: admin.username });
+    const dto = h.requests.toDto(stored!, { publicId: admin.publicId, username: 'admin' });
 
     expect(dto.companionEbook).toBeNull();
   });

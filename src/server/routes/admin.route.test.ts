@@ -262,7 +262,7 @@ describe('admin request surfaces never carry a companion ebook (#147)', () => {
     expect(perUser.json().data.every((r: { companionEbook: unknown }) => r.companionEbook === null)).toBe(true);
 
     // …and the mapper itself, independent of any serializer.
-    const dto = h.requests.toDto(approved!, { publicId: user.publicId, username: user.username });
+    const dto = h.requests.toDto(approved!, { publicId: user.publicId, username: 'req' });
     expect(dto.companionEbook).toBeNull();
   });
 });

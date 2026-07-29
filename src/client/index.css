@@ -9,3 +9,13 @@ body,
 #root {
   min-height: 100%;
 }
+
+/*
+ * Success-tinted glow for the companion-ebook "Get eBook" affordance (issue #147) — the green
+ * counterpart to theme.css's primary `--shadow-glow`. APP-LOCAL on purpose: `theme.css` is a
+ * verbatim mirror of narratorr's token layer and must stay one, and a utility is glue rather than
+ * a design-system token, so it belongs here under both files' stated rules.
+ */
+@utility shadow-glow-success {
+  box-shadow: 0 0 20px -5px hsl(var(--success) / 0.45);
+}

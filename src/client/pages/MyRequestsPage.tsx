@@ -2,18 +2,38 @@ import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type { RequestDto } from '@shared/schemas/request';
 import { DEFAULT_LIMIT } from '@shared/schemas/v1/common';
-import { useMyRequestsPaged } from '../hooks';
+import { isNarratorrBookId } from '@shared/schemas/book-id';
+import { useMyRequestsPaged, useMe, useFeatures } from '../hooks';
+import { ebooksVisible } from '../features';
 import { StatusBadge } from '../components/StatusBadge';
 import { EmptyState } from '../components/EmptyState';
 import { Button } from '../components/Button';
-import { InboxIcon, HeadphonesIcon, SearchIcon } from '../components/icons';
+import { InboxIcon, HeadphonesIcon, SearchIcon, BookIcon } from '../components/icons';
 import { requestFailureReason } from '../components/request-failure';
 import { QuotaMeter } from '../components/QuotaMeter';
 import { PagedListFooter } from '../components/PagedListFooter';
 import { nextLimit } from '../components/paging';
+import { EbookSheet, type EbookSheetTarget } from '../components/EbookSheet';
 
-function RequestRow({ r }: { r: RequestDto }) {
+/**
+ * Exported for focused DOM coverage of the row's own decisions; `MyRequestsPage` is still the
+ * component that proves the real feature-source wiring.
+ */
+export function RequestRow({ r, ebooksEnabled = false }: { r: RequestDto; ebooksEnabled?: boolean }) {
   const failureReason = requestFailureReason(r);
+  // SNAPSHOT at click time, held until the sheet's OWN close. The list polls every 4s and a
+  // companion can validly go back to `null` after a transient lookup failure — a sheet driven off
+  // the live row would then unmount itself mid-download.
+  const [sheet, setSheet] = useState<EbookSheetTarget | null>(null);
+  // The same no-dead-button gate the search card applies: an id the download route wouldn't admit
+  // gets no affordance. No "No eBook" chip here — that is a SEARCH-CARD affordance only; rows stay
+  // quiet for every other status.
+  const bookId = r.narratorrBookId;
+  const companion =
+    ebooksEnabled && r.status === 'available' && r.companionEbook !== null && bookId !== null && isNarratorrBookId(bookId)
+      ? { bookId, companion: r.companionEbook }
+      : null;
+
   return (
     <li className="glass-card flex items-center gap-4 rounded-xl p-3">
       {r.coverUrl ? (
@@ -46,7 +66,30 @@ function RequestRow({ r }: { r: RequestDto }) {
           </p>
         )}
       </div>
-      <StatusBadge status={r.status} />
+      <div className="flex shrink-0 items-center gap-2">
+        <StatusBadge status={r.status} />
+        {companion && (
+          <Button
+            variant="success"
+            size="sm"
+            icon={BookIcon}
+            onClick={() =>
+              setSheet({
+                bookId: companion.bookId,
+                title: r.title,
+                author: r.author,
+                series: null,
+                coverUrl: r.coverUrl,
+                companion: companion.companion,
+              })
+            }
+            className="shadow-glow-success"
+          >
+            Get eBook
+          </Button>
+        )}
+      </div>
+      {sheet && <EbookSheet target={sheet} onClose={() => setSheet(null)} />}
     </li>
   );
 }
@@ -54,6 +97,8 @@ function RequestRow({ r }: { r: RequestDto }) {
 export function MyRequestsPage() {
   const [limit, setLimit] = useState(DEFAULT_LIMIT);
   const { data, isLoading, error, isFetching } = useMyRequestsPaged(limit);
+  // Through the pure gate, never off `.data` — loading and errored both render the feature as off.
+  const ebooksEnabled = ebooksVisible(useFeatures(useMe().data));
   const navigate = useNavigate();
 
   return (
@@ -79,7 +124,7 @@ export function MyRequestsPage() {
         <>
           <ul className="flex flex-col gap-3">
             {data.data.map((r) => (
-              <RequestRow key={r.publicId} r={r} />
+              <RequestRow key={r.publicId} r={r} ebooksEnabled={ebooksEnabled} />
             ))}
           </ul>
           <PagedListFooter
