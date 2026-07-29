@@ -1085,3 +1085,121 @@ describe('ConnectorSettingsService — companion-ebook opt-in (#144)', () => {
     selectSpy.mockRestore();
   });
 });
+
+// ---- issue #148: the ATOMIC Kindle-send settings snapshot --------------------
+// The send path's ONE settings seam. What must be atomic is SELECTION ↔ TRANSPORT CONFIG:
+// composing getEbookSettings() with getNotificationsConfig() would be two independent row reads,
+// and an admin switching sender A→B between them would resolve stale selection A against the new
+// notifier list and send as A — missing every household member's Amazon allowlist.
+describe('ConnectorSettingsService — getKindleSendSettings (#148)', () => {
+  const emailBody = (over: Partial<CreateNotifierBody> = {}, config: Record<string, unknown> = {}): CreateNotifierBody => ({
+    name: 'Mail',
+    type: 'email',
+    events: ['request.created'],
+    config: { host: 'smtp.example.com', port: 587, secure: false, user: 'u', pass: 'p', to: 'admin@ex.com', from: 'bot@ex.com', ...config },
+    ...over,
+  });
+
+  it('resolves the selection AND the selected notifier’s transport config from ONE row read', async () => {
+    const nf = await svc.createNotifier(emailBody({}, { from: 'bot@ex.com', host: 'chosen.example.com' }));
+    await svc.update({ kindleSender: { notifierId: nf.id } });
+
+    const spy = vi.spyOn(db.query.appSettings, 'findFirst');
+    const { sender } = await svc.getKindleSendSettings();
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(sender).toEqual({
+      mailbox: 'bot@ex.com',
+      config: expect.objectContaining({ host: 'chosen.example.com', from: 'bot@ex.com', pass: 'p' }),
+    });
+  });
+
+  it('carries no outer `from`, and the address used on the wire is config.from', async () => {
+    const nf = await svc.createNotifier(emailBody({}, { from: 'Narratorr <Bot@Ex.com>' }));
+    await svc.update({ kindleSender: { notifierId: nf.id } });
+    const { sender } = await svc.getKindleSendSettings();
+    expect(sender && 'config' in sender && Object.keys(sender).sort()).toEqual(['config', 'mailbox']);
+    // `mailbox` is the PARSED address (used for the recipient-match check); `config.from` is the
+    // notifier's own string, verbatim — the single canonical copy that reaches SMTP.
+    expect(sender && 'config' in sender && sender.config.from).toBe('Narratorr <Bot@Ex.com>');
+    expect(sender && 'mailbox' in sender && sender.mailbox).toBe('Bot@Ex.com');
+  });
+
+  it('deliberately does NOT return ebooksEnabled — the route’s feature gate is the only one', async () => {
+    const nf = await svc.createNotifier(emailBody());
+    await svc.update({ kindleSender: { notifierId: nf.id }, ebooksEnabled: true });
+    expect(Object.keys(await svc.getKindleSendSettings())).toEqual(['sender']);
+  });
+
+  it('returns null when nothing has been selected', async () => {
+    await svc.createNotifier(emailBody());
+    expect(await svc.getKindleSendSettings()).toEqual({ sender: null });
+  });
+
+  it.each([
+    ['notifier-missing', async () => {
+      const nf = await svc.createNotifier(emailBody());
+      await svc.update({ kindleSender: { notifierId: nf.id } });
+      await svc.deleteNotifier(nf.id);
+    }],
+    ['not-email', async () => {
+      const nf = await svc.createNotifier(emailBody());
+      await svc.update({ kindleSender: { notifierId: nf.id } });
+      await svc.updateNotifier(nf.id, ntfyBody());
+    }],
+    ['from-unparseable', async () => {
+      const nf = await svc.createNotifier(emailBody());
+      await svc.update({ kindleSender: { notifierId: nf.id } });
+      await svc.updateNotifier(nf.id, emailBody({}, { from: 'a@' }));
+    }],
+    ['sender-changed', async () => {
+      const nf = await svc.createNotifier(emailBody());
+      await svc.update({ kindleSender: { notifierId: nf.id } });
+      await svc.updateNotifier(nf.id, emailBody({}, { from: 'moved@ex.com' }));
+    }],
+  ])('reports the %s failure — and `ok` is unrepresentable on that branch', async (status, arrange) => {
+    await arrange();
+    const { sender } = await svc.getKindleSendSettings();
+    // The failure branch is typed `Exclude<KindleSenderStatus, 'ok'>`: a healthy sender can only
+    // ever produce the `{ mailbox, config }` branch, so `{ failure: 'ok' }` cannot be built.
+    expect(sender).toEqual({ failure: status });
+  });
+
+  it('reports config-unusable when the selected notifier’s stored secret cannot be decrypted', async () => {
+    const nf = await svc.createNotifier(emailBody());
+    await svc.update({ kindleSender: { notifierId: nf.id } });
+    // Corrupt the stored config so the runtime schema rejects it (port dropped).
+    const stored = await svc.getStored();
+    stored.notifiers[0]!.config = { host: 'smtp.example.com' };
+    await db.update(appSettings).set({ connectors: stored }).where(eq(appSettings.id, 1));
+    expect((await svc.getKindleSendSettings()).sender).toEqual({ failure: 'config-unusable' });
+  });
+
+  // The race this accessor exists to make unrepresentable. A COMPOSED implementation reads the row
+  // twice, and an admin switching sender A→B between those reads resolves stale selection A
+  // against the new notifier list — sending as A and missing every household member's allowlist.
+  it('SETTINGS RACE: a composed two-read pair can disagree; the atomic snapshot reads once and cannot', async () => {
+    const a = await svc.createNotifier(emailBody({ name: 'A' }, { from: 'a@ex.com', host: 'a.example.com' }));
+    await svc.update({ kindleSender: { notifierId: a.id } });
+
+    // The hazard, made concrete: read the SELECTION, let the admin switch, then read the notifiers.
+    const staleSelection = (await svc.getEbookSettings()).kindleSender;
+    const b = await svc.createNotifier(emailBody({ name: 'B' }, { from: 'b@ex.com', host: 'b.example.com' }));
+    await svc.update({ kindleSender: { notifierId: b.id } });
+    const freshNotifiers = await svc.getNotificationsConfig();
+    // Selection A resolved against the post-switch list — a live, wrong pairing.
+    expect(staleSelection?.notifierId).toBe(a.id);
+    expect(freshNotifiers.notifiers.map((n) => n.id)).toContain(b.id);
+
+    // The atomic accessor cannot express that: ONE row read means the mailbox and the transport
+    // config are always the same generation. The call count is the load-bearing assertion here —
+    // reimplementing this as a composition of the two accessors above fails it.
+    const spy = vi.spyOn(db.query.appSettings, 'findFirst');
+    const { sender } = await svc.getKindleSendSettings();
+    expect(spy).toHaveBeenCalledTimes(1);
+    vi.restoreAllMocks();
+    expect(sender).toEqual({
+      mailbox: 'b@ex.com',
+      config: expect.objectContaining({ host: 'b.example.com', from: 'b@ex.com' }),
+    });
+  });
+});

@@ -115,8 +115,9 @@ describe('schema migrations', () => {
       '0000_baseline',
       '0001_user_kindle_email',
       '0002_app_settings_ebooks_enabled',
+      '0003_kindle_sends',
     ]);
-    expect(journal.entries.map((e) => e.idx)).toEqual([0, 1, 2]);
+    expect(journal.entries.map((e) => e.idx)).toEqual([0, 1, 2, 3]);
     // The .sql files and meta snapshots must match the journal — a stale leftover would
     // change what migrate() applies (sql) or what drizzle-kit diffs against (snapshot).
     const sqlFiles = fs.readdirSync(drizzleDir).filter((f) => f.endsWith('.sql')).sort();
@@ -134,6 +135,125 @@ describe('schema migrations', () => {
   it('leaves the 0000 baseline free of the columns later migrations add', () => {
     const baseline = fs.readFileSync(path.join(drizzleDir, '0000_baseline.sql'), 'utf8');
     expect(baseline).not.toContain('kindle_email');
+    expect(baseline).not.toContain('kindle_sends');
+  });
+});
+
+// issue #148 — the `kindle_sends` audit table IS the Send-to-Kindle admission mechanism, so the
+// two constraints that carry the durable guarantees (the partial unique index and the coherence
+// CHECK) are asserted against a REAL in-memory libSQL DB applying the generated SQL. Drizzle
+// renders the JS `check()` verbatim, and SQLite treats a NULL-evaluating CHECK as SATISFIED, so a
+// naively-written predicate would silently pass every incoherent row.
+describe('kindle_sends schema (issue #148)', () => {
+  /** A fresh migrated DB with one user (id 1) to hang audit rows off. */
+  async function seededDb() {
+    const client = createClient({ url: ':memory:' });
+    await migrate(drizzle(client), { migrationsFolder: drizzleDir });
+    await client.execute(
+      "INSERT INTO users (public_id, auth_provider, auth_subject, username) VALUES ('us_a','local','a','a')",
+    );
+    return client;
+  }
+
+  const insert = (
+    client: Awaited<ReturnType<typeof seededDb>>,
+    row: { userId?: number; bookId: string; status: string; finalizedAt?: number | null },
+  ) =>
+    client.execute({
+      sql: 'INSERT INTO kindle_sends (user_id, book_id, status, started_at, finalized_at) VALUES (?, ?, ?, 1000, ?)',
+      args: [row.userId ?? 1, row.bookId, row.status, row.finalizedAt ?? null],
+    });
+
+  it('applies the append-only 0003 kindle_sends table on top of the baseline', async () => {
+    const client = await seededDb();
+    const cols = (await client.execute("PRAGMA table_info('kindle_sends')")).rows.map((r) => r['name']);
+    expect(cols).toEqual([
+      'id',
+      'user_id',
+      'book_id',
+      'status',
+      'byte_count',
+      'failure_code',
+      'started_at',
+      'finalized_at',
+    ]);
+    // `byte_count` is nullable on purpose — unknown until the stream establishes it.
+    const byteCount = (await client.execute("PRAGMA table_info('kindle_sends')")).rows.find(
+      (r) => r['name'] === 'byte_count',
+    );
+    expect(byteCount?.['notnull']).toBe(0);
+    client.close();
+  });
+
+  it('declares every index the spec names, and no bare started_at index', async () => {
+    const client = await seededDb();
+    const rows = (await client.execute("PRAGMA index_list('kindle_sends')")).rows;
+    const names = rows.map((r) => String(r['name'])).sort();
+    expect(names).toEqual([
+      'idx_kindle_sends_active',
+      'idx_kindle_sends_finalized',
+      'idx_kindle_sends_replay',
+      'idx_kindle_sends_user_finalized',
+      'idx_kindle_sends_user_started',
+    ]);
+    // Only the active-reservation guard is unique, and it is PARTIAL — a non-partial unique index
+    // would block re-sending a book forever.
+    const active = rows.find((r) => r['name'] === 'idx_kindle_sends_active');
+    expect(active?.['unique']).toBe(1);
+    expect(active?.['partial']).toBe(1);
+    client.close();
+  });
+
+  it('rejects a second STARTED row for the same (user, book) and permits one once the first is finalized', async () => {
+    const client = await seededDb();
+    await insert(client, { bookId: 'bk_1', status: 'started' });
+    await expect(insert(client, { bookId: 'bk_1', status: 'started' })).rejects.toThrow(
+      /UNIQUE constraint failed/i,
+    );
+    // A different book for the same user is unaffected — the guard is per (user, book).
+    await insert(client, { bookId: 'bk_2', status: 'started' });
+    // …and so is the same book for a different user.
+    await client.execute(
+      "INSERT INTO users (public_id, auth_provider, auth_subject, username) VALUES ('us_b','local','b','b')",
+    );
+    await insert(client, { userId: 2, bookId: 'bk_1', status: 'started' });
+
+    // Finalizing the first frees the slot: the partial index covers `started` rows only.
+    await client.execute("UPDATE kindle_sends SET status='sent', finalized_at=2000 WHERE book_id='bk_1' AND user_id=1");
+    await insert(client, { bookId: 'bk_1', status: 'started' });
+    const n = (await client.execute("SELECT count(*) AS n FROM kindle_sends WHERE user_id=1 AND book_id='bk_1'")).rows;
+    expect(n[0]?.['n']).toBe(2);
+    client.close();
+  });
+
+  it('rejects EVERY incoherent status/finalized_at corner (the never-NULL CHECK form)', async () => {
+    const client = await seededDb();
+    // `started` with a finalized_at — the case a NULL-evaluating predicate would let through.
+    await expect(insert(client, { bookId: 'bk_a', status: 'started', finalizedAt: 5 })).rejects.toThrow(
+      /CHECK constraint failed/i,
+    );
+    // …and each terminal status with a NULL finalized_at.
+    for (const status of ['sent', 'failed', 'indeterminate']) {
+      await expect(insert(client, { bookId: `bk_${status}`, status, finalizedAt: null })).rejects.toThrow(
+        /CHECK constraint failed/i,
+      );
+    }
+    // The two coherent shapes store fine.
+    await insert(client, { bookId: 'bk_ok1', status: 'started', finalizedAt: null });
+    await insert(client, { bookId: 'bk_ok2', status: 'sent', finalizedAt: 9 });
+    expect((await client.execute('SELECT count(*) AS n FROM kindle_sends')).rows[0]?.['n']).toBe(2);
+    client.close();
+  });
+
+  it('cascades audit rows away when the user row is deleted', async () => {
+    const client = await seededDb();
+    await insert(client, { bookId: 'bk_1', status: 'sent', finalizedAt: 2000 });
+    await insert(client, { bookId: 'bk_2', status: 'started' });
+    await client.execute('DELETE FROM users WHERE id = 1');
+    // Exercised at the DB level: the app has no user-delete path, so nothing else would catch a
+    // missing ON DELETE CASCADE until an orphan row broke a later foreign-key check.
+    expect((await client.execute('SELECT count(*) AS n FROM kindle_sends')).rows[0]?.['n']).toBe(0);
+    client.close();
   });
 });
 

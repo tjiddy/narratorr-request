@@ -146,12 +146,28 @@ export class KindleSendService {
     bookId: string,
     opts: { title?: string | undefined } = {},
   ): Promise<EbookSendResult> {
-    // Preconditions are decided BEFORE the critical section and before a single EPUB byte is
-    // fetched. They write nothing and consume no budget, so serializing them would buy nothing and
-    // would queue one user's refusals behind another book's live SMTP transaction.
-    const pre = await this.preflight(user, bookId);
-    if ('outcome' in pre) return { outcome: pre.outcome };
-    return this.locks.run(user.id, () => this.admit(user, bookId, pre, opts));
+    try {
+      // Preconditions are decided BEFORE the critical section and before a single EPUB byte is
+      // fetched. They write nothing and consume no budget, so serializing them would buy nothing
+      // and would queue one user's refusals behind another book's live SMTP transaction.
+      const pre = await this.preflight(user, bookId);
+      if ('outcome' in pre) return { outcome: pre.outcome };
+      return await this.locks.run(user.id, () => this.admit(user, bookId, pre, opts));
+    } catch (err: unknown) {
+      // The classification here is EXACT, not a guess: every post-reservation failure is either
+      // absorbed into a terminal outcome or raised as the post-admission `ApiError`, so a
+      // non-`ApiError` escaping this method is necessarily a PRE-RESERVATION operational failure —
+      // the user read, the settings snapshot, the lease sweep, the replay lookup, the quota counts,
+      // or a non-collision reservation insert error. The log carries the safe context only; the
+      // error object itself is deliberately never logged from this service.
+      if (!(err instanceof ApiError)) {
+        this.deps.logger.error(
+          this.ctx(user, bookId),
+          'kindle-send failed before the reservation was durable — no attempt was recorded',
+        );
+      }
+      throw err;
+    }
   }
 
   // ---- Preconditions --------------------------------------------------------

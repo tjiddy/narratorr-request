@@ -425,3 +425,100 @@ describe('CompanionEbookService — connection generation', () => {
     expect(h.books.calls).toHaveLength(3);
   });
 });
+
+// ---- issue #148: the PUBLIC single-book accessor ----------------------------
+// `get()` is what the Send-to-Kindle preflight resolves `sizeBytes` through. The property that
+// matters is that it is the SAME resolver `enrich()` uses — one cache, one in-flight slot, one
+// generation rule — because a second, uncached implementation would open a fresh `getBook` per
+// send and would still pass every mocked service test.
+describe('CompanionEbookService.get — shared with enrich, in both call orders', () => {
+  it('resolves a single book’s companion, and null when the key is absent', async () => {
+    const h = build();
+    expect(await h.svc.get('bk_1')).toEqual(EPUB);
+    h.books.responder = (id) => Promise.resolve(book(id, undefined)); // pre-#1961 narratorr
+    expect(await h.svc.get('bk_2')).toBeNull();
+  });
+
+  it('CACHE, get() then enrich(): the enrichment reuses get()’s entry — no second getBook', async () => {
+    const h = build();
+    expect(await h.svc.get('bk_1')).toEqual(EPUB);
+    const [row] = await h.svc.enrich([dto()]);
+    expect(row?.companionEbook).toEqual(EPUB);
+    expect(h.books.calls).toEqual(['bk_1']);
+  });
+
+  it('CACHE, enrich() then get(): the accessor reuses the enrichment’s entry — no second getBook', async () => {
+    const h = build();
+    await h.svc.enrich([dto()]);
+    expect(await h.svc.get('bk_1')).toEqual(EPUB);
+    expect(h.books.calls).toEqual(['bk_1']);
+  });
+
+  it('honours the SAME TTL: a get() past COMPANION_TTL_MS re-fetches, one just inside does not', async () => {
+    const h = build();
+    await h.svc.get('bk_1');
+    h.setNow(COMPANION_TTL_MS - 1);
+    await h.svc.get('bk_1');
+    expect(h.books.calls).toHaveLength(1);
+    h.setNow(COMPANION_TTL_MS);
+    await h.svc.get('bk_1');
+    expect(h.books.calls).toHaveLength(2);
+  });
+
+  it('installs the FAILURE TTL on a rejected lookup, exactly as the enrichment path does', async () => {
+    const h = build();
+    h.books.responder = () => Promise.reject(new Error('narratorr down'));
+    // Total: a failed lookup is "no companion", never a rejection out of the accessor.
+    expect(await h.svc.get('bk_1')).toBeNull();
+    h.setNow(COMPANION_FAILURE_TTL_MS - 1);
+    expect(await h.svc.get('bk_1')).toBeNull();
+    expect(h.books.calls).toHaveLength(1);
+    h.setNow(COMPANION_FAILURE_TTL_MS);
+    await h.svc.get('bk_1');
+    expect(h.books.calls).toHaveLength(2);
+  });
+
+  it('absorbs a SYNCHRONOUS holder throw (the NOT_CONFIGURED disconnect race) into a null', async () => {
+    const h = build();
+    h.books.responder = () => {
+      throw new Error('Narratorr isn’t connected yet.');
+    };
+    await expect(h.svc.get('bk_1')).resolves.toBeNull();
+  });
+
+  it('SHARES the in-flight slot with enrich() — one open getBook per id, joined by both callers', async () => {
+    const h = build();
+    const d = deferred<V1Book>();
+    h.books.responder = () => d.promise;
+
+    const viaGet = h.svc.get('bk_1');
+    const viaEnrich = h.svc.enrich([dto()]);
+    await flush();
+    // Without a shared slot this would be 2 — the exact duplicate-call shape the accessor exists
+    // to avoid on a cold cache.
+    expect(h.books.calls).toEqual(['bk_1']);
+
+    d.resolve(book('bk_1', EPUB));
+    expect(await viaGet).toEqual(EPUB);
+    expect((await viaEnrich)[0]?.companionEbook).toEqual(EPUB);
+  });
+
+  it('is GENERATION-SCOPED: a connection swap retires get()’s cached answer too', async () => {
+    const h = build();
+    await h.svc.get('bk_1');
+    expect(h.books.calls).toHaveLength(1);
+    h.bumpGeneration();
+    // The previous server's answer is simply unreadable under the new generation.
+    await h.svc.get('bk_1');
+    expect(h.books.calls).toHaveLength(2);
+  });
+
+  it('does NOT consult the feature flag — the route’s gate already admitted the request', async () => {
+    // `enrich()` short-circuits on the flag because it is called on a polled list; `get()` is
+    // reached only after the route resolved features, so a second gate here would be a second,
+    // undefined admission path.
+    const h = build({ ebooksEnabled: false });
+    expect(await h.svc.get('bk_1')).toEqual(EPUB);
+    expect(h.books.calls).toEqual(['bk_1']);
+  });
+});
