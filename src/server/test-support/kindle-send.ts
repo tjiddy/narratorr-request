@@ -29,6 +29,9 @@ async function drain(stream: Readable | undefined): Promise<void> {
     stream.on('data', () => {});
     stream.on('end', () => resolve());
     stream.on('error', (err: Error) => reject(err));
+    // A destroyed-without-error attachment must not leave this pending forever — a real transport
+    // would see a premature close and fail the transaction, not hang.
+    stream.on('close', () => reject(new Error('attachment stream closed before it ended')));
   });
 }
 

@@ -426,6 +426,10 @@ export class KindleSendService {
       }
       const upstream = webStreamToReadable(stream.body);
       const counting = new CountingEpubStream(pre.sizeBytes);
+      // A no-op error listener so tearing the attachment down can never surface as an UNCAUGHT
+      // 'error' — nodemailer attaches its own handler while it is reading, but the teardown below
+      // can also fire between its listeners being removed and the stream being destroyed.
+      counting.on('error', () => {});
       live.upstream = upstream;
       live.counter = counting;
       // `pipe` does not forward errors, so a mid-body upstream failure is wired through
@@ -482,8 +486,14 @@ export class KindleSendService {
     // Only the winner tears down — single assignment is what makes this run exactly once.
     clearTimeout(timer);
     controller.abort();
-    live.upstream?.destroy();
-    live.counter?.destroy();
+    // Destroyed WITH an error, deliberately: a bare `destroy()` closes the stream without emitting
+    // `error`, and nodemailer would then sit waiting on an attachment that never ends — the
+    // deadline would select a row but never actually abort the transaction. Erroring it is what
+    // makes DATA incomplete so the receiving server discards the partial. On an attempt that
+    // already reached `end` both streams are auto-destroyed, so these calls are no-ops.
+    const teardown = new Error('Send-to-Kindle attempt concluded');
+    live.upstream?.destroy(teardown);
+    live.counter?.destroy(teardown);
     live.transport?.close();
     // The section is NOT released until the SMTP attempt actually settles. Abandoning the await
     // would not stop the transaction, only lose track of it — which is what manufactures orphan
