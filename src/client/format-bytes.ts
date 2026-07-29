@@ -8,9 +8,11 @@
 const SIZE_UNITS = ['KB', 'MB', 'GB', 'TB'] as const;
 
 /**
- * Humanize a FINITE, NON-NEGATIVE byte count: `0` → "0 B", `1023` → "1023 B", `1024` → "1 KB",
- * `1536` → "1.5 KB". Callers own validation — this function assumes a whole, valid count and has
- * no "unknown" answer of its own.
+ * Humanize a FINITE, NON-NEGATIVE byte count: `0` → "0 B", `1023` → "1023 B", `1024` → "1.0 KB",
+ * `1536` → "1.5 KB". Bytes are whole; every larger unit carries one decimal, unconditionally —
+ * that trailing `.0` is the long-standing System Information shape and is kept so the two
+ * surfaces read identically. Callers own validation: this function assumes a whole, valid count
+ * and has no "unknown" answer of its own.
  */
 export function humanizeBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
