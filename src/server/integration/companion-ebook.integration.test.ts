@@ -1,6 +1,7 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import {
   startIntegrationScenario,
+  expectAllUpstreamGets,
   expectKeyAccepted,
   INTEGRATION_SENDER_FROM,
   type IntegrationScenario,
@@ -51,12 +52,32 @@ function searchBody(sizeBytes: number): unknown {
   };
 }
 
+/**
+ * A FIXED instant for the whole file. Session minting and verification read the ambient clock, so
+ * the suite pins it rather than letting a host clock adjustment decide whether a scenario's cookie
+ * is still valid.
+ *
+ * `toFake: ['Date']` is the load-bearing part (curated learning `vitest-tofake-date-only`): plain
+ * fake timers would also fake `setTimeout`/`setImmediate`, which stalls the very things this suite
+ * is built on — a listening Fastify instance, libSQL migrations and real socket I/O — turning a
+ * failure into a hang. Faking Date alone leaves the event loop intact. Restored in `afterEach`,
+ * because `vi.restoreAllMocks()` does NOT restore timers.
+ */
+const FROZEN_NOW = new Date('2026-07-29T12:00:00.000Z');
+
 let s: IntegrationScenario | null = null;
+
+beforeEach(() => {
+  // Before the scenario boots: the session cookie has to be minted under the same frozen clock that
+  // later verifies it.
+  vi.useFakeTimers({ toFake: ['Date'], now: FROZEN_NOW });
+});
 
 afterEach(async () => {
   // AC7: the app AND both fakes are closed on the same teardown, so no handle outlives the file.
   await s?.close();
   s = null;
+  vi.useRealTimers();
 });
 
 /** A real HTTP GET at the running app. */
@@ -65,6 +86,25 @@ const get = (scenario: IntegrationScenario, path: string, cookie: string): Promi
 
 const post = (scenario: IntegrationScenario, path: string, cookie: string): Promise<Response> =>
   fetch(`${scenario.baseUrl}${path}`, { method: 'POST', headers: { cookie } });
+
+/**
+ * Drain a response body, RETAINING every chunk that arrived and capturing the read failure instead
+ * of throwing it. Both halves matter for the truncation case: the failure IS the assertion, and the
+ * bytes the client already saw are a swept surface that `arrayBuffer()` would throw away.
+ */
+async function readUntilError(res: Response): Promise<{ chunks: Uint8Array[]; error: unknown }> {
+  const reader = res.body!.getReader();
+  const chunks: Uint8Array[] = [];
+  try {
+    for (;;) {
+      const result = await reader.read();
+      if (result.done) return { chunks, error: null };
+      chunks.push(result.value);
+    }
+  } catch (err: unknown) {
+    return { chunks, error: err };
+  }
+}
 
 describe('the happy path, end to end over real sockets', () => {
   it('carries capability → search → download through ONE app and ONE connection generation', async () => {
@@ -118,6 +158,9 @@ describe('the happy path, end to end over real sockets', () => {
     expect(download.headers.get('content-disposition')).toBe(`attachment; filename="${TITLE}.epub"`);
     expectKeyAccepted(s.upstream, '/companion-epub');
     expect(s.upstream.companionOpens).toBe(1);
+    // Every upstream endpoint this feature consumes is a GET, asserted as a positive METHOD receipt
+    // — the fake refuses anything else, so a client that changed verb cannot pass this suite.
+    expectAllUpstreamGets(s.upstream);
     s.sweep('GET /api/ebooks/:bookId/download', download, received.toString('latin1'));
 
     // The log sweep is only worth anything if the capture is LIVE — pin that the destination
@@ -199,9 +242,22 @@ describe('a mid-body upstream abort truncates the client', () => {
 
     const res = await get(s, `/api/ebooks/${BOOK}/download`, cookie);
     expect(res.status).toBe(200);
-    // Not "rejects or is short", and not a byte-count comparison: the READ ITSELF must reject.
-    await expect(res.arrayBuffer()).rejects.toThrow();
-    s.sweep('GET /api/ebooks/:bookId/download (mid-body abort)', res, '');
+    // Read chunk by chunk rather than through `arrayBuffer()`: the bytes delivered BEFORE the abort
+    // are client-visible and must be swept too (AC22), and `arrayBuffer()` discards them.
+    const { chunks, error } = await readUntilError(res);
+    // Not "rejects or is short", and not a byte-count comparison: the READ ITSELF must reject. A
+    // body that reaches a clean end leaves `error` null and fails here however many bytes it
+    // carried — the clean-short control below is what proves that is a real distinction.
+    expect(error, 'the truncated body read resolved instead of rejecting').not.toBeNull();
+
+    const partial = Buffer.concat(chunks.map((c) => Buffer.from(c)));
+    expect(partial.byteLength).toBeLessThan(EPUB.byteLength);
+    // Whatever DID arrive is genuine upstream payload, not synthesized filler. No LOWER bound is
+    // asserted on the length: the abort is a socket destruction, and whether undici surfaces the
+    // already-buffered bytes or discards them with the reset is the client's business, not a
+    // property of our route.
+    expect(EPUB.subarray(0, partial.byteLength).equals(partial)).toBe(true);
+    s.sweep('GET /api/ebooks/:bookId/download (mid-body abort)', res, partial.toString('latin1'));
   }, 30_000);
 
   it('DISCRIMINATES: a genuinely clean short body resolves, so the rejection above means something', async () => {

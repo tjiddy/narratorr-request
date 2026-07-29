@@ -96,11 +96,28 @@ export function expectNoLeaksAcross(
   sentinels: ReadonlyArray<readonly [label: string, value: string]>,
   surfaces: { body: string; headers: Record<string, unknown>; logs: string },
   where: string,
+  opts: ExpectNoLeaksOpts = {},
 ): void {
   const headers = JSON.stringify(surfaces.headers);
+  const exempt = new Set(opts.bodyExempt ?? []);
   for (const [label, value] of sentinels) {
-    expect(surfaces.body.includes(value), `${where}: leaked ${label} in the response body`).toBe(false);
+    // The exemption is PER VALUE and applies to the BODY ONLY. `GET`/`PATCH /api/me` legitimately
+    // return the caller's own Kindle address, but nothing makes them a licence to carry the
+    // narratorr key, a media path or the SMTP credentials — so every other sentinel keeps its body
+    // assertion, and the exempted value is still swept in the headers and the logs.
+    if (!exempt.has(value)) {
+      expect(surfaces.body.includes(value), `${where}: leaked ${label} in the response body`).toBe(false);
+    }
     expect(headers.includes(value), `${where}: leaked ${label} in a response header`).toBe(false);
     expect(surfaces.logs.includes(value), `${where}: leaked ${label} in an application log line`).toBe(false);
   }
+}
+
+export interface ExpectNoLeaksOpts {
+  /**
+   * Sentinel VALUES this response's body is the documented carrier of — the only per-response
+   * narrowing the sweep allows. Never widen this to a whole response: exempting a surface exempts
+   * every secret on it.
+   */
+  bodyExempt?: readonly string[];
 }

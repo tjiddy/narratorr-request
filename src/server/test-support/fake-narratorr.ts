@@ -14,11 +14,12 @@ import type { AddressInfo } from 'node:net';
  *   • `GET /api/v1/books/:id`
  *   • `GET /api/v1/books/:id/companion-epub`
  *
- * It is deliberately NOT permissive about credentials (AC1b): every request is authenticated
- * against the exact configured key BEFORE any endpoint handler runs, so a regression that stops
- * sending `X-Api-Key` fails every scenario instead of passing against a fake that would have
- * served an anonymous caller. Each receipt records whether the presented key matched, so a
- * scenario can assert a POSITIVE receipt rather than only the absence of a 401.
+ * It is deliberately NOT permissive — about credentials (AC1b) or about the METHOD: every request
+ * is authenticated against the exact configured key and then required to be a `GET` BEFORE any
+ * endpoint handler runs, so a regression that stops sending `X-Api-Key`, or that starts using the
+ * wrong verb, fails every scenario instead of passing against a fake that would have served it.
+ * Each receipt records the method and whether the presented key matched, so a scenario can assert
+ * POSITIVE receipts rather than only the absence of a 401/405.
  *
  * It never answers a 3xx: `NarratorrClient.request()` follows redirects and would replay the api
  * key at the redirect target (open debt #171), so a redirect is not something this fake offers.
@@ -200,6 +201,15 @@ export async function startFakeNarratorr(opts: { apiKey: string }): Promise<Fake
     // nor the expected key.
     if (!keyMatched) {
       sendJson(res, 401, { error: { code: 'UNAUTHORIZED', message: 'a valid api key is required' } });
+      return;
+    }
+
+    // All four endpoints this feature consumes are GETs, and the fake is no more permissive about
+    // the METHOD than it is about the key: a client that regressed to another verb must fail here
+    // rather than be served a success the real narratorr would never give it. Ordered after the
+    // credential check so an unauthenticated caller still learns nothing but `401`.
+    if (req.method !== 'GET') {
+      sendJson(res, 405, { error: { code: 'METHOD_NOT_ALLOWED', message: 'only GET is served here' } });
       return;
     }
 

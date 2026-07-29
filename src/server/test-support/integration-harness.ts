@@ -25,7 +25,12 @@ import { createSessionToken } from '../util/session.js';
 import { insertUser } from './db.js';
 import { startFakeNarratorr, type FakeNarratorr } from './fake-narratorr.js';
 import { startFakeSmtp, type FakeSmtp } from './fake-smtp.js';
-import { NARRATORR_API_KEY, expectNoLeaksAcross, integrationSentinels } from './leak-sentinels.js';
+import {
+  NARRATORR_API_KEY,
+  expectNoLeaksAcross,
+  integrationSentinels,
+  type ExpectNoLeaksOpts,
+} from './leak-sentinels.js';
 import type { Db } from '../../db/client.js';
 import type { AppConfig } from '../config.js';
 import type { AppDeps } from '../services/deps.js';
@@ -268,8 +273,11 @@ export interface IntegrationScenario extends IntegrationHarness {
    * AC21/AC22: sweep this response's body, ALL its headers and every captured log line. Invoked
    * from every scenario — including the failure branches — rather than living in an isolated
    * block, so a new scenario cannot forget it.
+   *
+   * `opts.bodyExempt` narrows the BODY surface for named sentinel VALUES only (the `/api/me`
+   * carrier). It never exempts a whole response, and never touches the header or log surfaces.
    */
-  sweep(where: string, res: Response, body: string): void;
+  sweep(where: string, res: Response, body: string, opts?: ExpectNoLeaksOpts): void;
 }
 
 export interface StartScenarioOpts {
@@ -282,53 +290,70 @@ export interface StartScenarioOpts {
  * `pnpm test` exits without a hanging handle.
  */
 export async function startIntegrationScenario(opts: StartScenarioOpts = {}): Promise<IntegrationScenario> {
-  const upstream = await startFakeNarratorr({ apiKey: INTEGRATION_API_KEY });
-  const smtp = await startFakeSmtp({ user: INTEGRATION_SMTP_USER, pass: INTEGRATION_SMTP_PASS });
-  const harness = await buildIntegrationApp({
-    narratorr: { url: upstream.baseUrl, apiKey: INTEGRATION_API_KEY },
-    smtp: {
-      host: '127.0.0.1',
-      port: smtp.port,
-      user: INTEGRATION_SMTP_USER,
-      pass: INTEGRATION_SMTP_PASS,
-      from: INTEGRATION_SENDER_FROM,
-      to: 'admin@example.com',
-    },
-    ...(opts.ebooksEnabled !== undefined && { ebooksEnabled: opts.ebooksEnabled }),
-    ...(opts.selectKindleSender !== undefined && { selectKindleSender: opts.selectKindleSender }),
-  });
-
-  const sentinels = integrationSentinels({
-    narratorrBaseUrl: upstream.baseUrl,
-    kindleAddress: INTEGRATION_KINDLE_ADDRESS,
-    smtpUser: INTEGRATION_SMTP_USER,
-    smtpPass: INTEGRATION_SMTP_PASS,
-  });
-
-  return {
-    ...harness,
-    upstream,
-    smtp,
-    activeUser: async (userOpts = {}) => {
-      const user = await insertUser(harness.db, {
-        role: 'user',
-        status: 'active',
-        kindleEmail: userOpts.kindleEmail ?? null,
-      });
-      return { user, cookie: harness.cookieFor(user) };
-    },
-    sweep: (where, res, body) => {
-      expectNoLeaksAcross(
-        sentinels,
-        { body, headers: Object.fromEntries(res.headers), logs: harness.logs.raw() },
-        where,
-      );
-    },
-    close: async () => {
-      await harness.close();
-      await Promise.all([upstream.close(), smtp.close()]);
-    },
+  // Every resource is registered the instant it is ACQUIRED, so a rejection anywhere below unwinds
+  // the ones already listening. Without this, a scenario object that never becomes reachable takes
+  // its `afterEach` teardown with it and the open handles hang the Vitest worker instead of
+  // producing a clean failing test (AC7).
+  const acquired: Array<() => Promise<void>> = [];
+  const closeAll = async (): Promise<void> => {
+    for (const close of [...acquired].reverse()) await close();
   };
+
+  try {
+    const upstream = await startFakeNarratorr({ apiKey: INTEGRATION_API_KEY });
+    acquired.push(() => upstream.close());
+    const smtp = await startFakeSmtp({ user: INTEGRATION_SMTP_USER, pass: INTEGRATION_SMTP_PASS });
+    acquired.push(() => smtp.close());
+    const harness = await buildIntegrationApp({
+      narratorr: { url: upstream.baseUrl, apiKey: INTEGRATION_API_KEY },
+      smtp: {
+        host: '127.0.0.1',
+        port: smtp.port,
+        user: INTEGRATION_SMTP_USER,
+        pass: INTEGRATION_SMTP_PASS,
+        from: INTEGRATION_SENDER_FROM,
+        to: 'admin@example.com',
+      },
+      ...(opts.ebooksEnabled !== undefined && { ebooksEnabled: opts.ebooksEnabled }),
+      ...(opts.selectKindleSender !== undefined && { selectKindleSender: opts.selectKindleSender }),
+    });
+    acquired.push(() => harness.close());
+
+    const sentinels = integrationSentinels({
+      narratorrBaseUrl: upstream.baseUrl,
+      kindleAddress: INTEGRATION_KINDLE_ADDRESS,
+      smtpUser: INTEGRATION_SMTP_USER,
+      smtpPass: INTEGRATION_SMTP_PASS,
+    });
+
+    return {
+      ...harness,
+      upstream,
+      smtp,
+      activeUser: async (userOpts = {}) => {
+        const user = await insertUser(harness.db, {
+          role: 'user',
+          status: 'active',
+          kindleEmail: userOpts.kindleEmail ?? null,
+        });
+        return { user, cookie: harness.cookieFor(user) };
+      },
+      sweep: (where, res, body, sweepOpts = {}) => {
+        expectNoLeaksAcross(
+          sentinels,
+          { body, headers: Object.fromEntries(res.headers), logs: harness.logs.raw() },
+          where,
+          sweepOpts,
+        );
+      },
+      // ONE teardown path, shared with the unwind above — the app first, then the fakes it talked to.
+      close: closeAll,
+    };
+  } catch (err: unknown) {
+    // Teardown must never mask the construction failure that triggered it.
+    await closeAll().catch(() => {});
+    throw err;
+  }
 }
 
 /** Assert an exchange authenticated with the configured api key (AC1b's positive receipt). */
@@ -336,4 +361,17 @@ export function expectKeyAccepted(upstream: FakeNarratorr, pathSuffix: string): 
   const receipts = upstream.receiptsFor(pathSuffix);
   expect(receipts.length, `no upstream request reached ${pathSuffix}`).toBeGreaterThan(0);
   expect(receipts.every((r) => r.keyMatched), `${pathSuffix} was served without the configured api key`).toBe(true);
+}
+
+/**
+ * AC1: all four upstream endpoints this feature consumes are GETs. The fake refuses anything else
+ * (405), and this asserts the METHOD receipt positively — so a client that regressed to another
+ * verb fails here with a named signal rather than only through a downstream symptom.
+ */
+export function expectAllUpstreamGets(upstream: FakeNarratorr): void {
+  expect(upstream.receipts.length, 'no upstream request was recorded at all').toBeGreaterThan(0);
+  expect(
+    upstream.receipts.filter((r) => r.method !== 'GET'),
+    'a non-GET request reached the fake narratorr',
+  ).toEqual([]);
 }
