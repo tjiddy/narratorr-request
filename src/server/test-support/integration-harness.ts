@@ -283,6 +283,18 @@ export interface IntegrationScenario extends IntegrationHarness {
 export interface StartScenarioOpts {
   ebooksEnabled?: boolean;
   selectKindleSender?: boolean;
+  /**
+   * The AC7 UNWIND SEAM, and the only reason this option exists.
+   *
+   * Called the instant both fakes are listening and BEFORE the app is composed. It solves the two
+   * problems a committed regression test for the failure path has: a construction failure destroys
+   * the fakes before `startIntegrationScenario` ever returns, so the test needs a handle on them
+   * from in here — and it needs a way to MAKE that failure happen. Throwing from this callback does
+   * the second job, standing in for any genuine rejection of the construction step below (a
+   * connector write, a plugin that throws at register, a failed `listen`) at exactly the point such
+   * a rejection would land.
+   */
+  onFakesListening?: (fakes: { upstream: FakeNarratorr; smtp: FakeSmtp }) => void;
 }
 
 /**
@@ -304,6 +316,9 @@ export async function startIntegrationScenario(opts: StartScenarioOpts = {}): Pr
     acquired.push(() => upstream.close());
     const smtp = await startFakeSmtp({ user: INTEGRATION_SMTP_USER, pass: INTEGRATION_SMTP_PASS });
     acquired.push(() => smtp.close());
+    // Both fakes are listening and neither is reachable by the caller yet — the exact window the
+    // unwind exists for. A throw from here is a construction failure in that window.
+    opts.onFakesListening?.({ upstream, smtp });
     const harness = await buildIntegrationApp({
       narratorr: { url: upstream.baseUrl, apiKey: INTEGRATION_API_KEY },
       smtp: {
