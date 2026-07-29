@@ -136,6 +136,10 @@ describe('schema migrations', () => {
     const baseline = fs.readFileSync(path.join(drizzleDir, '0000_baseline.sql'), 'utf8');
     expect(baseline).not.toContain('kindle_email');
     expect(baseline).not.toContain('kindle_sends');
+    // …and no EARLIER migration silently grew the table either — 0003 is its only source.
+    for (const tag of ['0001_user_kindle_email', '0002_app_settings_ebooks_enabled']) {
+      expect(fs.readFileSync(path.join(drizzleDir, `${tag}.sql`), 'utf8')).not.toContain('kindle_sends');
+    }
   });
 });
 
@@ -163,6 +167,26 @@ describe('kindle_sends schema (issue #148)', () => {
       sql: 'INSERT INTO kindle_sends (user_id, book_id, status, started_at, finalized_at) VALUES (?, ?, ?, 1000, ?)',
       args: [row.userId ?? 1, row.bookId, row.status, row.finalizedAt ?? null],
     });
+
+  it('applies onto an EXISTING 0000–0002 database, leaving its rows intact', async () => {
+    // The append-only property a fresh-DB test cannot reach: an install that stopped at 0002, with
+    // rows already written, must gain the table without disturbing anything.
+    const client = await seedThenMigrate({
+      target: '0003_kindle_sends',
+      seed: async (c) => {
+        await c.execute(
+          "INSERT INTO users (public_id, auth_provider, auth_subject, username) VALUES ('us_a','local','a','a')",
+        );
+        await c.execute(
+          "INSERT INTO app_settings (id, default_quota_mode, default_quota_limit, default_quota_window_days) VALUES (1, 'limited', 7, 7)",
+        );
+      },
+    });
+    expect((await client.execute('SELECT count(*) AS n FROM kindle_sends')).rows[0]?.['n']).toBe(0);
+    expect((await client.execute('SELECT count(*) AS n FROM users')).rows[0]?.['n']).toBe(1);
+    expect((await client.execute('SELECT default_quota_limit AS n FROM app_settings')).rows[0]?.['n']).toBe(7);
+    client.close();
+  });
 
   it('applies the append-only 0003 kindle_sends table on top of the baseline', async () => {
     const client = await seededDb();

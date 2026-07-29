@@ -82,9 +82,11 @@ describe('guards (AC3, AC9, AC10)', () => {
   it('403s EBOOKS_DISABLED when the feature is off — the same code the download proxy uses', async () => {
     await build({ ebooksEnabled: false });
     const { cookies } = await activeUser();
+    const spy = vi.spyOn(h.kindleSends, 'send');
     const res = await post(GOOD_ID, { cookies });
     expect(res.statusCode).toBe(403);
     expect(res.json().error.code).toBe('EBOOKS_DISABLED');
+    expect(spy).not.toHaveBeenCalled();
     expect(h.narratorr.bookCalls).toEqual([]);
     expect(h.ebookStream.opened).toEqual([]);
   });
