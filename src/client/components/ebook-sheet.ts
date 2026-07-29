@@ -1,4 +1,5 @@
 import { isNarratorrBookId } from '@shared/schemas/book-id';
+import type { EbookSendOutcome } from '@shared/schemas/ebooks';
 import { humanizeBytes } from '../format-bytes';
 
 // Every DECISION the companion-ebook sheet makes (issue #147), extracted out of the component so
@@ -230,4 +231,164 @@ function clickDownloadAnchor(url: string, filename: string): void {
   anchor.href = url;
   anchor.download = filename;
   anchor.click();
+}
+
+// --- Send to Kindle (issue #149) ---------------------------------------------
+// The sheet's second leg. Everything below is a DECISION — hierarchy, masking, and the two copy
+// tables — extracted for the same reason the download helpers above are: so it is asserted
+// directly rather than through the DOM.
+
+/**
+ * Which of the sheet's two actions is the amber primary, and why.
+ *
+ * The sheet's rule is "exactly ONE amber button, and it is the one this user can actually act on",
+ * so the hierarchy has to be a single total decision rather than a pile of ternaries in the JSX.
+ * The three states map 1:1 onto what the user must do next:
+ *   • `send-primary`      — an address is saved and delivery works: Send on top, Download beneath.
+ *   • `address-missing`   — delivery works but the user has no device address: Download on top,
+ *                           Send disabled beneath a hint that opens the account modal.
+ *   • `delivery-unavailable` — the instance cannot send at all: Download on top, Send disabled
+ *                           with honest copy. Adding an address would not help, so no hint.
+ *
+ * `kindleEmail` arrives from `MeDto.kindleEmail`, a plain nullable string on the DTO — NOT the
+ * refined `kindleEmailSchema` — so whitespace is a value this has to decide about rather than
+ * assume away. A whitespace-only address is `address-missing`, never `send-primary`: the server
+ * would have nowhere to send, and a truthiness check would render a masked caption for it.
+ */
+export type EbookSheetHierarchy =
+  | { kind: 'send-primary'; kindleEmail: string }
+  | { kind: 'address-missing' }
+  | { kind: 'delivery-unavailable' };
+
+/**
+ * TOTAL over every `(kindleDeliveryVisible × kindleEmail)` pair. `kindleDeliveryVisible` must come
+ * from the fail-safe `kindleDeliveryVisible()` gate in `../features`, never off `.data` — the gate
+ * already folds "still loading" and "the query errored" into `false`, which is what makes
+ * `delivery-unavailable` the honest answer in all three of those cases with one branch.
+ */
+export function decideEbookSheetHierarchy({
+  kindleEmail,
+  kindleDeliveryVisible,
+}: {
+  kindleEmail: string | null;
+  kindleDeliveryVisible: boolean;
+}): EbookSheetHierarchy {
+  if (!kindleDeliveryVisible) return { kind: 'delivery-unavailable' };
+  const trimmed = (kindleEmail ?? '').trim();
+  return trimmed === '' ? { kind: 'address-missing' } : { kind: 'send-primary', kindleEmail: trimmed };
+}
+
+/** Everything before the first `@`, or the whole string when there is none. */
+function localPartOf(value: string): string {
+  const at = value.indexOf('@');
+  return at < 0 ? value : value.slice(0, at);
+}
+
+/**
+ * Mask a Kindle address for DISPLAY: `todd@kindle.com` → `t…d@kindle.com`.
+ *
+ * TOTAL over arbitrary strings and it never throws. That matters because `MeDto.kindleEmail` is a
+ * plain nullable string on the DTO, not the refined write schema — a value stored before that
+ * schema existed, or a hand-crafted PATCH, can reach this helper looking like nothing in
+ * particular, and a caption is not the place to discover it.
+ *
+ * The disclosure bound is deliberate: for a well-formed address the first and last code point of
+ * the local part survive (the mockup's shape — enough for the owner to recognize their own
+ * device), for a 1- or 2-character local part only the FIRST does (never echo a whole local part),
+ * and for anything malformed — no `@`, an empty local part, an empty domain, a second `@` — only
+ * the first code point of the pre-`@` portion does. CODE POINTS, not UTF-16 units: indexing a
+ * string would split an emoji into lone surrogates and render mojibake.
+ */
+export function maskKindleAddress(value: string): string {
+  const trimmed = value.trim();
+  const at = trimmed.indexOf('@');
+  const local = [...localPartOf(trimmed)];
+  const head = local[0] ?? '';
+  // No `@` at all: there is no domain to keep, so the mask is just the disclosed head.
+  if (at < 0) return `${head}…`;
+  const domain = trimmed.slice(at + 1);
+  // Malformed — an empty local part, an empty domain, or a second `@`. Disclose the head and
+  // nothing else; the remainder is echoed verbatim because it is not a local part at all.
+  if (local.length === 0 || domain === '' || domain.includes('@')) return `${head}…@${domain}`;
+  const tail = local.length > 2 ? local[local.length - 1] : '';
+  return `${head}…${tail}@${domain}`;
+}
+
+/**
+ * The State-A caption: who it goes to (masked) and who it arrives from.
+ *
+ * `kindleSenderEmail` is `null`-able on the features payload. The server's invariant says a visible
+ * Kindle feature always carries a confirmed sender, but the client stays total: an absent sender
+ * DROPS the whole "arrives from" clause rather than rendering the string `null`.
+ */
+export function kindleSendCaption(kindleEmail: string, senderEmail: string | null): string {
+  const masked = maskKindleAddress(kindleEmail);
+  return senderEmail ? `Sends to ${masked} · arrives from ${senderEmail}` : `Sends to ${masked}`;
+}
+
+/** State B's hint — the lead-in; {@link KINDLE_ADDRESS_HINT_ACTION} is the control that follows it. */
+export const KINDLE_ADDRESS_HINT = 'Send to Kindle needs your device address —';
+/** The activatable half of State B's hint. Opens the account modal; never a navigating `<a href>`. */
+export const KINDLE_ADDRESS_HINT_ACTION = 'add it in your account';
+/** State C's copy. Honest about the instance, not about the user — adding an address wouldn't help. */
+export const KINDLE_DELIVERY_UNAVAILABLE = 'Send to Kindle isn’t available on this instance right now.';
+
+/**
+ * Copy for every member of the service's outcome union. EVERY admitted attempt answers
+ * `200 { outcome }` — the failures included — so this table, not the status code, is what the user
+ * hears about a send.
+ *
+ * Keyed by the SHARED `EbookSendOutcome`, so a member added server-side is a typecheck failure here
+ * rather than a silently missing toast.
+ *
+ * `no_kindle_address` and `no_sender` should be unreachable behind the hierarchy's State B/C gates,
+ * but they are genuinely reachable in practice: the features payload has a 60s `staleTime`, and an
+ * address cleared in another tab is invisible to this one until `qk.me` refetches.
+ */
+export const EBOOK_SEND_OUTCOME_MESSAGES: Record<EbookSendOutcome, string> = {
+  sent: 'Sent to Amazon — conversion and delivery happen on Amazon’s side.',
+  // Deliberately NOT "try again": a duplicate send is the expensive mistake here, and the Kindle
+  // library is the only place that can actually answer whether the first one landed.
+  indeterminate: 'We couldn’t confirm the handoff. Don’t resend immediately — check your Kindle library first.',
+  rate_limited: 'You’ve sent a few too quickly. Wait a minute and try again.',
+  quota_exhausted: 'Your send allowance is used up for now — try again later.',
+  too_large: 'This eBook is too large to email. Download it instead.',
+  unavailable: 'This book doesn’t have a companion eBook any more.',
+  no_kindle_address: 'Add a Kindle device address in your account first.',
+  no_sender: 'Send to Kindle isn’t configured on this instance.',
+  failed: 'The send failed. You can download the eBook instead.',
+};
+
+export function sendOutcomeMessage(outcome: EbookSendOutcome): string {
+  return EBOOK_SEND_OUTCOME_MESSAGES[outcome];
+}
+
+/** Shown for every REJECTED send the code table below doesn't cover, including a network failure. */
+export const GENERIC_SEND_ERROR = 'Could not send the eBook to Kindle.';
+
+/**
+ * Copy for a REJECTED request — a thrown `ApiError`, which is a different thing from an outcome.
+ * Keyed on the envelope CODE.
+ *
+ * A `Record<string, string>` lookup, NOT an exhaustive switch over the four bespoke codes: this
+ * route can also emit the central handler's `PAYLOAD_TOO_LARGE` (413) and
+ * `UNSUPPORTED_MEDIA_TYPE` (415), and `parse<T>` mints `NON_JSON` for a malformed body — all of
+ * which must reach the generic message rather than `undefined`.
+ *
+ * The GUARD codes (`UNAUTHORIZED` / `ACCOUNT_PENDING` / `ACCOUNT_REJECTED`) get no bespoke copy, the
+ * same doctrine the download leg follows: the app's `/api/me` gate owns the sign-in experience and
+ * the sheet must not grow its own auth handling.
+ *
+ * There is deliberately no 429 entry — the send route carries no Fastify limiter, and the
+ * per-minute cap surfaces as `200 { outcome: 'rate_limited' }` through the outcome table above.
+ */
+const SEND_ERROR_MESSAGES: Record<string, string> = {
+  EBOOKS_DISABLED: 'Send to Kindle is turned off on this instance.',
+  EBOOK_UNAVAILABLE: 'This book doesn’t have a companion eBook any more.',
+  BAD_REQUEST: 'That send request wasn’t accepted — reload the page and try again.',
+  INTERNAL: 'Something went wrong on our side. Try again in a moment.',
+};
+
+export function sendErrorMessage(code: string): string {
+  return SEND_ERROR_MESSAGES[code] ?? GENERIC_SEND_ERROR;
 }
