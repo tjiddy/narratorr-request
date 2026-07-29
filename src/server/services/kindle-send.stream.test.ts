@@ -11,6 +11,7 @@ import { KindleSendService } from './kindle-send.service.js';
 import { buildKindleTransport } from './kindle-send.transport.js';
 import { MAX_KINDLE_SEND_BYTES } from './kindle-send.policy.js';
 import { NarratorrStreamClient } from './narratorr-stream-client.js';
+import { Readable } from 'node:stream';
 import nodemailer from 'nodemailer';
 import type { KindleTransportFactory } from './kindle-send.transport.js';
 
@@ -189,6 +190,8 @@ interface RawSmtpOpts {
   trickleReplyMs?: number;
   /** Destroy the connection once this many DATA bytes have arrived — a mid-DATA disconnect. */
   destroyAfterDataBytes?: number;
+  /** Destroy the connection immediately after answering `354`, before ANY DATA byte arrives. */
+  destroyAtDataPrompt?: boolean;
 }
 
 async function startRawSmtp(opts: RawSmtpOpts): Promise<RawSmtp> {
@@ -233,6 +236,9 @@ async function startRawSmtp(opts: RawSmtpOpts): Promise<RawSmtp> {
           inData = true;
           tail = '';
           socket.write('354 Go ahead\r\n');
+          // The submission-boundary fixture: invite the message, then vanish. Not a single
+          // attachment byte is ever accepted, so nothing can have been submitted.
+          if (opts.destroyAtDataPrompt) socket.destroy();
         } else if (verb === 'QUIT') socket.end('221 Bye\r\n');
         else socket.write('250 OK\r\n');
       }
@@ -289,6 +295,8 @@ async function realHarness(opts: {
   sizeBytes: number;
   attemptDeadlineMs?: number;
   socketTimeoutMs?: number;
+  /** Replace the SMTP leg entirely — for the case whose subject is the CONSUMER's pace. */
+  transport?: KindleTransportFactory;
 }): Promise<KindleSendHarness> {
   const h = await buildKindleSendHarness(
     opts.attemptDeadlineMs === undefined ? {} : { attemptDeadlineMs: opts.attemptDeadlineMs },
@@ -305,7 +313,9 @@ async function realHarness(opts: {
     narratorr: streamClient,
     companions: h.companions,
     settings: h.settings,
-    transport: opts.socketTimeoutMs === undefined ? buildKindleTransport : fastTransport(opts.socketTimeoutMs),
+    transport:
+      opts.transport ??
+      (opts.socketTimeoutMs === undefined ? buildKindleTransport : fastTransport(opts.socketTimeoutMs)),
     logger: h.logger,
     now: h.now,
     ...(opts.attemptDeadlineMs === undefined ? {} : { attemptDeadlineMs: opts.attemptDeadlineMs }),
@@ -468,39 +478,75 @@ describe('Content-Length is never the integrity source (split by seam)', () => {
 });
 
 describe('bounded memory — the attachment is streamed, never buffered whole', () => {
-  it('does not run upstream production to completion ahead of downstream demand', async () => {
-    // A large body with a deliberately slow consumer. If the implementation buffered (or used
-    // `Readable.from(wholeBuffer)`), production would race to the end regardless of demand — which
-    // an "is it a stream instance" assertion would happily accept.
-    const TOTAL = 8 * 1024 * 1024;
-    let produced = 0;
-    const upstream = await startUpstream((_req, res) => {
-      res.writeHead(200, { 'content-type': 'application/epub+zip', 'content-length': String(TOTAL) });
-      const pump = (): void => {
-        if (produced >= TOTAL) {
-          res.end();
-          return;
+  const TOTAL = 4 * 1024 * 1024;
+  const CHUNK = 64 * 1024;
+  /**
+   * The retention ceiling this test defends. Legitimately outstanding at any moment: the one chunk
+   * our web-stream adapter has pulled, plus the transform's 16 KiB writable and 16 KiB readable
+   * highWaterMarks. Well inside this, and two orders of magnitude below TOTAL — so an
+   * implementation that buffers the attachment whole cannot pass on ANY host, fast or loaded.
+   */
+  const MAX_IN_FLIGHT = 512 * 1024;
+
+  // Measured at the seam we OWN — bytes our adapter pulled from the upstream stream, minus bytes
+  // the transport has consumed. Deliberately NOT across a real socket: undici keeps its own
+  // receive buffer (empirically ~4 MiB for a 4 MiB localhost body), so a socket-level measurement
+  // would mostly assert undici's buffering policy, which the streaming contract neither constrains
+  // nor can influence. What AC33 constrains is our own pipeline, and this measures exactly that.
+  it('holds only a BOUNDED number of un-consumed bytes against a deliberately throttled consumer', async () => {
+    const h = await buildKindleSendHarness();
+    h.companions.value = { format: 'epub', sizeBytes: TOTAL };
+    h.stream.bytes = new Uint8Array(TOTAL);
+    h.stream.chunks = TOTAL / CHUNK;
+
+    let consumed = 0;
+    let peakInFlight = 0;
+    let pulledAtFirstChunk = -1;
+    h.transports.factoryOverride = () => ({
+      // The THROTTLE is the point: the consumer sets the pace, and every sample is taken BEFORE
+      // crediting the chunk, so the reading is genuine outstanding bytes rather than a post-hoc
+      // difference that a single whole-buffer chunk would flatten to zero.
+      sendMail: async (message) => {
+        const attachment = message.attachments[0]?.content;
+        if (!attachment) throw new Error('no attachment stream');
+        for await (const chunk of attachment) {
+          if (pulledAtFirstChunk < 0) pulledAtFirstChunk = h.stream.pulled;
+          peakInFlight = Math.max(peakInFlight, h.stream.pulled - consumed);
+          consumed += (chunk as Buffer).length;
+          await new Promise((resolve) => setTimeout(resolve, 2));
         }
-        const size = Math.min(64 * 1024, TOTAL - produced);
-        produced += size;
-        if (res.write(Buffer.alloc(size, 0x41))) setImmediate(pump);
-        else res.once('drain', pump);
-      };
-      pump();
+        return { accepted: [message.to], rejected: [] };
+      },
+      close: () => {},
     });
-    const smtp = await startSmtp();
-    const h = await realHarness({ upstream, smtp, sizeBytes: TOTAL });
 
-    const sending = h.svc.send(h.user, BOOK);
-    // Sample production a few ticks in: with genuine end-to-end backpressure, only a bounded
-    // amount can be in flight this early.
-    await new Promise((r) => setTimeout(r, 25));
-    const early = produced;
-    expect(early).toBeLessThan(TOTAL);
-
-    expect(await sending).toEqual({ outcome: 'sent' });
-    expect(produced).toBe(TOTAL);
+    expect(await h.svc.send(h.user, BOOK)).toEqual({ outcome: 'sent' });
+    // Throttling slowed the pipeline; it did not truncate it.
+    expect(consumed).toBe(TOTAL);
+    expect(h.stream.pulled).toBe(TOTAL);
+    // The load-bearing assertion: an explicit retention bound, not a wall-clock sample.
+    expect(peakInFlight).toBeLessThan(MAX_IN_FLIGHT);
+    // Upstream production never ran ahead of downstream demand to completion.
+    expect(pulledAtFirstChunk).toBeLessThan(TOTAL);
+    expect((await h.rowsFor(BOOK))[0]).toMatchObject({ status: 'sent', byteCount: TOTAL });
   }, 60_000);
+
+  it('the bound DISCRIMINATES: the same measurement over a whole-attachment buffer blows past it', async () => {
+    // The control. `Readable.from(wholeBuffer)` is the exact shape AC33 names as forbidden, and it
+    // satisfies an "attachment is a stream instance" assertion perfectly — so the bound above has
+    // to be shown to reject it, or it is decoration.
+    let consumed = 0;
+    let peakInFlight = 0;
+    const whole = Buffer.alloc(TOTAL, 0x41);
+    // Buffering the source IS "pulled everything up front" — that is the shape under test.
+    const pulled = TOTAL;
+    for await (const chunk of Readable.from(whole)) {
+      peakInFlight = Math.max(peakInFlight, pulled - consumed);
+      consumed += (chunk as Buffer).length;
+    }
+    expect(consumed).toBe(TOTAL);
+    expect(peakInFlight).toBeGreaterThan(MAX_IN_FLIGHT);
+  }, 30_000);
 });
 
 describe('the submission boundary — the transform’s `end`, deliberately over-approximating', () => {
@@ -678,5 +724,38 @@ describe('the section outlives the deadline when SMTP is uncancellable', () => {
     expect(result).toEqual({ outcome: 'indeterminate' });
     expect((await h.rowsFor(BOOK))[0]).toMatchObject({ status: 'indeterminate', failureCode: null });
     await queued;
+  }, 30_000);
+});
+
+describe('the submission boundary at a REAL peer — `_flush()` is not `end`', () => {
+  it('a peer that vanishes at the DATA prompt is FAILED — never indeterminate', async () => {
+    // The gap the stage flag must not paper over: the upstream body is complete (so the
+    // transform's `_flush()` has run and its integrity check passed), but the transport consumed
+    // nothing, so no attachment byte reached the wire. A `_flush()`-based flag reports the message
+    // as submitted and yields `indeterminate`, suppressing a retry that is provably safe.
+    //
+    // The body is sized well past nodemailer's own buffering so the outcome cannot hinge on how
+    // much the encoder happened to pull before the socket died.
+    const upstream = await startUpstream(bodyServer({ total: 1024 * 1024, chunkSize: 64 * 1024 }));
+    const raw = await startRawSmtp({ destroyAtDataPrompt: true });
+    const h = await realHarness({ upstream, smtp: raw, sizeBytes: 1024 * 1024, socketTimeoutMs: 5_000 });
+
+    expect(await h.svc.send(h.user, BOOK)).toEqual({ outcome: 'failed' });
+    const [row] = await h.rowsFor(BOOK);
+    // Stage decides, and the stage is "not reached": the code is the catch-all, because no named
+    // cause of OURS induced it.
+    expect(row).toMatchObject({ status: 'failed', failureCode: 'smtp_error' });
+  }, 30_000);
+
+  it('the same peer with a SMALL body — one that fully fits the buffers — is still FAILED', async () => {
+    // The adversarial half: a body under the transform's readable highWaterMark, so `_flush()` has
+    // certainly run and every byte is queued. Only the readable-side `end` distinguishes this from
+    // a genuine submission, which is exactly what the fix restored.
+    const upstream = await startUpstream(bodyServer({ total: 4096 }));
+    const raw = await startRawSmtp({ destroyAtDataPrompt: true });
+    const h = await realHarness({ upstream, smtp: raw, sizeBytes: 4096, socketTimeoutMs: 5_000 });
+
+    expect((await h.svc.send(h.user, BOOK)).outcome).toBe('failed');
+    expect((await h.rowsFor(BOOK))[0]?.status).toBe('failed');
   }, 30_000);
 });

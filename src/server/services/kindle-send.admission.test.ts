@@ -2,9 +2,10 @@ import { describe, it, expect, vi } from 'vitest';
 import { and, eq } from 'drizzle-orm';
 import {
   buildKindleSendHarness,
+  emailRuntimeConfig,
   type KindleSendHarness,
 } from '../test-support/kindle-send.js';
-import { kindleSends } from '../../db/schema.js';
+import { kindleSends, users } from '../../db/schema.js';
 import {
   KINDLE_SEND_AUDIT_RETENTION_MS,
   KINDLE_SEND_DAILY_ACCEPTED,
@@ -203,12 +204,19 @@ describe('the per-minute start cap — a ROLLING window, not a tumbling bucket',
   // The minute budget is spent at the INSERT ATTEMPT, so everything that refuses earlier must
   // leave all three slots intact. A counter incremented before the preconditions would still pass
   // a "zero DB writes" assertion, which is why this asserts the SLOTS rather than the rows.
-  it('no non-reserving refusal spends a minute slot', async () => {
+  it('no non-reserving refusal spends a minute slot — including no_kindle_address', async () => {
     const h = await buildKindleSendHarness();
-    // Every pre-admission refusal, in one sweep.
+    // EVERY pre-admission refusal, in one sweep, starting at the first rung of the ladder: a
+    // caller with no stored Kindle address. Proving only "no row, no stream" there is not enough —
+    // the minute budget is in-memory, so a counter bumped ahead of the preconditions would satisfy
+    // both of those and still throttle the user's later valid sends.
+    await h.db.update(users).set({ kindleEmail: null }).where(eq(users.id, h.user.id));
+    expect((await h.svc.send(h.user, 'bk_r0')).outcome).toBe('no_kindle_address');
+    await h.db.update(users).set({ kindleEmail: 'reader@kindle.com' }).where(eq(users.id, h.user.id));
+
     h.settings.sender = { failure: 'sender-changed' };
     expect((await h.svc.send(h.user, 'bk_r1')).outcome).toBe('no_sender');
-    h.settings.sender = { mailbox: 'library@example.com', config: h.transports.configs[0] ?? (await import('../test-support/kindle-send.js')).emailRuntimeConfig() };
+    h.settings.sender = { mailbox: 'library@example.com', config: emailRuntimeConfig() };
     h.companions.value = null;
     expect((await h.svc.send(h.user, 'bk_r2')).outcome).toBe('unavailable');
     h.companions.value = { format: 'epub', sizeBytes: Number.MAX_SAFE_INTEGER };

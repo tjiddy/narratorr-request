@@ -13,6 +13,7 @@ import {
   sendBudgetMs,
 } from './kindle-send.policy.js';
 import {
+  CountingEpubStream,
   KINDLE_SMTP_CONNECTION_TIMEOUT_MS,
   KINDLE_SMTP_GREETING_TIMEOUT_MS,
   KINDLE_SMTP_SOCKET_INACTIVITY_TIMEOUT_MS,
@@ -371,6 +372,83 @@ describe('rejection classification — three ordered questions, no error-code ta
     for (const code of produced) expect(KINDLE_SEND_FAILURE_CODES).toContain(code);
     // …and no listed code is dead (a dead code invites an implementation-defined extra outcome).
     expect([...produced].sort()).toEqual([...KINDLE_SEND_FAILURE_CODES].sort());
+  });
+});
+
+describe('the submission stage boundary is the readable `end`, NOT `_flush()`', () => {
+  /** Feed the transform a complete body and end the writable side, WITHOUT draining it. */
+  async function flushedButUndrained(bytes: number): Promise<CountingEpubStream> {
+    const transform = new CountingEpubStream(bytes);
+    transform.write(Buffer.alloc(bytes, 0x41));
+    transform.end();
+    // `_flush()` runs off the writable side ending; a body under the readable highWaterMark is
+    // fully accepted, so this settles without any consumer having read a single byte.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    return transform;
+  }
+
+  it('is FALSE while every byte still sits un-consumed in the readable buffer', async () => {
+    const transform = await flushedButUndrained(4096);
+    // `_flush()` has passed — the integrity check ran and the counter is complete…
+    expect(transform.bytes).toBe(4096);
+    expect(transform.abortReason).toBeNull();
+    // …but nodemailer has read nothing, so nothing has reached the socket. Reporting the stage as
+    // reached here is what would misclassify a disconnect in this gap as `indeterminate`.
+    expect(transform.readableEnded).toBe(false);
+    expect(transform.reachedEnd).toBe(false);
+  });
+
+  it('flips to TRUE only once the consumer has drained it', async () => {
+    const transform = await flushedButUndrained(4096);
+    expect(transform.reachedEnd).toBe(false);
+    let drained = 0;
+    transform.on('data', (chunk: Buffer) => {
+      drained += chunk.length;
+    });
+    await new Promise((resolve) => transform.on('end', resolve));
+    expect(drained).toBe(4096);
+    expect(transform.reachedEnd).toBe(true);
+  });
+
+  it('stays FALSE when our own integrity check aborted before EOF', async () => {
+    const transform = new CountingEpubStream(99);
+    transform.on('error', () => {});
+    transform.write(Buffer.alloc(10, 0x41));
+    transform.end();
+    transform.resume();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(transform.abortReason).toBe('size_mismatch');
+    expect(transform.reachedEnd).toBe(false);
+  });
+
+  // The boundary through the REAL classification path: a transport that takes the attachment,
+  // stops consuming it, and then rejects with no server reply. `_flush()` has passed, so a
+  // flush-based flag reports `indeterminate`; the honest answer is `failed`, because not one
+  // attachment byte was submitted and a retry is provably safe.
+  it('classifies an un-consumed attachment as FAILED, never indeterminate', async () => {
+    const h = await buildKindleSendHarness();
+    h.companions.value = { format: 'epub', sizeBytes: 4096 };
+    h.stream.bytes = new Uint8Array(4096);
+    h.transports.factoryOverride = () => ({
+      // Never reads the attachment — the connection died before the transport could consume it.
+      sendMail: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        throw new Error('connection reset');
+      },
+      close: () => {},
+    });
+
+    expect(await h.svc.send(h.user, BOOK)).toEqual({ outcome: 'failed' });
+    const [row] = await h.rowsFor(BOOK);
+    expect(row).toMatchObject({ status: 'failed', failureCode: 'smtp_error' });
+  });
+
+  it('still classifies a FULLY consumed attachment as indeterminate on a reply-less rejection', async () => {
+    // The mirror case, so the fix cannot be satisfied by simply never reporting the stage.
+    const h = await buildKindleSendHarness();
+    h.transports.reply = () => Promise.reject(new Error('connection lost after DATA'));
+    expect(await h.svc.send(h.user, BOOK)).toEqual({ outcome: 'indeterminate' });
+    expect((await h.rowsFor(BOOK))[0]).toMatchObject({ status: 'indeterminate', failureCode: null });
   });
 });
 

@@ -148,7 +148,6 @@ export type CountingAbortReason = Extract<KindleSendFailureCode, 'oversize' | 's
 export class CountingEpubStream extends Transform {
   private counted = 0;
   private aborted: CountingAbortReason | null = null;
-  private ended = false;
 
   constructor(private readonly expectedBytes: number) {
     super();
@@ -165,12 +164,22 @@ export class CountingEpubStream extends Transform {
   }
 
   /**
-   * Whether the readable side reached `end` — i.e. the transport consumed every attachment byte
-   * and `_flush()` passed. This is the STAGE discriminator the rejection taxonomy asks question 3
+   * Whether the readable side actually reached `end` — i.e. the transport consumed EVERY attachment
+   * byte AND `_flush()` passed. The STAGE discriminator the rejection taxonomy asks question 3
    * against; see {@link classifySendRejection}.
+   *
+   * Read from Node's own `readableEnded`, which flips exactly when the `end` event is emitted.
+   * Deliberately NOT a flag set in `_flush()`: `_flush()` fires when the WRITABLE side has ended
+   * and the final output has been queued, which says nothing about downstream consumption — up to
+   * a full `highWaterMark` of attachment bytes can still be sitting in the readable buffer,
+   * un-read by nodemailer and therefore never written to the socket. Using the `_flush()` moment
+   * would classify a disconnect in that gap as `indeterminate` even though the message was never
+   * submitted, suppressing a retry that is provably safe. It would also widen the deliberate
+   * over-approximation from "the MIME epilogue plus the `\r\n.\r\n` terminator" to the whole
+   * readable buffer, which is not the trade the contract makes.
    */
   get reachedEnd(): boolean {
-    return this.ended;
+    return this.readableEnded;
   }
 
   override _transform(chunk: Buffer | string, _encoding: BufferEncoding, cb: TransformCallback): void {
@@ -186,12 +195,14 @@ export class CountingEpubStream extends Transform {
   }
 
   override _flush(cb: TransformCallback): void {
+    // Integrity is enforced HERE — before EOF — so the attachment never ends cleanly on a mismatch
+    // and nodemailer's DATA cannot complete. It deliberately does NOT record the submission stage:
+    // that is `readableEnded`'s job, and the two moments are genuinely different.
     if (this.counted !== this.expectedBytes) {
       this.aborted = 'size_mismatch';
       cb(new Error('companion ebook byte count did not match the advertised size'));
       return;
     }
-    this.ended = true;
     cb();
   }
 }

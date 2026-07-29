@@ -55,9 +55,16 @@ export class FakeKindleTransports {
    */
   reply: (message: KindleMailMessage) => Promise<KindleSendInfo> = (message) =>
     Promise.resolve({ accepted: [message.to], rejected: [] });
+  /**
+   * Replace the built transport wholesale. The default one DRAINS the attachment, which is right
+   * for almost every case — but the submission-stage boundary needs a transport that deliberately
+   * does NOT consume it, and that cannot be expressed by overriding {@link reply} alone.
+   */
+  factoryOverride: KindleTransportFactory | null = null;
 
   readonly factory: KindleTransportFactory = (config) => {
     this.configs.push(config);
+    if (this.factoryOverride) return this.factoryOverride(config);
     return {
       sendMail: async (message) => {
         this.messages.push(message);
@@ -119,6 +126,15 @@ export class FakeEpubStreamClient implements IEbookStreamClient {
   beforeOpen: (() => Promise<void>) | null = null;
   /** Awaited before each chunk — the trickle seam for deadline tests. */
   beforeChunk: (() => Promise<void>) | null = null;
+  /**
+   * Bytes this fake has actually HANDED OVER, i.e. that the consumer's adapter pulled.
+   *
+   * The observability seam for bounded memory: `pulled - consumed` is exactly what OUR pipeline is
+   * retaining, with no third-party receive buffer in the middle. Measuring the same quantity across
+   * a real socket instead would mostly measure undici's own buffering, which the streaming contract
+   * neither constrains nor can influence.
+   */
+  pulled = 0;
 
   async openCompanionEpub(publicId: string, opts: { signal?: AbortSignal } = {}): Promise<NarratorrEbookStream> {
     this.signals.push(opts.signal);
@@ -127,6 +143,11 @@ export class FakeEpubStreamClient implements IEbookStreamClient {
     if (this.openError) throw this.openError;
     const { bytes, chunks, midStreamError, beforeChunk } = this;
     const size = Math.max(1, Math.ceil(bytes.byteLength / Math.max(1, chunks)));
+    // An arrow closure rather than a `this` alias: the underlying-source `pull` is invoked with the
+    // stream's own receiver, so the counter has to be reached lexically.
+    const countPulled = (n: number): void => {
+      this.pulled += n;
+    };
     let offset = 0;
     let served = 0;
     return {
@@ -141,6 +162,7 @@ export class FakeEpubStreamClient implements IEbookStreamClient {
             return;
           }
           controller.enqueue(bytes.subarray(offset, offset + size));
+          countPulled(Math.min(size, bytes.byteLength - offset));
           offset += size;
           served += 1;
         },
