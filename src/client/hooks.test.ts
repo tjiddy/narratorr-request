@@ -984,13 +984,12 @@ describe('useSendToKindle — the send mutation (#149)', () => {
   // dispatches, that it asks for NO cache operation, and which toast each answer raises
   // (react-query-mock-hides-cache-convergence). It also OWNS the toasts: the sheet raises none, so
   // "exactly one toast per answer" is assertable here.
-  const send = (bookId: string, title: string) =>
-    mutFn<{ bookId: string; title: string }>(useSendToKindle())({ bookId, title });
-
   it('dispatches sendEbookToKindle with the book id and the sheet’s title', async () => {
     hoisted.api.sendEbookToKindle.mockResolvedValue({ outcome: 'sent' });
 
-    await expect(send('bk_abc123', 'The Hobbit')).resolves.toEqual({ outcome: 'sent' });
+    const dispatch = mutFn<{ bookId: string; title: string }>(useSendToKindle());
+
+    await expect(dispatch({ bookId: 'bk_abc123', title: 'The Hobbit' })).resolves.toEqual({ outcome: 'sent' });
 
     expect(hoisted.api.sendEbookToKindle).toHaveBeenCalledTimes(1);
     expect(hoisted.api.sendEbookToKindle).toHaveBeenCalledWith('bk_abc123', 'The Hobbit');

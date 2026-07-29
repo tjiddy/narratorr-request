@@ -6,6 +6,11 @@ import type { MeDto } from '@shared/schemas/user';
 import { useMe } from '../hooks';
 import { KINDLE_EMAIL_HELP } from '../pages/notify-prefs';
 import { AccountModal } from './AccountModal';
+import {
+  AMAZON_APPROVED_LIST_URL,
+  AMAZON_APPROVED_LIST_LINK_LABEL,
+  AMAZON_APPROVED_LIST_DISCLOSURE_LABEL,
+} from './kindle-allowlist';
 
 // The hook toasts on every settled mutation; the toasts are not what this file is about (they're
 // covered by `meSuccessToast`'s pure tests), and a real sonner store would leak between cases.
@@ -355,5 +360,111 @@ describe('AccountModal — overlapping row saves settle race-safely (#142 F1)', 
     expect(emailInput().value).toBe('new@contact.com');
     expect(emailSave()).toBeDisabled();
     expect(kindleSave()).toBeDisabled();
+  });
+});
+
+// --- The Amazon allowlist education beside the Kindle row (#149 AC18/AC19) ----
+
+describe('AccountModal — Amazon allowlist education (#149)', () => {
+  const link = () => screen.queryByRole('link', { name: AMAZON_APPROVED_LIST_LINK_LABEL });
+  const expander = () => screen.queryByRole('button', { name: AMAZON_APPROVED_LIST_DISCLOSURE_LABEL });
+
+  it.each([
+    ['an address already saved', 'device@kindle.com'],
+    // The SETUP-time teaching moment: it must be there before there is anything to teach about.
+    ['no address saved yet', null],
+  ])('renders the link and the expander with %s', async (_label, kindleEmail) => {
+    await renderModal({ kindleEmail });
+
+    expect(link()).toBeInTheDocument();
+    expect(expander()).toBeInTheDocument();
+  });
+
+  it('renders them beside the KINDLE row, not the contact-email row', async () => {
+    await renderModal({ kindleEmail: null });
+
+    // Each row is `<div><div class="flex items-end">…input…</div><p>error|help</p></div>`; the
+    // education is a sibling of that row inside a shared wrapper.
+    const kindleGroup = kindleInput().closest('div')?.parentElement?.parentElement;
+    const emailRow = emailInput().closest('div')?.parentElement;
+    expect(kindleGroup).toContainElement(link());
+    expect(kindleGroup).toContainElement(expander());
+    expect(emailRow).not.toContainElement(link());
+  });
+
+  it('opens the deep link in a new tab with both rel tokens', async () => {
+    await renderModal({ kindleEmail: null });
+
+    expect(link()).toHaveAttribute('href', AMAZON_APPROVED_LIST_URL);
+    expect(link()).toHaveAttribute('target', '_blank');
+    expect(link()!.getAttribute('rel')).toContain('noopener');
+    expect(link()!.getAttribute('rel')).toContain('noreferrer');
+  });
+
+  it('keeps the click path collapsed by default and reveals it on demand', async () => {
+    const user = userEvent.setup();
+    await renderModal({ kindleEmail: null });
+
+    expect(expander()).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByText('Personal Document Settings')).toBeNull();
+
+    await user.click(expander()!);
+
+    expect(expander()).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByText('Approved Personal Document E-mail List')).toBeInTheDocument();
+    expect(screen.getByText('Enter the sender mailbox')).toBeInTheDocument();
+    expect(screen.getByText(/one-time setup per Amazon account/i)).toBeInTheDocument();
+  });
+
+  // THE regression AC18 exists to prevent. `EmailFieldRow.help` is a `string` rendered only while
+  // the row's inline `error` is null, so education routed through it would VANISH exactly when the
+  // user has just failed to save an address — the moment they most need to be told about Amazon's
+  // approved list. A `help`-prop implementation passes every other test in this describe.
+  it('SURVIVES the row’s inline error state', async () => {
+    const user = userEvent.setup();
+    patchResponder = () =>
+      Promise.resolve(jsonRes(400, { error: { code: 'FST_ERR_VALIDATION', message: 'enter your Kindle address' } }));
+    await renderModal({ kindleEmail: null });
+
+    await user.type(kindleInput(), 'nope@example.com');
+    await user.click(kindleSave());
+    await screen.findByText('enter your Kindle address');
+
+    // The help copy is gone (the existing error/help swap, untouched) — the education is not.
+    expect(screen.queryByText(KINDLE_EMAIL_HELP)).not.toBeInTheDocument();
+    expect(link()).toBeInTheDocument();
+    expect(expander()).toBeInTheDocument();
+  });
+
+  it('leaves the existing help/error swap exactly as it was', async () => {
+    const user = userEvent.setup();
+    let reject = true;
+    patchResponder = (body) =>
+      reject
+        ? Promise.resolve(jsonRes(400, { error: { code: 'FST_ERR_VALIDATION', message: 'enter your Kindle address' } }))
+        : applyPatch(body);
+    await renderModal({ kindleEmail: null });
+
+    // No error → the help copy renders.
+    expect(screen.getByText(KINDLE_EMAIL_HELP)).toBeInTheDocument();
+
+    await user.type(kindleInput(), 'nope@example.com');
+    await user.click(kindleSave());
+    await screen.findByText('enter your Kindle address');
+    expect(screen.queryByText(KINDLE_EMAIL_HELP)).not.toBeInTheDocument();
+
+    // …and it comes back once the error clears.
+    reject = false;
+    await user.type(kindleInput(), 'x');
+    expect(screen.getByText(KINDLE_EMAIL_HELP)).toBeInTheDocument();
+  });
+
+  // The AC9 exemption, pinned deliberately: the SHEET must never show the full address, but this
+  // input is where the user reads and edits it — masking here would break the feature.
+  it('still renders the FULL Kindle address in its editable input', async () => {
+    await renderModal({ kindleEmail: 'todd@kindle.com' });
+
+    expect(kindleInput().value).toBe('todd@kindle.com');
+    expect(kindleInput().value).not.toContain('…');
   });
 });

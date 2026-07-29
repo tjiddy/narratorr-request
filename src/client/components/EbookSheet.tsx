@@ -259,8 +259,14 @@ function EbookSheetActions({
     openAccount?.();
   }
 
+  // KEYED, and load-bearing: the two controls SWAP ORDER when the hierarchy changes under an open
+  // sheet (an address saved in another tab, a sender the admin just retired). As positional
+  // children React would reconcile them by index and reuse each other's DOM node — the element the
+  // user is hovering, or the one holding an in-flight download's pending state, would silently
+  // become the other button. Keys make the reorder a move rather than a swap of contents.
   const download = (
     <Button
+      key="download"
       variant={sendPrimary ? 'secondary' : 'primary'}
       icon={DownloadIcon}
       loading={downloading}
@@ -271,8 +277,9 @@ function EbookSheetActions({
     </Button>
   );
 
-  const sendButton = (
+  const sendControl = (
     <Button
+      key="send"
       variant={sendPrimary ? 'primary' : 'secondary'}
       icon={SendIcon}
       loading={send.isPending}
@@ -286,8 +293,7 @@ function EbookSheetActions({
 
   return (
     <div className="flex flex-col gap-2.5">
-      {sendPrimary ? sendButton : download}
-      {sendPrimary ? download : sendButton}
+      {sendPrimary ? [sendControl, download] : [download, sendControl]}
       {hierarchy.kind === 'send-primary' && (
         <div className="mt-0.5 flex flex-col gap-1.5">
           <p className="text-xs text-muted-foreground/80">
