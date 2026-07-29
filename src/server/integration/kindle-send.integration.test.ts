@@ -196,6 +196,11 @@ describe('the happy path, end to end over real sockets', () => {
     expect(row.finalizedAt).not.toBeNull();
     expect(row.failureCode).toBeNull();
     expect(row.byteCount).toBe(EPUB.byteLength);
+    // The clock receipt: the service stamped this row from the FROZEN instant, so the rolling
+    // windows every scenario in this file depends on are pinned rather than ambient. Removing the
+    // `useFakeTimers` call fails HERE, instead of leaving a silently host-clock-dependent suite.
+    expect(row.startedAt.getTime()).toBe(FROZEN_NOW.getTime());
+    expect(row.finalizedAt?.getTime()).toBe(FROZEN_NOW.getTime());
     // The CLOSED column set — a new column carrying a recipient, a filename or an SMTP response
     // string would have to appear here first.
     expect(Object.keys(row).sort()).toEqual(
