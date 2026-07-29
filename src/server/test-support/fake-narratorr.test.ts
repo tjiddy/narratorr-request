@@ -61,4 +61,19 @@ describe('the fake narratorr refuses before it serves', () => {
     expect(await res.json()).toEqual({ companionEpub: { enabled: true } });
     expect(fake.receipts).toEqual([{ method: 'GET', path: '/api/v1/capabilities', keyMatched: true }]);
   }, 30_000);
+
+  it.each([
+    ['a book id with no programmed entry', '/api/v1/books/bk_unprogrammed'],
+    ['a path the feature never consumes', '/api/v1/nothing-here'],
+  ])('answers 404 for %s', async (_label, path) => {
+    // The two documented 404 fallbacks. A scenario that programs `books` and expects an unknown id
+    // to read as "no such book" depends on the first; the second keeps an accidental typo in a
+    // scenario's path from being served something.
+    fake = await startFakeNarratorr({ apiKey: API_KEY });
+
+    const res = await fetch(`${fake.baseUrl}${path}`, { headers: { 'x-api-key': API_KEY } });
+
+    expect(res.status).toBe(404);
+    expect(fake.companionOpens).toBe(0);
+  }, 30_000);
 });
