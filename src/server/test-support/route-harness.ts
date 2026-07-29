@@ -11,6 +11,7 @@ import { RequestService, type RequestPolicy } from '../services/request.service.
 import { SearchService } from '../services/search.service.js';
 import { NarratorrClientHolder } from '../services/narratorr-client-holder.js';
 import { FeatureService } from '../services/feature.service.js';
+import { CompanionEbookService } from '../services/companion-ebook.service.js';
 import { Notifier } from '../services/notifications/notifier.service.js';
 import type { NotifierLogger } from '../services/notifications/types.js';
 import { SecretCodec, deriveSettingsKey } from '../util/secret-codec.js';
@@ -27,6 +28,7 @@ import type { IEbookStreamClient, NarratorrEbookStream } from '../services/narra
 import type { V1Book } from '../../shared/schemas/v1/books.js';
 import type { V1System } from '../../shared/schemas/v1/system.js';
 import type { V1Capabilities } from '../../shared/schemas/v1/capabilities.js';
+import type { V1CompanionEbook } from '../../shared/schemas/v1/companion-ebook.js';
 import type { BookStatus } from '../../shared/schemas/book.js';
 import type { AuthUser } from '../types.js';
 
@@ -64,6 +66,14 @@ export class FakeNarratorrClient implements INarratorrClient {
   companionEpub = true;
   /** How many times the capability probe was called — asserts the `/api/features` short-circuit. */
   capabilityCalls = 0;
+  /**
+   * Companion ebooks `getBook()` reports, keyed by book id (issue #147). An id that is ABSENT
+   * from this map yields a book with NO `companionEbook` key at all — a pre-#1961 narratorr —
+   * which the consumer must treat identically to an explicit `null`.
+   */
+  companions = new Map<string, V1CompanionEbook | null>();
+  /** Every `getBook()` id, in order — asserts the enrichment fan-out and its cache. */
+  bookCalls: string[] = [];
   private seq = 0;
 
   async searchMetadata(): Promise<[]> {
@@ -75,7 +85,15 @@ export class FakeNarratorrClient implements INarratorrClient {
     return { id: `bk_${this.seq}`, title: 'A Book', authors: [], narrators: [], status: this.status };
   }
   async getBook(id: string): Promise<V1Book> {
-    return { id, title: 'A Book', authors: [], narrators: [], status: this.status };
+    this.bookCalls.push(id);
+    return {
+      id,
+      title: 'A Book',
+      authors: [],
+      narrators: [],
+      status: this.status,
+      ...(this.companions.has(id) && { companionEbook: this.companions.get(id) ?? null }),
+    };
   }
   async getSystem(): Promise<V1System> {
     return { version: 'v1.0.0' };
@@ -244,6 +262,15 @@ export async function buildRouteApp(opts: BuildRouteAppOpts): Promise<RouteHarne
   // and its cache generation, so a route test can flip `narratorr.companionEpub` (or `.set(null)`,
   // which retires the cache) and observe it through `/api/features`.
   const features = new FeatureService(narratorrHolder, narratorrHolder);
+  // Mirrors production wiring (issue #147): the same holder for lookups AND cache generation, and
+  // the same feature inputs `/api/features` resolves through — so a route test flips
+  // `connectorSettings.ebooksEnabled` / `narratorr.companionEpub` and observes enrichment change.
+  const companionEbooks = new CompanionEbookService(
+    narratorrHolder,
+    narratorrHolder,
+    { connectorSettings, features },
+    { warn() {} },
+  );
   // A real Notifier (no channels → inert) with its `notify` swapped for a spy, so route tests
   // can assert dispatch without a structural cast. Building the genuine type means a new required
   // AppDeps field surfaces as a compile error here instead of a silent runtime `undefined`.
@@ -294,6 +321,7 @@ export async function buildRouteApp(opts: BuildRouteAppOpts): Promise<RouteHarne
     connectorSettings,
     narratorr: narratorrHolder,
     features,
+    companionEbooks,
     notifier,
     oidc: new Map(),
   };

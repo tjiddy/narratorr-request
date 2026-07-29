@@ -166,6 +166,12 @@ export class RequestService {
       requestedAt: row.requestedAt.toISOString(),
       decidedAt: row.decidedAt ? row.decidedAt.toISOString() : null,
       narratorrBookId: row.narratorrBookId,
+      // ALWAYS null here (issue #147). The field is transient read-time decoration owned by
+      // `CompanionEbookService`, which only the caller's own request list runs; setting it
+      // unconditionally is what keeps every other `toDto()` caller — the admin queue, the
+      // per-user list, the detail route and both mutation responses — serializing against the
+      // response schema unchanged.
+      companionEbook: null,
       requester,
     };
   }

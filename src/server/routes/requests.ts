@@ -53,12 +53,18 @@ export function registerRequestRoutes(app: FastifyInstance, deps: AppDeps): void
     { schema: { querystring: requestListQuerySchema, response: { 200: requestListSchema } } },
     async (request) => {
       const user = requireActiveUser(request);
-      return deps.requests.list({
+      const page = await deps.requests.list({
         userId: user.id,
         ...(request.query.status !== undefined ? { status: request.query.status } : {}),
         limit: request.query.limit,
         offset: request.query.offset,
       });
+      // The ONE enriched surface (issue #147): companion ebooks are read-time decoration for the
+      // caller's own list, where the Get-eBook affordance lives. Every other `toDto()` caller —
+      // the detail route, both mutation responses and the two admin lists — stays unenriched and
+      // truthfully reports `null`. `enrich()` is total, so a narratorr outage costs the
+      // affordance, never the list.
+      return { ...page, data: await deps.companionEbooks.enrich(page.data) };
     },
   );
 

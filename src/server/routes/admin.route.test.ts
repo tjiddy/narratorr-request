@@ -222,6 +222,51 @@ describe('POST /api/admin/requests/:publicId/decision', () => {
 });
 
 // AC4 — credential-leak guard: the serialized user list never carries passwordHash.
+// Issue #147 — the admin surfaces are deliberately UNENRICHED. `requestDtoSchema.companionEbook`
+// is required-and-nullable, so these paths must serialize a truthful `null` even for a book that
+// genuinely has a companion; `toDto()` is asserted directly too, because the response schema is
+// non-strict and a body assertion alone can't catch a mapper that drops the field.
+describe('admin request surfaces never carry a companion ebook (#147)', () => {
+  const COMPANION = { format: 'epub', sizeBytes: 4096 } as const;
+
+  it('the queue, the per-user list and the DECISION response all report null', async () => {
+    const admin = await insertUser(h.db, { role: 'admin', status: 'active' });
+    const user = await insertUser(h.db, { role: 'user', status: 'active', username: 'req' });
+    const cookie = h.cookieFor(admin);
+    h.narratorr.companionEpub = true;
+    await h.connectorSettings.update({ ebooksEnabled: true });
+    h.narratorr.status = 'imported';
+
+    // A pending row the admin approves — the handoff lands it `available` with a real book id.
+    const { row } = await h.requests.create(user.id, bodyFor('B01'));
+    const decision = await h.app.inject({
+      method: 'POST',
+      url: `/api/admin/requests/${row.publicId}/decision`,
+      cookies: cookie,
+      payload: { action: 'approve' },
+    });
+    expect(decision.statusCode).toBe(200);
+    expect(decision.json()).toMatchObject({ status: 'available', companionEbook: null });
+
+    const approved = await h.requests.getByPublicId(row.publicId);
+    h.narratorr.companions.set(approved!.narratorrBookId!, COMPANION);
+
+    const queue = await h.app.inject({ method: 'GET', url: '/api/admin/requests', cookies: cookie });
+    expect(queue.json().data.every((r: { companionEbook: unknown }) => r.companionEbook === null)).toBe(true);
+
+    const perUser = await h.app.inject({
+      method: 'GET',
+      url: `/api/admin/users/${user.publicId}/requests`,
+      cookies: cookie,
+    });
+    expect(perUser.json().data.every((r: { companionEbook: unknown }) => r.companionEbook === null)).toBe(true);
+
+    // …and the mapper itself, independent of any serializer.
+    const dto = h.requests.toDto(approved!, { publicId: user.publicId, username: user.username });
+    expect(dto.companionEbook).toBeNull();
+  });
+});
+
 describe('GET /api/admin/users — no passwordHash leak', () => {
   it('returns {data,total} and the serialized body contains no passwordHash', async () => {
     const admin = await insertUser(h.db, { role: 'admin', status: 'active' });

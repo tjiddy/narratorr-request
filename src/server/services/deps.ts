@@ -10,6 +10,7 @@ import type { Notifier } from './notifications/index.js';
 import type { ConnectorSettingsService } from './connector-settings.service.js';
 import type { NarratorrClientHolder } from './narratorr-client-holder.js';
 import type { FeatureService } from './feature.service.js';
+import type { CompanionEbookService } from './companion-ebook.service.js';
 
 /** Wired-up service container handed to the route registrars. */
 export interface AppDeps {
@@ -26,6 +27,8 @@ export interface AppDeps {
   /** Total, cached companion-ebook capability resolver; keyed to {@link narratorr}'s generation,
    *  so a connection swap retires the previous server's cached answer by construction. */
   features: FeatureService;
+  /** Total, cached read-time companion-ebook enrichment for the caller's own request list. */
+  companionEbooks: CompanionEbookService;
   /** Fire-and-forget notification dispatcher; reassigned live when channels are saved. */
   notifier: Notifier;
   /** Configured OIDC providers (login service + display config), keyed by provider id.
