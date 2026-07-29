@@ -3,18 +3,11 @@ import type { AppDeps } from '../services/deps.js';
 import type { NarratorrEbookStream } from '../services/narratorr-stream-client.js';
 import { NarratorrError } from '../services/narratorr-client.js';
 import { resolveFeatures } from '../services/feature-state.js';
+import { isNarratorrBookId } from '../../shared/schemas/book-id.js';
 import { requireActiveUser } from '../plugins/auth.js';
 import { ebookDownloadRateLimitOptions } from '../plugins/rate-limit.js';
 import { epubFilename, contentDispositionAttachment } from '../util/epub-filename.js';
 import { ApiError, badGateway } from '../util/errors.js';
-
-/**
- * narratorr's opaque public book id. The `bk_` prefix is contract (`prefixedId('bk')` on the book
- * DTO); past it the token is a base64url `randomBytes(16)`, so `-` and `_` are routine. Bounded at
- * 64 characters total — deliberately BELOW Fastify's default `maxParamLength` of 100, so every id
- * this grammar could accept reaches the handler rather than being refused by the router first.
- */
-const BOOK_ID_RE = /^bk_[A-Za-z0-9_-]{1,61}$/u;
 
 /** The one media type we pass through; anything else is neutralized to a non-renderable type. */
 const EPUB_MEDIA_TYPE = 'application/epub+zip';
@@ -224,8 +217,10 @@ async function prepareDownload(
   // with what `/api/features` told the same caller. Fail-closed by construction.
   if (!(await resolveFeatures(deps)).ebooksEnabled) throw ebooksDisabled();
 
+  // The SAME predicate the client's `buildEbookDownloadUrl()` gates on (issue #147), so "renders
+  // an affordance" and "reaches the handler" are one admission set that cannot drift.
   const { bookId } = request.params;
-  if (!BOOK_ID_RE.test(bookId)) throw ebookUnavailable();
+  if (!isNarratorrBookId(bookId)) throw ebookUnavailable();
 
   // Fastify's querystring parser yields an ARRAY for a repeated key; only a string is usable, and
   // the filename helper decides that. The title only ever affects THIS caller's

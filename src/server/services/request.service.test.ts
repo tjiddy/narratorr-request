@@ -931,6 +931,26 @@ describe('toDto', () => {
     const [failed] = await db.select().from(requests).where(eq(requests.asin, 'B2'));
     expect(svc.toDto(failed!, requester).failureReason).toBe("This edition is excluded by the library's filters.");
   });
+
+  it('always emits companionEbook: null — including on an available row with a real book id', async () => {
+    // Issue #147: the field is TRANSIENT read-time decoration owned by CompanionEbookService,
+    // which only the caller's own list runs. The mapper setting it unconditionally is what keeps
+    // every other caller — the detail route, both mutation responses and both admin lists —
+    // serializing against the required-nullable response schema.
+    const admin = await insertUser(db, { role: 'admin' });
+    const svc = new RequestService(db, client, policy());
+
+    const { row: pending } = await svc.create(admin.id, body('B1'));
+    expect(svc.toDto(pending, requester).companionEbook).toBeNull();
+
+    // The row shape enrichment WOULD target (available + a narratorr book id) still maps to null
+    // here, so a mapper that started sourcing the field itself fails this receipt.
+    client.status = 'imported';
+    const { row: available } = await svc.create(admin.id, body('B2'));
+    expect(available.status).toBe('available');
+    expect(available.narratorrBookId).not.toBeNull();
+    expect(svc.toDto(available, requester).companionEbook).toBeNull();
+  });
 });
 
 describe('applyBook (poller reconciliation)', () => {

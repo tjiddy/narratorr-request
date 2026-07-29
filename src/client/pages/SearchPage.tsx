@@ -1,6 +1,7 @@
 import { useMemo, useState, type FormEvent } from 'react';
 import type { RequestStatus } from '@shared/schemas/request';
-import { useSearch, useMyRequests } from '../hooks';
+import { useSearch, useMyRequests, useMe, useFeatures } from '../hooks';
+import { ebooksVisible } from '../features';
 import { BookCard } from '../components/BookCard';
 import { EmptyState } from '../components/EmptyState';
 import { SearchIcon } from '../components/icons';
@@ -14,6 +15,9 @@ export function SearchPage() {
 
   const search = useSearch(q);
   const mine = useMyRequests();
+  // Read through the pure gate, never off `.data`: a loading or errored /api/features renders the
+  // feature as OFF (fail-safe) rather than flashing an affordance that may not exist.
+  const ebooksEnabled = ebooksVisible(useFeatures(useMe().data));
 
   const statusByAsin = useMemo(() => {
     const map = new Map<string, RequestStatus>();
@@ -74,7 +78,12 @@ export function SearchPage() {
         {search.data && search.data.data.length > 0 && (
           <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
             {search.data.data.map((r) => (
-              <BookCard key={r.asin} result={r} requestedStatus={statusByAsin.get(r.asin)} />
+              <BookCard
+                key={r.asin}
+                result={r}
+                requestedStatus={statusByAsin.get(r.asin)}
+                ebooksEnabled={ebooksEnabled}
+              />
             ))}
           </div>
         )}

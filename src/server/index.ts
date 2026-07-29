@@ -13,6 +13,7 @@ import { UserService } from './services/user.service.js';
 import { SettingsService } from './services/settings.service.js';
 import { RequestService, resolveRequestPolicy, sanitizeAutoApproveRoles } from './services/request.service.js';
 import { SearchService } from './services/search.service.js';
+import { CompanionEbookService } from './services/companion-ebook.service.js';
 import { StatusPoller } from './services/status-poller.js';
 import { buildNarratorrConnection } from './services/narratorr-clients.js';
 import { OidcService, makeOidcMapper, type OidcProfile } from './services/oidc.service.js';
@@ -84,6 +85,11 @@ async function main(): Promise<void> {
     { getNotifier: () => deps.notifier, users, requesterEmail, logger: app.log },
   );
   const search = new SearchService(narratorr);
+  // Read-time companion enrichment for `GET /api/requests` (issue #147). Reads the same swappable
+  // holder for both its lookups and its cache generation, and the same feature inputs the
+  // `/api/features` route and the download proxy resolve through — so all three agree by
+  // construction and a connection swap retires the previous server's cached companions.
+  const companionEbooks = new CompanionEbookService(narratorr, narratorr, { connectorSettings, features }, app.log);
   // One OidcService per configured provider, keyed by id. Authorization is the approval
   // queue (no per-provider gate), so the mapped profile flows straight to upsertFromOidc.
   const oidc = new Map<string, { service: OidcService<OidcProfile>; config: (typeof config.oidcProviders)[number] }>();
@@ -108,6 +114,7 @@ async function main(): Promise<void> {
     connectorSettings,
     narratorr,
     features,
+    companionEbooks,
     notifier,
     oidc,
   };

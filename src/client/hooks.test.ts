@@ -156,8 +156,28 @@ const query = (hook: unknown): QueryOptions => hook as QueryOptions;
 type PlaceholderFn = (prev: unknown, prevQuery?: { queryKey: readonly unknown[] }) => unknown;
 const placeholder = (q: QueryOptions): PlaceholderFn => q.placeholderData as PlaceholderFn;
 
-// Minimal cast helpers — the callbacks only read the few fields we set.
-const req = (over: Partial<RequestDto>): RequestDto => ({ title: 'Dune', status: 'pending', ...over } as RequestDto);
+// A COMPLETE RequestDto, deliberately un-cast: the callbacks under test only read `title` and
+// `status`, but building the whole shape is what makes a newly-required response field (e.g.
+// `companionEbook`, issue #147) a compile error HERE rather than something a `as RequestDto`
+// silently absorbs.
+const req = (over: Partial<RequestDto> = {}): RequestDto => ({
+  publicId: 'rq_1',
+  asin: 'B01',
+  title: 'Dune',
+  author: null,
+  narrator: null,
+  coverUrl: null,
+  status: 'pending',
+  note: null,
+  failureReason: null,
+  requestedAt: '2026-07-01T00:00:00.000Z',
+  decidedAt: null,
+  narratorrBookId: null,
+  companionEbook: null,
+  requester: { publicId: 'us_1', username: 'ann' },
+  ...over,
+});
+// Still a cast: MeDto's unread half is large and not what any receipt here turns on.
 const meDto = (over: Partial<MeDto>): MeDto =>
   ({ publicId: 'us_1', username: 'ann', role: 'user', status: 'active', ...over }) as MeDto;
 
