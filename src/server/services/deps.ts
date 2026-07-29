@@ -11,6 +11,7 @@ import type { ConnectorSettingsService } from './connector-settings.service.js';
 import type { NarratorrClientHolder } from './narratorr-client-holder.js';
 import type { FeatureService } from './feature.service.js';
 import type { CompanionEbookService } from './companion-ebook.service.js';
+import type { KindleSendService } from './kindle-send.service.js';
 
 /** Wired-up service container handed to the route registrars. */
 export interface AppDeps {
@@ -29,6 +30,8 @@ export interface AppDeps {
   features: FeatureService;
   /** Total, cached read-time companion-ebook enrichment for the caller's own request list. */
   companionEbooks: CompanionEbookService;
+  /** Send-to-Kindle: race-safe admission over the `kindle_sends` audit table + the SMTP delivery. */
+  kindleSends: KindleSendService;
   /** Fire-and-forget notification dispatcher; reassigned live when channels are saved. */
   notifier: Notifier;
   /** Configured OIDC providers (login service + display config), keyed by provider id.
