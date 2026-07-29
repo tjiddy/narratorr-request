@@ -330,6 +330,29 @@ describe('the happy path over real sockets', () => {
     expect((await h.rowsFor(BOOK))[0]).toMatchObject({ status: 'sent', byteCount: 2048, failureCode: null });
   }, 20_000);
 
+  it('puts the SELECTED notifier’s From on the wire — envelope AND header — at a real server', async () => {
+    const upstream = await startUpstream(bodyServer({ total: 64 }));
+    const smtp = await startSmtp();
+    const h = await realHarness({ upstream, smtp, sizeBytes: 64 });
+    // A distinguishable sender, resolved from the SELECTED notifier's own config.
+    h.settings.sender = {
+      mailbox: 'chosen@example.com',
+      config: emailRuntimeConfig({
+        host: '127.0.0.1',
+        port: smtp.port,
+        secure: false,
+        from: 'Chosen Library <chosen@example.com>',
+      }),
+    };
+    expect(await h.svc.send(h.user, BOOK)).toEqual({ outcome: 'sent' });
+
+    const message = smtp.completed[0]!.toString('latin1');
+    // The header From is the notifier's own string, VERBATIM — never a second copy or a rewrite.
+    expect(message).toContain('From: Chosen Library <chosen@example.com>');
+    expect(message).toContain(`To: ${RECIPIENT}`);
+    expect(message).not.toContain('library@example.com');
+  }, 20_000);
+
   it('carries the fixed subject and body only — a hostile title reaches the FILENAME alone', async () => {
     const upstream = await startUpstream(bodyServer({ total: 32 }));
     const smtp = await startSmtp();

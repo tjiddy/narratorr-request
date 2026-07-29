@@ -1,7 +1,7 @@
 import type { AddressInfo } from 'node:net';
 import { request as httpRequest } from 'node:http';
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import type { FastifyInstance, RouteOptions } from 'fastify';
+import { errorCodes, type FastifyInstance, type RouteOptions } from 'fastify';
 import { buildRouteApp, type RouteHarness } from '../test-support/route-harness.js';
 import { insertUser } from '../test-support/db.js';
 import { registerEbookRoutes } from './ebooks.js';
@@ -222,6 +222,69 @@ describe('body admission (AC6) — and the absence of any recipient input (AC7)'
   });
 });
 
+describe('the SELECTED notifier reaches SMTP — transport AND From (AC14, AC15, AC17)', () => {
+  it('builds the transport from the SELECTED notifier, not the first usable email notifier', async () => {
+    h = await buildRouteApp({ register: (app, deps) => registerEbookRoutes(app, deps) });
+    h.narratorr.companions.set(GOOD_ID, { format: 'epub', sizeBytes: 3 });
+    await h.connectorSettings.update({ ebooksEnabled: true });
+    // Two distinguishable email notifiers. The selection is SECOND in stored order — exactly where
+    // `selectEmailSource`'s first-usable-wins rule would silently substitute the From, breaking
+    // every household member's Amazon allowlist at once.
+    const mk = (name: string, host: string, from: string) =>
+      h.connectorSettings.createNotifier({
+        name,
+        type: 'email',
+        events: [],
+        config: { host, port: 587, secure: false, user: 'u', pass: 'p', to: 'a@ex.com', from },
+      });
+    await mk('First', 'first.example.com', 'first@example.com');
+    const chosen = await mk('Chosen', 'chosen.example.com', 'chosen@example.com');
+    await h.connectorSettings.update({ kindleSender: { notifierId: chosen.id } });
+
+    const { cookies } = await activeUser();
+    expect((await post(GOOD_ID, { cookies })).json()).toEqual({ outcome: 'sent' });
+
+    // The transport config AND the wire From both come from the selection…
+    expect(h.kindleTransports.configs).toHaveLength(1);
+    expect(h.kindleTransports.configs[0]?.host).toBe('chosen.example.com');
+    expect(h.kindleTransports.messages[0]?.from).toBe('chosen@example.com');
+    // …and the first notifier is nowhere in sight.
+    expect(JSON.stringify(h.kindleTransports.configs)).not.toContain('first.example.com');
+    expect(JSON.stringify(h.kindleTransports.messages)).not.toContain('first@example.com');
+  });
+
+  it('refuses rather than falling back when the SELECTED notifier goes bad, healthy ones beside it', async () => {
+    h = await buildRouteApp({ register: (app, deps) => registerEbookRoutes(app, deps) });
+    h.narratorr.companions.set(GOOD_ID, { format: 'epub', sizeBytes: 3 });
+    await h.connectorSettings.update({ ebooksEnabled: true });
+    const healthy = await h.connectorSettings.createNotifier({
+      name: 'Healthy',
+      type: 'email',
+      events: [],
+      config: { host: 'healthy.example.com', port: 587, secure: false, user: 'u', pass: 'p', to: 'a@ex.com', from: 'healthy@example.com' },
+    });
+    const chosen = await h.connectorSettings.createNotifier({
+      name: 'Chosen',
+      type: 'email',
+      events: [],
+      config: { host: 'chosen.example.com', port: 587, secure: false, user: 'u', pass: 'p', to: 'a@ex.com', from: 'chosen@example.com' },
+    });
+    await h.connectorSettings.update({ kindleSender: { notifierId: chosen.id } });
+    // The admin moves the selected notifier's From — the confirmed sender no longer matches.
+    await h.connectorSettings.updateNotifier(chosen.id, {
+      name: 'Chosen',
+      type: 'email',
+      events: [],
+      config: { host: 'chosen.example.com', port: 587, secure: false, user: 'u', pass: 'p', to: 'a@ex.com', from: 'moved@example.com' },
+    });
+    void healthy;
+
+    const { cookies } = await activeUser();
+    expect((await post(GOOD_ID, { cookies })).json()).toEqual({ outcome: 'no_sender' });
+    expect(h.kindleTransports.configs).toEqual([]);
+  });
+});
+
 describe('outcomes ride the uniform 200 transport (AC2)', () => {
   it('no_kindle_address when the caller has no stored address', async () => {
     await build();
@@ -334,6 +397,27 @@ describe('pre-handler parser errors, through the PRODUCTION error handler (AC3)'
     expect(res.statusCode).toBe(413);
     expect(res.json().error.code).toBe('PAYLOAD_TOO_LARGE');
     expect(res.body).not.toContain('Request body is too large');
+  });
+
+  it('a body that does not match its Content-Length → 400 BAD_REQUEST', async () => {
+    // `FST_ERR_CTP_INVALID_CONTENT_LENGTH` cannot be provoked over a real socket: a SHORT body
+    // makes Node abort the request (Fastify answers with its connection-level `clientError`, which
+    // never reaches an error handler), and a LONG one is framed off as a pipelined request. So the
+    // error is raised from Fastify's OWN exported constructor — a genuine instance with the real
+    // code and statusCode — and driven through the PRODUCTION error-handler plugin.
+    h = await buildRouteApp({
+      register: (app, deps) => {
+        registerEbookRoutes(app, deps);
+        app.get('/api/__ctp-length', async () => {
+          throw new errorCodes.FST_ERR_CTP_INVALID_CONTENT_LENGTH();
+        });
+      },
+    });
+    const res = await h.app.inject({ method: 'GET', url: '/api/__ctp-length' });
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toEqual({ error: { code: 'BAD_REQUEST', message: expect.any(String) } });
+    // OUR message, never Fastify's raw text.
+    expect(res.body).not.toContain('did not match Content-Length');
   });
 
   it('the DECLARED blast radius: a non-Kindle body route gets the same correction', async () => {

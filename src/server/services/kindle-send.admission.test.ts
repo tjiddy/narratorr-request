@@ -1011,3 +1011,116 @@ describe('orphans — both producers, and the global daily cost', () => {
     await queued;
   });
 });
+
+describe('outcome selection — single-assignment, with an OPEN producer set', () => {
+  /** Count terminal finalization writes (the only `update` that asks for `returning`). */
+  function countFinalizations(h: KindleSendHarness): { count: () => number } {
+    const realUpdate = h.db.update.bind(h.db);
+    let count = 0;
+    vi.spyOn(h.db, 'update').mockImplementation(((table: any) => {
+      const real = realUpdate(table);
+      const realSet = real.set.bind(real);
+      real.set = ((vals: any) => {
+        const q = realSet(vals);
+        const realWhere = q.where.bind(q);
+        q.where = ((cond: any) => {
+          const w = realWhere(cond);
+          const realReturning = (w as any).returning?.bind(w);
+          if (realReturning) {
+            (w as any).returning = (cols: any) => {
+              count += 1;
+              return realReturning(cols);
+            };
+          }
+          return w;
+        }) as any;
+        return q;
+      }) as any;
+      return real;
+    }) as any);
+    return { count: () => count };
+  }
+
+  it('a resolving sendMail and the deadline settling together yield ONE row and ONE response', async () => {
+    const h = await buildKindleSendHarness({ attemptDeadlineMs: 5 });
+    h.transports.reply = async (message) => {
+      // Settle at the deadline, deliberately: both producers are live in the same tick.
+      await new Promise((r) => setTimeout(r, 5));
+      return { accepted: [message.to], rejected: [] };
+    };
+    const finalizations = countFinalizations(h);
+    const result = await h.svc.send(h.user, BOOK);
+    vi.restoreAllMocks();
+
+    // Whichever producer won, exactly ONE terminal row and ONE finalization sequence exist.
+    const rows = await h.rowsFor(BOOK);
+    expect(rows).toHaveLength(1);
+    expect(finalizations.count()).toBe(1);
+    expect(rows[0]?.status).toBe(result.outcome);
+    expect(rows[0]?.status).not.toBe('started');
+    // A `sent` durable row is never contradicted afterwards by the timer path.
+    if (result.outcome === 'sent') expect(rows[0]?.failureCode).toBeNull();
+  });
+
+  it('a REJECTING sendMail and the deadline settling together also yield ONE row', async () => {
+    const h = await buildKindleSendHarness({ attemptDeadlineMs: 5 });
+    const finalizations = countFinalizations(h);
+    h.transports.reply = async () => {
+      await new Promise((r) => setTimeout(r, 5));
+      throw new Error('socket gone');
+    };
+    const result = await h.svc.send(h.user, BOOK);
+    vi.restoreAllMocks();
+    expect(await h.rowsFor(BOOK)).toHaveLength(1);
+    expect(finalizations.count()).toBe(1);
+    expect((await h.rowsFor(BOOK))[0]?.status).toBe(result.outcome);
+  });
+
+  it.each([
+    ['the OPEN wins', 500, 0, 'upstream_unavailable'],
+    ['the DEADLINE wins', 5, 40, 'attempt_timeout'],
+  ] as const)(
+    'an open rejection racing the deadline: %s → exactly one AC41 row, never both',
+    async (_label, attemptDeadlineMs, openDelayMs, failureCode) => {
+      const h = await buildKindleSendHarness({ attemptDeadlineMs });
+      const finalizations = countFinalizations(h);
+      h.stream.beforeOpen = () => new Promise((r) => setTimeout(r, openDelayMs));
+      h.stream.openError = new Error('narratorr is unreachable');
+
+      expect(await h.svc.send(h.user, BOOK)).toEqual({ outcome: 'failed' });
+      vi.restoreAllMocks();
+      const rows = await h.rowsFor(BOOK);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ status: 'failed', failureCode });
+      expect(finalizations.count()).toBe(1);
+      // No transport was ever built on either branch — no `sendMail` promise exists to classify.
+      expect(h.transports.configs).toEqual([]);
+    },
+  );
+
+  it('the deadline is NOT running during the admission queries — a slow one cannot time the send out', async () => {
+    // The deadline is armed when `openCompanionEpub` is issued and cleared once an outcome is
+    // selected; every database call is awaited unconditionally. A whole-section timer would fire
+    // during this deliberately-slow quota count and wrongly produce `attempt_timeout`.
+    const h = await buildKindleSendHarness({ attemptDeadlineMs: 50 });
+    const realSelect = h.db.select.bind(h.db);
+    vi.spyOn(h.db, 'select').mockImplementationOnce(((cols: any) => {
+      const q = realSelect(cols);
+      const realFrom = q.from.bind(q);
+      q.from = ((table: any) => {
+        const f = realFrom(table);
+        const realWhere = (f as any).where.bind(f);
+        (f as any).where = async (cond: any) => {
+          await new Promise((r) => setTimeout(r, 200));
+          return realWhere(cond);
+        };
+        return f;
+      }) as any;
+      return q;
+    }) as any);
+
+    expect(await h.svc.send(h.user, BOOK)).toEqual({ outcome: 'sent' });
+    vi.restoreAllMocks();
+    expect((await h.rowsFor(BOOK))[0]?.status).toBe('sent');
+  });
+});
