@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "509680f9-0952-4e0e-9905-9f3f406011dd",
+  "id": "b319866c-15a4-496e-b0b3-7a5a515524b5",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
     "app_settings": {
@@ -36,6 +36,14 @@
           "notNull": true,
           "autoincrement": false,
           "default": 30
+        },
+        "ebooks_enabled": {
+          "name": "ebooks_enabled",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": false
         },
         "auto_approve_roles": {
           "name": "auto_approve_roles",
@@ -76,6 +84,133 @@
         "default_quota_mode_limit": {
           "name": "default_quota_mode_limit",
           "value": "(\"app_settings\".\"default_quota_mode\" = 'limited') = (\"app_settings\".\"default_quota_limit\" IS NOT NULL) AND (\"app_settings\".\"default_quota_limit\" IS NULL OR \"app_settings\".\"default_quota_limit\" > 0)"
+        }
+      }
+    },
+    "kindle_sends": {
+      "name": "kindle_sends",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "integer",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": true
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "book_id": {
+          "name": "book_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "byte_count": {
+          "name": "byte_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "failure_code": {
+          "name": "failure_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "started_at": {
+          "name": "started_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "finalized_at": {
+          "name": "finalized_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "idx_kindle_sends_active": {
+          "name": "idx_kindle_sends_active",
+          "columns": [
+            "user_id",
+            "book_id"
+          ],
+          "isUnique": true,
+          "where": "status = 'started'"
+        },
+        "idx_kindle_sends_replay": {
+          "name": "idx_kindle_sends_replay",
+          "columns": [
+            "user_id",
+            "book_id",
+            "finalized_at"
+          ],
+          "isUnique": false
+        },
+        "idx_kindle_sends_user_started": {
+          "name": "idx_kindle_sends_user_started",
+          "columns": [
+            "user_id",
+            "started_at"
+          ],
+          "isUnique": false
+        },
+        "idx_kindle_sends_user_finalized": {
+          "name": "idx_kindle_sends_user_finalized",
+          "columns": [
+            "user_id",
+            "finalized_at"
+          ],
+          "isUnique": false
+        },
+        "idx_kindle_sends_finalized": {
+          "name": "idx_kindle_sends_finalized",
+          "columns": [
+            "finalized_at"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "kindle_sends_user_id_users_id_fk": {
+          "name": "kindle_sends_user_id_users_id_fk",
+          "tableFrom": "kindle_sends",
+          "tableTo": "users",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "kindle_sends_status_finalized": {
+          "name": "kindle_sends_status_finalized",
+          "value": "(\"kindle_sends\".\"status\" = 'started') = (\"kindle_sends\".\"finalized_at\" IS NULL)"
         }
       }
     },
@@ -315,6 +450,13 @@
         },
         "email": {
           "name": "email",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "kindle_email": {
+          "name": "kindle_email",
           "type": "text",
           "primaryKey": false,
           "notNull": false,

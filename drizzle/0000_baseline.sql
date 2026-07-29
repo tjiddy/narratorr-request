@@ -3,6 +3,7 @@ CREATE TABLE `app_settings` (
 	`default_quota_mode` text DEFAULT 'limited' NOT NULL,
 	`default_quota_limit` integer,
 	`default_quota_window_days` integer DEFAULT 30 NOT NULL,
+	`ebooks_enabled` integer DEFAULT false NOT NULL,
 	`auto_approve_roles` text DEFAULT '["admin"]' NOT NULL,
 	`notify_config` text,
 	`connectors` text,
@@ -10,6 +11,24 @@ CREATE TABLE `app_settings` (
 	CONSTRAINT "default_quota_mode_limit" CHECK(("app_settings"."default_quota_mode" = 'limited') = ("app_settings"."default_quota_limit" IS NOT NULL) AND ("app_settings"."default_quota_limit" IS NULL OR "app_settings"."default_quota_limit" > 0))
 );
 --> statement-breakpoint
+CREATE TABLE `kindle_sends` (
+	`id` integer PRIMARY KEY AUTOINCREMENT NOT NULL,
+	`user_id` integer NOT NULL,
+	`book_id` text NOT NULL,
+	`status` text NOT NULL,
+	`byte_count` integer,
+	`failure_code` text,
+	`started_at` integer NOT NULL,
+	`finalized_at` integer,
+	FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON UPDATE no action ON DELETE cascade,
+	CONSTRAINT "kindle_sends_status_finalized" CHECK(("kindle_sends"."status" = 'started') = ("kindle_sends"."finalized_at" IS NULL))
+);
+--> statement-breakpoint
+CREATE UNIQUE INDEX `idx_kindle_sends_active` ON `kindle_sends` (`user_id`,`book_id`) WHERE status = 'started';--> statement-breakpoint
+CREATE INDEX `idx_kindle_sends_replay` ON `kindle_sends` (`user_id`,`book_id`,`finalized_at`);--> statement-breakpoint
+CREATE INDEX `idx_kindle_sends_user_started` ON `kindle_sends` (`user_id`,`started_at`);--> statement-breakpoint
+CREATE INDEX `idx_kindle_sends_user_finalized` ON `kindle_sends` (`user_id`,`finalized_at`);--> statement-breakpoint
+CREATE INDEX `idx_kindle_sends_finalized` ON `kindle_sends` (`finalized_at`);--> statement-breakpoint
 CREATE TABLE `requests` (
 	`id` integer PRIMARY KEY AUTOINCREMENT NOT NULL,
 	`public_id` text NOT NULL,
@@ -44,6 +63,7 @@ CREATE TABLE `users` (
 	`username` text NOT NULL,
 	`password_hash` text,
 	`email` text,
+	`kindle_email` text,
 	`thumb` text,
 	`role` text DEFAULT 'user' NOT NULL,
 	`status` text DEFAULT 'pending' NOT NULL,

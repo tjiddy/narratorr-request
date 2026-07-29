@@ -10,12 +10,13 @@ import { seedThenMigrate } from './seed-then-migrate.js';
 const drizzleDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../drizzle');
 
 // The migration history was squashed (again) to a single 0000 for the 1.0 release — the
-// post-rename increments (the user_caused_failure drop, notify_on, available_notified_at and
-// its one-time backfill) are folded into the baseline. Pre-1.0 DBs are deliberately NOT
-// auto-upgradable: the new baseline has a fresh journal timestamp so an old DB fails loudly at
-// boot instead of silently skipping it. What matters here is that a fresh DB gets the complete
-// final schema. The seed-then-migrate modality (seed-then-migrate.ts) stays for the next
-// data-bearing migration; its worked example (the old 0003 backfill) left the tree with the squash.
+// companion-ebook increments (users.kindle_email, app_settings.ebooks_enabled, kindle_sends)
+// are folded into the baseline alongside the earlier folds. Pre-squash DBs are deliberately
+// NOT auto-upgradable: the new baseline has a fresh journal timestamp so an old DB fails
+// loudly at boot instead of silently skipping it (upgrade = export users, fresh DB, re-import).
+// What matters here is that a fresh DB gets the complete final schema. The seed-then-migrate
+// modality (seed-then-migrate.ts) stays for the next data-bearing migration; its worked
+// examples (the old 0002/0003 in-place upgrades) left the tree with the squash.
 describe('schema migrations', () => {
   it('applies cleanly on a fresh DB with the generic identity schema', async () => {
     const client = createClient({ url: ':memory:' });
@@ -38,17 +39,16 @@ describe('schema migrations', () => {
     client.close();
   });
 
-  // issue #142: `users.kindle_email` is the FIRST append-only migration on top of the 1.0
-  // baseline. Asserted against a fresh in-memory DB that applies the whole folder, so a
-  // migration that never lands (an edited baseline — drizzle tracks by content hash, so it
-  // would silently not re-run) fails here rather than at a customer's boot.
-  it('applies the append-only 0001 kindle_email column on top of the baseline', async () => {
+  // issue #142 (folded): `users.kindle_email` now ships in the baseline. Asserted against a
+  // fresh in-memory DB applying the whole folder, so a squash that silently dropped the column
+  // fails here rather than at a customer's boot.
+  it('folds the kindle_email column into the baseline, nullable', async () => {
     const client = createClient({ url: ':memory:' });
     await migrate(drizzle(client), { migrationsFolder: drizzleDir });
     const info = (await client.execute("PRAGMA table_info('users')")).rows;
     const kindle = info.find((r) => r['name'] === 'kindle_email');
     expect(kindle).toBeDefined();
-    expect(kindle?.['notnull']).toBe(0); // nullable — a pre-existing row needs no backfill
+    expect(kindle?.['notnull']).toBe(0); // nullable — a fresh row needs no value
     client.close();
   });
 
@@ -68,10 +68,10 @@ describe('schema migrations', () => {
     client.close();
   });
 
-  // issue #144: the companion-ebook opt-in. Same fresh-DB shape check as 0001 above — a migration
-  // that never lands (an edited baseline, which drizzle tracks by content hash and silently skips
-  // on an existing DB) fails here rather than at a customer's boot.
-  it('applies the append-only 0002 ebooks_enabled column on top of the baseline', async () => {
+  // issue #144 (folded): the companion-ebook opt-in ships in the baseline. NOT NULL with a
+  // false default — the flag is opt-in, never opt-out, so a squash that defaulted it on would
+  // silently publish ebooks to every family member on a fresh install.
+  it('folds ebooks_enabled into the baseline as NOT NULL defaulting to false', async () => {
     const client = createClient({ url: ':memory:' });
     await migrate(drizzle(client), { migrationsFolder: drizzleDir });
     const col = (await client.execute("PRAGMA table_info('app_settings')")).rows.find(
@@ -79,45 +79,25 @@ describe('schema migrations', () => {
     );
     expect(col).toBeDefined();
     expect(col?.['notnull']).toBe(1); // NOT NULL — every read gets a concrete boolean
-    client.close();
-  });
-
-  // AC2's other half, which a fresh-DB test CANNOT reach: an EXISTING install (schema stopped at
-  // 0001, singleton row already written) must survive the in-place upgrade and read the new column
-  // as false. Default OFF is the safe state — the flag is opt-in, never opt-out — so a migration
-  // that defaulted it on, or that dropped/recreated the row, would silently publish ebooks to
-  // every family member on upgrade.
-  it('gives an EXISTING app_settings row ebooks_enabled = false when 0002 is applied in place', async () => {
-    const client = await seedThenMigrate({
-      target: '0002_app_settings_ebooks_enabled',
-      seed: async (c) => {
-        await c.execute(
-          "INSERT INTO app_settings (id, default_quota_mode, default_quota_limit, default_quota_window_days) VALUES (1, 'limited', 7, 7)",
-        );
-      },
-    });
-    const rows = (await client.execute('SELECT id, default_quota_limit, ebooks_enabled FROM app_settings')).rows;
-    expect(rows).toHaveLength(1);
-    // The pre-existing row survives with its own values intact…
-    expect(rows[0]?.['default_quota_limit']).toBe(7);
-    // …and the new column reads falsy (SQLite stores the boolean default as 0).
+    // The default is exercised, not just declared: a singleton row inserted without the column
+    // (exactly what settings.ensure() does) must read back false.
+    await client.execute(
+      "INSERT INTO app_settings (id, default_quota_mode, default_quota_limit, default_quota_window_days) VALUES (1, 'limited', 7, 7)",
+    );
+    const rows = (await client.execute('SELECT ebooks_enabled FROM app_settings')).rows;
     expect(rows[0]?.['ebooks_enabled']).toBe(0);
     client.close();
   });
 
-  it('journal, .sql files and snapshots stay in lockstep — no stragglers, baseline untouched', () => {
+  it('journal, .sql files and snapshots stay in lockstep — a single squashed baseline', () => {
     const journal = JSON.parse(
       fs.readFileSync(path.join(drizzleDir, 'meta', '_journal.json'), 'utf8'),
     ) as { entries: { idx: number; tag: string }[] };
-    // Migrations are APPEND-ONLY from the 1.0 baseline forward: 0000_baseline must remain the
-    // first entry, with every later migration stacked after it in idx order.
-    expect(journal.entries.map((e) => e.tag)).toEqual([
-      '0000_baseline',
-      '0001_user_kindle_email',
-      '0002_app_settings_ebooks_enabled',
-      '0003_kindle_sends',
-    ]);
-    expect(journal.entries.map((e) => e.idx)).toEqual([0, 1, 2, 3]);
+    // Migrations are APPEND-ONLY from this baseline forward: 0000_baseline must remain the
+    // first entry, with every later migration stacked after it in idx order. Today that means
+    // exactly one entry; a new feature migration extends this expectation, never rewrites it.
+    expect(journal.entries.map((e) => e.tag)).toEqual(['0000_baseline']);
+    expect(journal.entries.map((e) => e.idx)).toEqual([0]);
     // The .sql files and meta snapshots must match the journal — a stale leftover would
     // change what migrate() applies (sql) or what drizzle-kit diffs against (snapshot).
     const sqlFiles = fs.readdirSync(drizzleDir).filter((f) => f.endsWith('.sql')).sort();
@@ -129,17 +109,14 @@ describe('schema migrations', () => {
     expect(snapshots).toEqual(journal.entries.map((e) => `${String(e.idx).padStart(4, '0')}_snapshot.json`));
   });
 
-  // The baseline is the from-scratch squash for 1.0 — later migrations stack ON it, never edit
-  // it. This pins the one property that would silently break existing DBs if violated: the
-  // baseline never carries a column that a later migration adds.
-  it('leaves the 0000 baseline free of the columns later migrations add', () => {
+  // The squash-completeness check: everything the folded migrations added must be IN the
+  // baseline text, because there is no later migration left to supply it. A regeneration from
+  // a stale schema.ts would pass the journal test and fail here.
+  it('carries every folded feature in the 0000 baseline', () => {
     const baseline = fs.readFileSync(path.join(drizzleDir, '0000_baseline.sql'), 'utf8');
-    expect(baseline).not.toContain('kindle_email');
-    expect(baseline).not.toContain('kindle_sends');
-    // …and no EARLIER migration silently grew the table either — 0003 is its only source.
-    for (const tag of ['0001_user_kindle_email', '0002_app_settings_ebooks_enabled']) {
-      expect(fs.readFileSync(path.join(drizzleDir, `${tag}.sql`), 'utf8')).not.toContain('kindle_sends');
-    }
+    expect(baseline).toContain('kindle_email');
+    expect(baseline).toContain('ebooks_enabled');
+    expect(baseline).toContain('kindle_sends');
   });
 });
 
@@ -168,27 +145,7 @@ describe('kindle_sends schema (issue #148)', () => {
       args: [row.userId ?? 1, row.bookId, row.status, row.finalizedAt ?? null],
     });
 
-  it('applies onto an EXISTING 0000–0002 database, leaving its rows intact', async () => {
-    // The append-only property a fresh-DB test cannot reach: an install that stopped at 0002, with
-    // rows already written, must gain the table without disturbing anything.
-    const client = await seedThenMigrate({
-      target: '0003_kindle_sends',
-      seed: async (c) => {
-        await c.execute(
-          "INSERT INTO users (public_id, auth_provider, auth_subject, username) VALUES ('us_a','local','a','a')",
-        );
-        await c.execute(
-          "INSERT INTO app_settings (id, default_quota_mode, default_quota_limit, default_quota_window_days) VALUES (1, 'limited', 7, 7)",
-        );
-      },
-    });
-    expect((await client.execute('SELECT count(*) AS n FROM kindle_sends')).rows[0]?.['n']).toBe(0);
-    expect((await client.execute('SELECT count(*) AS n FROM users')).rows[0]?.['n']).toBe(1);
-    expect((await client.execute('SELECT default_quota_limit AS n FROM app_settings')).rows[0]?.['n']).toBe(7);
-    client.close();
-  });
-
-  it('applies the append-only 0003 kindle_sends table on top of the baseline', async () => {
+  it('creates the kindle_sends table from the baseline with the exact column set', async () => {
     const client = await seededDb();
     const cols = (await client.execute("PRAGMA table_info('kindle_sends')")).rows.map((r) => r['name']);
     expect(cols).toEqual([

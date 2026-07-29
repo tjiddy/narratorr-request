@@ -1,1 +1,0 @@
-ALTER TABLE `app_settings` ADD `ebooks_enabled` integer DEFAULT false NOT NULL;

@@ -5,29 +5,8 @@
     {
       "idx": 0,
       "version": "6",
-      "when": 1783360891195,
+      "when": 1785340451084,
       "tag": "0000_baseline",
-      "breakpoints": true
-    },
-    {
-      "idx": 1,
-      "version": "6",
-      "when": 1785221614536,
-      "tag": "0001_user_kindle_email",
-      "breakpoints": true
-    },
-    {
-      "idx": 2,
-      "version": "6",
-      "when": 1785254110139,
-      "tag": "0002_app_settings_ebooks_enabled",
-      "breakpoints": true
-    },
-    {
-      "idx": 3,
-      "version": "6",
-      "when": 1785307677348,
-      "tag": "0003_kindle_sends",
       "breakpoints": true
     }
   ]
