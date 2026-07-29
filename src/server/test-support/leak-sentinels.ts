@@ -38,3 +38,86 @@ export function expectNoLeaks(body: string, headers: Record<string, unknown>, wh
     expect(haystack.includes(value), `${where}: leaked ${label}`).toBe(false);
   }
 }
+
+// ---- The cross-app integration sweep (issue #150) ----------------------------
+
+/**
+ * The values a cross-app scenario injects on top of the closed list above. Same provenance rule:
+ * every one is configured or injected by the suite, never caller-owned text, and no fixture title
+ * or book id contains one as a substring.
+ *
+ * The narratorr coordinates are supplied rather than taken from the constants above because the
+ * fake narratorr binds an EPHEMERAL port — the sentinel has to be the URL actually configured, or
+ * the sweep would assert about a host nothing ever talked to.
+ */
+export interface IntegrationSentinelValues {
+  /** The configured base URL of the live fake narratorr (`http://127.0.0.1:<port>`). */
+  narratorrBaseUrl: string;
+  /** The caller's own Kindle address — carried ONLY by `GET`/`PATCH /api/me`. */
+  kindleAddress: string;
+  /** The SMTP username `buildKindleTransport` must present. */
+  smtpUser: string;
+  /** The SMTP password `buildKindleTransport` must present. */
+  smtpPass: string;
+}
+
+/**
+ * Compose the shared closed list with a scenario's own injected values. The shared list is
+ * EXTENDED, never mutated — its two existing consumers keep exactly the sentinels they had.
+ */
+export function integrationSentinels(
+  v: IntegrationSentinelValues,
+): ReadonlyArray<readonly [label: string, value: string]> {
+  return [
+    ...LEAK_SENTINELS,
+    ['the live narratorr base url', v.narratorrBaseUrl],
+    ['the live narratorr host:port', new URL(v.narratorrBaseUrl).host],
+    ['the caller’s kindle address', v.kindleAddress],
+    ['the smtp username', v.smtpUser],
+    ['the smtp password', v.smtpPass],
+  ];
+}
+
+/**
+ * AC21: the three swept surfaces — our response body, ALL of our response headers, and every
+ * captured application log line.
+ *
+ * The log haystack is asserted RAW (the serialized lines, joined) rather than field-wise, so a
+ * sentinel nested inside a structured field or an error `cause` cannot slip past. That matters
+ * more than the body assertion here: `fastify-type-provider-zod` parses handler returns through
+ * NON-`.strict()` schemas, so Zod strips unknown keys and a body-only sweep can pass over a
+ * genuinely leaking mapper (curated learning `nonstrict-response-schema-masks-mapper-leak`).
+ *
+ * The fakes' OWN capture is deliberately not a swept surface: the credentials legitimately travel
+ * to them on the wire (`X-Api-Key` to fake narratorr, SMTP `AUTH` to fake SMTP), and sweeping one
+ * would contradict the positive receipts AC1b/AC2b require.
+ */
+export function expectNoLeaksAcross(
+  sentinels: ReadonlyArray<readonly [label: string, value: string]>,
+  surfaces: { body: string; headers: Record<string, unknown>; logs: string },
+  where: string,
+  opts: ExpectNoLeaksOpts = {},
+): void {
+  const headers = JSON.stringify(surfaces.headers);
+  const exempt = new Set(opts.bodyExempt ?? []);
+  for (const [label, value] of sentinels) {
+    // The exemption is PER VALUE and applies to the BODY ONLY. `GET`/`PATCH /api/me` legitimately
+    // return the caller's own Kindle address, but nothing makes them a licence to carry the
+    // narratorr key, a media path or the SMTP credentials — so every other sentinel keeps its body
+    // assertion, and the exempted value is still swept in the headers and the logs.
+    if (!exempt.has(value)) {
+      expect(surfaces.body.includes(value), `${where}: leaked ${label} in the response body`).toBe(false);
+    }
+    expect(headers.includes(value), `${where}: leaked ${label} in a response header`).toBe(false);
+    expect(surfaces.logs.includes(value), `${where}: leaked ${label} in an application log line`).toBe(false);
+  }
+}
+
+export interface ExpectNoLeaksOpts {
+  /**
+   * Sentinel VALUES this response's body is the documented carrier of — the only per-response
+   * narrowing the sweep allows. Never widen this to a whole response: exempting a surface exempts
+   * every secret on it.
+   */
+  bodyExempt?: readonly string[];
+}
