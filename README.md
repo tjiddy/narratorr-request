@@ -149,6 +149,10 @@ the job succeeds. Requires repo secrets **`DOCKERHUB_USERNAME`** and **`DOCKERHU
 pnpm verify   # lint + test + typecheck + build
 ```
 
+Companion ebooks (Get eBook + Send to Kindle) also have a manual two-app checklist for release
+verification against a real narratorr, a real relay and a real browser —
+[docs/companion-ebook-smoke.md](docs/companion-ebook-smoke.md).
+
 ## Contributing
 
 Issues and PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) (branch off `develop`) and the

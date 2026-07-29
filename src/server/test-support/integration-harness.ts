@@ -331,12 +331,6 @@ export async function startIntegrationScenario(opts: StartScenarioOpts = {}): Pr
   };
 }
 
-/** Read a response as text for the sweep, tolerating a body that was already consumed. */
-export async function sweepableBody(res: Response): Promise<string> {
-  if (res.bodyUsed) return '';
-  return res.text();
-}
-
 /** Assert an exchange authenticated with the configured api key (AC1b's positive receipt). */
 export function expectKeyAccepted(upstream: FakeNarratorr, pathSuffix: string): void {
   const receipts = upstream.receiptsFor(pathSuffix);

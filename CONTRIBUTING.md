@@ -112,6 +112,17 @@ code exists is a bug, not coverage).
 > pure helpers with a co-located `.test.ts`, not asserted through a render. Reach for a `.test.tsx`
 > when there is no pure seam to extract.
 
+Cross-app behavior (real sockets, real SMTP) lives in `src/server/integration/`, composed by
+`src/server/test-support/integration-harness.ts` against a real fake narratorr and a real fake SMTP
+server. **MSW is never registered there** — it honors an abort only while a resolver is pending and
+re-buffers passthrough bodies, so truncation/backpressure assertions would be vacuous under it.
+
+## Release verification
+
+Some things no fake can stand in for — a real Amazon allowlist, a real relay, a real browser
+download. Before tagging a release that touches companion ebooks, walk the manual two-app checklist
+in [docs/companion-ebook-smoke.md](docs/companion-ebook-smoke.md) against a real narratorr.
+
 ## Security
 
 Found a vulnerability? **Don't open a public issue** — see [SECURITY.md](SECURITY.md) for the
