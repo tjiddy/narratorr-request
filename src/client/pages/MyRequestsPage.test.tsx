@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
@@ -7,6 +7,7 @@ import type { RequestDto, RequestStatus } from '@shared/schemas/request';
 import type { MeDto } from '@shared/schemas/user';
 import type { FeaturesDto } from '@shared/schemas/features';
 import type { V1CompanionEbook } from '@shared/schemas/v1/companion-ebook';
+import { qk } from '../hooks';
 import { MyRequestsPage, RequestRow } from './MyRequestsPage';
 
 /**
@@ -177,57 +178,95 @@ const me: MeDto = {
 const jsonRes = (status: number, payload: unknown): Response =>
   ({ ok: status >= 200 && status < 300, status, text: () => Promise.resolve(JSON.stringify(payload)) }) as unknown as Response;
 
-/** How `/api/features` answers. `null` = never settles (the loading case). */
-let featuresResponder: (() => Promise<Response>) | null;
+const FEATURES_ON = { ebooksEnabled: true, kindleDeliveryAvailable: false, kindleSenderEmail: null } satisfies FeaturesDto;
+const FEATURES_OFF = { ebooksEnabled: false, kindleDeliveryAvailable: false, kindleSenderEmail: null } satisfies FeaturesDto;
 
-function renderPage() {
+/**
+ * `/api/features` is answered by a DEFERRED promise the test resolves itself. The request rows
+ * arrive on an INDEPENDENT fetch (and `useFeatures` only starts after `/api/me` resolves), so
+ * waiting for a row proves nothing about the feature query — holding this response and settling it
+ * deliberately is what lets each case assert against a known TERMINAL query state.
+ */
+let settleFeatures: ((response: Response) => void) | null;
+
+function renderPage(): QueryClient {
   vi.stubGlobal(
     'fetch',
     vi.fn((input: RequestInfo | URL) => {
       const url = String(input);
       if (url.startsWith('/api/me')) return Promise.resolve(jsonRes(200, me));
       if (url.startsWith('/api/features')) {
-        return featuresResponder ? featuresResponder() : new Promise<Response>(() => {});
+        return new Promise<Response>((resolve) => {
+          settleFeatures = resolve;
+        });
       }
       if (url.startsWith('/api/requests')) return Promise.resolve(jsonRes(200, { data: [row()], total: 1 }));
       return Promise.reject(new Error(`unexpected fetch: ${url}`));
     }),
   );
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
+  render(
     <QueryClientProvider client={client}>
       <MemoryRouter>
         <MyRequestsPage />
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return client;
+}
+
+/**
+ * Settle the held `/api/features` request and WAIT for the query to reach `status`, then flush the
+ * render it schedules — so every assertion after this runs against a proven terminal state rather
+ * than an accidental observation of the still-loading one.
+ */
+async function settleFeaturesTo(client: QueryClient, response: Response, status: 'success' | 'error') {
+  await waitFor(() => expect(settleFeatures).not.toBeNull());
+  await act(async () => {
+    settleFeatures!(response);
+  });
+  await waitFor(() => expect(client.getQueryState(qk.features)?.status).toBe(status));
+  await act(async () => {});
 }
 
 describe('MyRequestsPage — the real feature source', () => {
   beforeEach(() => {
-    featuresResponder = () => Promise.resolve(jsonRes(200, { ebooksEnabled: true, kindleDeliveryAvailable: false, kindleSenderEmail: null } satisfies FeaturesDto));
+    settleFeatures = null;
   });
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.clearAllMocks();
   });
 
-  it('renders the affordance when /api/features says the feature is on', async () => {
-    renderPage();
+  it('renders the affordance once /api/features resolves ENABLED', async () => {
+    const client = renderPage();
     expect(await screen.findByText('The Hobbit')).toBeInTheDocument();
-    await waitFor(() => expect(getEbookButton()).toBeInTheDocument());
+
+    await settleFeaturesTo(client, jsonRes(200, FEATURES_ON), 'success');
+
+    expect(getEbookButton()).toBeInTheDocument();
   });
 
   it.each([
-    ['off', () => Promise.resolve(jsonRes(200, { ebooksEnabled: false, kindleDeliveryAvailable: false, kindleSenderEmail: null }))],
-    ['errored', () => Promise.resolve(jsonRes(500, { error: { code: 'INTERNAL', message: 'boom' } }))],
-    ['still loading', null],
-  ])('renders NO affordance while /api/features is %s (fail-safe)', async (_label, responder) => {
-    featuresResponder = responder;
-    renderPage();
-
+    ['resolved OFF', jsonRes(200, FEATURES_OFF), 'success' as const],
+    ['ERRORED with a 500', jsonRes(500, { error: { code: 'INTERNAL', message: 'boom' } }), 'error' as const],
+  ])('renders NO affordance once /api/features has %s (fail-safe)', async (_label, response, status) => {
+    const client = renderPage();
     expect(await screen.findByText('The Hobbit')).toBeInTheDocument();
-    // Synchronous: an absence can't be proven by waiting.
+
+    await settleFeaturesTo(client, response, status);
+
+    // Synchronous, against a PROVEN terminal state: vi.waitFor cannot assert an absence.
+    expect(getEbookButton()).toBeNull();
+  });
+
+  it('renders NO affordance while /api/features is genuinely still in flight', async () => {
+    const client = renderPage();
+    expect(await screen.findByText('The Hobbit')).toBeInTheDocument();
+
+    // Positive evidence this is the LOADING case rather than a query that never started.
+    await waitFor(() => expect(settleFeatures).not.toBeNull());
+    expect(client.getQueryState(qk.features)?.status).toBe('pending');
     expect(getEbookButton()).toBeNull();
   });
 });
