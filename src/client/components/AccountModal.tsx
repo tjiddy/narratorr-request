@@ -14,6 +14,7 @@ import {
   KINDLE_EMAIL_HELP,
 } from '../pages/notify-prefs';
 import { Dialog } from './Dialog';
+import { KindleAllowlistHelp } from './KindleAllowlistHelp';
 import { BellIcon } from './icons';
 
 /**
@@ -29,7 +30,12 @@ import { BellIcon } from './icons';
 export function AccountModal({ me, open, onClose }: { me: MeDto; open: boolean; onClose: () => void }) {
   const headingId = useId();
   return (
-    <Dialog open={open} onClose={onClose} labelledBy={headingId}>
+    // `scrollBody` (#149): the allowlist education adds an eight-step expandable click path to an
+    // already tall modal — identity block, two email rows, the education, and the notification
+    // group. Without it `Dialog` caps nothing and the card is `h-fit` inside a FIXED overlay, so on
+    // a short viewport the expanded path and everything below it render past the bottom edge with
+    // no way to scroll to them. This is the same mode the notifier form already uses.
+    <Dialog open={open} onClose={onClose} labelledBy={headingId} scrollBody>
       <AccountModalContent me={me} headingId={headingId} />
     </Dialog>
   );
@@ -196,21 +202,29 @@ function AccountModalContent({ me, headingId }: { me: MeDto; headingId: string }
           error={emailError}
         />
 
-        <EmailFieldRow
-          label="Kindle address"
-          saveLabel="Save Kindle address"
-          placeholder="you@kindle.com"
-          help={KINDLE_EMAIL_HELP}
-          value={kindleEmail}
-          onChange={(v) => {
-            setKindleEmail(v);
-            setKindleError(null);
-          }}
-          onSave={saveKindleEmail}
-          dirty={kindleDirty}
-          pending={saveKindle.isPending}
-          error={kindleError}
-        />
+        {/* The Kindle row plus its allowlist education (#149). The education is a SIBLING of the
+            row, deliberately NOT routed through `help`: that prop renders only while the row's
+            inline `error` is null, so education passed through it would vanish exactly when a save
+            has just failed — the moment the user most needs it. This is the setup-time teaching
+            moment, so it renders whether or not an address is saved yet. */}
+        <div className="flex flex-col gap-2">
+          <EmailFieldRow
+            label="Kindle address"
+            saveLabel="Save Kindle address"
+            placeholder="you@kindle.com"
+            help={KINDLE_EMAIL_HELP}
+            value={kindleEmail}
+            onChange={(v) => {
+              setKindleEmail(v);
+              setKindleError(null);
+            }}
+            onSave={saveKindleEmail}
+            dirty={kindleDirty}
+            pending={saveKindle.isPending}
+            error={kindleError}
+          />
+          <KindleAllowlistHelp />
+        </div>
 
         {/* Notifications group under a soft hairline. */}
         <div className="border-t border-border/50 pt-5">

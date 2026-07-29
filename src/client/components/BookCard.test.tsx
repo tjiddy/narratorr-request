@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import type { MeDto } from '@shared/schemas/user';
+import type { FeaturesDto } from '@shared/schemas/features';
 import type { V1AudibleResult } from '@shared/schemas/v1/metadata';
 import type { V1CompanionEbook } from '@shared/schemas/v1/companion-ebook';
 import { BookCard } from './BookCard';
@@ -37,9 +39,51 @@ const libraryWith = (companion: V1CompanionEbook | null | undefined, bookId = 'b
   ...(companion !== undefined && { companionEbook: companion }),
 });
 
+/** A minimal stand-in for the bits `api.ts`'s `parse()` reads. */
+const jsonRes = (status: number, payload: unknown): Response =>
+  ({
+    ok: status >= 200 && status < 300,
+    status,
+    text: () => Promise.resolve(JSON.stringify(payload)),
+  }) as unknown as Response;
+
+const me: MeDto = {
+  publicId: 'us_1',
+  username: 'todd',
+  authProvider: 'local',
+  email: null,
+  thumb: null,
+  role: 'user',
+  status: 'active',
+  requestQuota: { mode: 'inherit' },
+  autoApprove: false,
+  createdAt: '2026-07-01T00:00:00.000Z',
+  quota: { mode: 'unlimited', limit: null, used: 0, remaining: null, windowDays: 30 },
+  notifyOn: [],
+  emailNotifyAvailable: false,
+  kindleEmail: 'todd@kindle.com',
+};
+
+const FEATURES = {
+  ebooksEnabled: true,
+  kindleDeliveryAvailable: true,
+  kindleSenderEmail: 'library@example.com',
+} satisfies FeaturesDto;
+
 beforeEach(() => {
-  // The card never fetches in these cases, but `useRequestBook` needs a live client.
-  vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new Error('no request should be made'))));
+  // A ROUTER, not a blanket rejection. The sheet reads `/api/me` + `/api/features` LIVE (#149), so
+  // "reject everything" no longer means "the card is idle" — it would strand those two queries and
+  // silently change which sheet state every case here exercises. Everything else still rejects,
+  // which is this file's actual premise: the CARD issues no request of its own.
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith('/api/me')) return Promise.resolve(jsonRes(200, me));
+      if (url.startsWith('/api/features')) return Promise.resolve(jsonRes(200, FEATURES));
+      return Promise.reject(new Error(`no request should be made: ${url}`));
+    }),
+  );
 });
 afterEach(() => {
   vi.unstubAllGlobals();

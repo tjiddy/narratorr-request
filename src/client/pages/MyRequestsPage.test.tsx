@@ -43,15 +43,63 @@ const row = (over: Partial<RequestDto> = {}): RequestDto => ({
 
 const getEbookButton = () => screen.queryByRole('button', { name: /get ebook/i });
 
-const renderRow = (props: Parameters<typeof RequestRow>[0]) =>
-  render(
+/**
+ * The row opens the shared sheet, and the sheet reads `/api/me` + `/api/features` LIVE (#149), so
+ * every row case needs a real client and a routed `fetch` — a provider-less render now throws in
+ * `useMe`. The routing is deliberately minimal and DETERMINISTIC (State A: an address saved,
+ * delivery available), so the download assertions below keep exercising an enabled Download button
+ * and nothing here depends on a query race.
+ */
+// A function, not a const: `me` and `jsonRes` are declared further down (with the page-level
+// harness) and would be in the temporal dead zone at module-evaluation time.
+const rowMe = (): MeDto => ({ ...me, kindleEmail: 'todd@kindle.com' });
+const ROW_FEATURES = {
+  ebooksEnabled: true,
+  kindleDeliveryAvailable: true,
+  kindleSenderEmail: 'library@example.com',
+} satisfies FeaturesDto;
+
+/**
+ * A `fetch` stub answering the sheet's two live queries and delegating everything else to
+ * `rest` — so a case that needs to hold its own download response open still can, without
+ * stranding `/api/me` and silently changing which sheet state it is testing.
+ */
+function installRowFetch(rest: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>): void {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.startsWith('/api/me')) return Promise.resolve(jsonRes(200, rowMe()));
+      if (url.startsWith('/api/features')) return Promise.resolve(jsonRes(200, ROW_FEATURES));
+      return rest(input, init);
+    }),
+  );
+}
+
+const rowTree = (props: Parameters<typeof RequestRow>[0], client: QueryClient) => (
+  <QueryClientProvider client={client}>
     <ul>
       <RequestRow {...props} />
-    </ul>,
-  );
+    </ul>
+  </QueryClientProvider>
+);
+
+function renderRow(props: Parameters<typeof RequestRow>[0]) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const view = render(rowTree(props, client));
+  return {
+    ...view,
+    /** Re-render the same row through the SAME client, so the sheet's queries are not torn down. */
+    rerenderRow: (next: Parameters<typeof RequestRow>[0]) => view.rerender(rowTree(next, client)),
+  };
+}
 
 describe('RequestRow — Get eBook affordance', () => {
+  beforeEach(() => {
+    installRowFetch((input) => Promise.reject(new Error(`unexpected fetch: ${String(input)}`)));
+  });
   afterEach(() => {
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
     vi.clearAllMocks();
   });
@@ -104,11 +152,7 @@ describe('RequestRow — Get eBook affordance', () => {
     await userEvent.click(getEbookButton()!);
     expect(await screen.findByRole('dialog', { name: 'The Hobbit' })).toBeInTheDocument();
 
-    view.rerender(
-      <ul>
-        <RequestRow r={row({ companionEbook: null })} ebooksEnabled />
-      </ul>,
-    );
+    view.rerenderRow({ r: row({ companionEbook: null }), ebooksEnabled: true });
 
     expect(screen.getByRole('dialog', { name: 'The Hobbit' })).toBeInTheDocument();
     expect(getEbookButton()).toBeNull();
@@ -122,20 +166,15 @@ describe('RequestRow — Get eBook affordance', () => {
     // jsdom implements no navigation and would log "Not implemented" when the save lands.
     vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
     let release!: (value: Response) => void;
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(() => new Promise<Response>((resolve) => (release = resolve))),
-    );
+    // Only the DOWNLOAD is held open — `/api/me` and `/api/features` still answer, so the sheet is
+    // in a known state rather than stranded mid-query.
+    installRowFetch(() => new Promise<Response>((resolve) => (release = resolve)));
     const view = renderRow({ r: row(), ebooksEnabled: true });
     await userEvent.click(getEbookButton()!);
     await userEvent.click(await screen.findByRole('button', { name: /download ebook/i }));
     await waitFor(() => expect(screen.getByRole('button', { name: /downloading/i })).toBeDisabled());
 
-    view.rerender(
-      <ul>
-        <RequestRow r={row({ companionEbook: null })} ebooksEnabled />
-      </ul>,
-    );
+    view.rerenderRow({ r: row({ companionEbook: null }), ebooksEnabled: true });
     expect(screen.getByRole('dialog', { name: 'The Hobbit' })).toBeInTheDocument();
 
     release({
@@ -152,7 +191,6 @@ describe('RequestRow — Get eBook affordance', () => {
 
     // The in-flight state settles predictably rather than being stranded by the rerender.
     await waitFor(() => expect(screen.getByRole('button', { name: /download ebook/i })).not.toBeDisabled());
-    vi.unstubAllGlobals();
   });
 });
 

@@ -25,6 +25,7 @@ import {
   getConnectorSettings,
   getSystemInfo,
   getFeatures,
+  sendEbookToKindle,
   updateConnectorSettings,
   testConnector,
   createNotifier,
@@ -40,6 +41,7 @@ import {
 import { decideBadge } from './instance-badge';
 import { featuresQueryEnabled } from './features';
 import { meSuccessToast, mergeMeCache } from './pages/notify-prefs';
+import { sendOutcomeMessage, sendErrorMessage } from './components/ebook-sheet';
 
 export const qk = {
   me: ['me'] as const,
@@ -250,6 +252,31 @@ export const useFeatures = (me: MeDto | undefined) =>
     // don't hold a disabled-to-enabled flip for a whole session either.
     staleTime: 60_000,
   });
+
+// --- Send to Kindle (issue #149) ---------------------------------------------
+/**
+ * Send one companion eBook to the caller's own Kindle. The ONE mutation in this module that
+ * touches NO cache: a send changes no cached resource — not `me` (the address is unchanged), not
+ * `features` (operator config is unchanged), not the request lists — so there is nothing to
+ * invalidate and nothing to write. Adding a refetch here would only cost a round-trip.
+ *
+ * TOAST OWNERSHIP LIVES HERE, and only here. The sheet raises none, so every answer produces
+ * exactly one notification rather than a duplicate pair:
+ *   • a RESOLVED `{ outcome }` is not yet a success — every admitted attempt answers 200, failures
+ *     included, so the outcome (not the status code) picks the channel and the copy.
+ *   • a REJECTED request is a different thing entirely and maps through its own code table.
+ */
+export function useSendToKindle() {
+  return useMutation({
+    mutationFn: (v: { bookId: string; title: string }) => sendEbookToKindle(v.bookId, v.title),
+    onSuccess: (result) => {
+      const message = sendOutcomeMessage(result.outcome);
+      if (result.outcome === 'sent') toast.success(message);
+      else toast.error(message);
+    },
+    onError: (err) => toast.error(sendErrorMessage(err instanceof ApiError ? err.code : '')),
+  });
+}
 
 // --- Connector settings (admin) ----------------------------------------------
 export const useConnectorSettings = () =>

@@ -15,6 +15,7 @@ import type {
 } from '@shared/schemas/connectors';
 import type { SystemInfoDto } from '@shared/schemas/system';
 import type { FeaturesDto } from '@shared/schemas/features';
+import type { EbookSendResult } from '@shared/schemas/ebooks';
 import type { PublicConfigDto } from '@shared/schemas/config';
 
 export class ApiError extends Error {
@@ -151,6 +152,30 @@ export const getSystemInfo = () => fetch('/api/admin/system', opts()).then(parse
 
 /** Derived, instance-level feature state (issue #144). Active-user gated — 401/403 for anyone else. */
 export const getFeatures = () => fetch('/api/features', opts()).then(parse<FeaturesDto>);
+
+/**
+ * Send one companion eBook to the caller's own Kindle (issue #149).
+ *
+ * The body carries ONLY `title` — the attachment filename for this caller's own send. There is no
+ * recipient field by design: the server reads the destination from the caller's own
+ * `users.kindle_email`, which is what stops the endpoint being usable as a mail relay.
+ *
+ * EVERY admitted attempt answers `200 { outcome }`, the failures included, so a resolved promise is
+ * not yet a success — branch on `outcome`. A rejection is a different thing entirely: a business
+ * refusal, a parser error or an infrastructure 500, all of which reach the caller as an `ApiError`
+ * carrying the envelope's code.
+ *
+ * The path segment is interpolated raw, not `encodeURIComponent`'d — the same doctrine
+ * `buildEbookDownloadUrl` documents. `encodeURIComponent` throws `URIError` on an unpaired
+ * surrogate; the route's own `isNarratorrBookId` grammar (which the sheet gates on before calling)
+ * admits only characters that are already URL-safe.
+ */
+export const sendEbookToKindle = (bookId: string, title: string) =>
+  fetch(`/api/ebooks/${bookId}/send-to-kindle`, opts({
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ title }),
+  })).then(parse<EbookSendResult>);
 
 export const getConnectorSettings = () =>
   fetch('/api/admin/settings/connectors', opts()).then(parse<ConnectorSettingsDto>);
