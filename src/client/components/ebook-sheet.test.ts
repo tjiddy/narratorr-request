@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { isNarratorrBookId } from '@shared/schemas/book-id';
-import { EBOOK_SEND_OUTCOMES } from '@shared/schemas/ebooks';
+import { EBOOK_SEND_OUTCOMES, type EbookSendOutcome } from '@shared/schemas/ebooks';
 import {
   formatEbookSize,
   buildEbookDownloadUrl,
@@ -474,6 +474,53 @@ describe('sendOutcomeMessage', () => {
   ])('makes %s actionable', (outcome, pattern) => {
     expect(sendOutcomeMessage(outcome)).toMatch(pattern);
   });
+
+  /**
+   * Every key pinned to its OWN message (#149 F2). Totality + distinctness prove that nine
+   * non-empty strings exist and differ; they say nothing about WHICH key carries which. Swapping
+   * `no_sender` with `failed` keeps both of those green and every component case green too (they
+   * import the same table production does) while telling a user with a working instance that Send
+   * isn't configured. An exhaustive literal table is the only assertion that catches a permutation.
+   */
+  const EXPECTED_OUTCOME_COPY: Record<EbookSendOutcome, string> = {
+    sent: 'Sent to Amazon — conversion and delivery happen on Amazon’s side.',
+    indeterminate: 'We couldn’t confirm the handoff. Don’t resend immediately — check your Kindle library first.',
+    rate_limited: 'You’ve sent a few too quickly. Wait a minute and try again.',
+    quota_exhausted: 'Your send allowance is used up for now — try again later.',
+    too_large: 'This eBook is too large to email. Download it instead.',
+    unavailable: 'This book doesn’t have a companion eBook any more.',
+    no_kindle_address: 'Add a Kindle device address in your account first.',
+    no_sender: 'Send to Kindle isn’t configured on this instance.',
+    failed: 'The send failed. You can download the eBook instead.',
+  };
+
+  it.each(EBOOK_SEND_OUTCOMES)('maps %s to its own exact message, not merely a distinct one', (outcome) => {
+    expect(sendOutcomeMessage(outcome)).toBe(EXPECTED_OUTCOME_COPY[outcome]);
+  });
+
+  /**
+   * The RECOVERY INSTRUCTION each key must carry, independent of exact wording — so a copy edit
+   * that reworded a message into the wrong key's job still fails even though the literal table
+   * above was updated alongside it. Each predicate is discriminating: no other outcome's message
+   * satisfies it.
+   */
+  it.each([
+    // "the book lost its companion", never "retry" or "go add something".
+    ['unavailable' as const, /companion eBook/i, /account|configured|download it/i],
+    // Points at the USER's missing account setting.
+    ['no_kindle_address' as const, /address.*account|account.*address/i, /instance|companion/i],
+    // Points at the INSTANCE's missing operator setup — not at anything the user can fix.
+    ['no_sender' as const, /isn’t configured.*instance/i, /your account|companion/i],
+    // A real attempt that failed, with the download fallback named.
+    ['failed' as const, /failed/i, /companion|account|configured/i],
+  ])('gives %s the recovery instruction its key owns, and no other key’s', (outcome, owns, disowns) => {
+    const message = sendOutcomeMessage(outcome);
+    expect(message).toMatch(owns);
+    expect(message).not.toMatch(disowns);
+    // …and the predicate genuinely discriminates: no OTHER outcome's copy satisfies it.
+    const others = EBOOK_SEND_OUTCOMES.filter((o) => o !== outcome).map(sendOutcomeMessage);
+    expect(others.filter((m) => owns.test(m))).toHaveLength(0);
+  });
 });
 
 describe('sendErrorMessage', () => {
@@ -489,6 +536,44 @@ describe('sendErrorMessage', () => {
   it('gives the four bespoke codes DISTINCT copy', () => {
     const codes = ['EBOOKS_DISABLED', 'EBOOK_UNAVAILABLE', 'BAD_REQUEST', 'INTERNAL'];
     expect(new Set(codes.map(sendErrorMessage)).size).toBe(codes.length);
+  });
+
+  /**
+   * Each code pinned to its OWN message (#149 F3). Distinctness alone permits any permutation of
+   * the four values, which would answer a 403 "the instance has this turned off" with "reload the
+   * page and try again" while every existing assertion stayed green.
+   *
+   * `EBOOK_UNAVAILABLE` deliberately shares its wording with the `unavailable` OUTCOME: the same
+   * fact reaches the user by two transport paths (a 404 refusal and a 200 typed outcome) and should
+   * read identically. The distinctness rule is per-table, so this is not a copy-paste slip.
+   */
+  it.each([
+    ['EBOOKS_DISABLED', 'Send to Kindle is turned off on this instance.'],
+    ['EBOOK_UNAVAILABLE', 'This book doesn’t have a companion eBook any more.'],
+    ['BAD_REQUEST', 'That send request wasn’t accepted — reload the page and try again.'],
+    ['INTERNAL', 'Something went wrong on our side. Try again in a moment.'],
+  ])('maps %s to its own exact message, not merely a distinct one', (code, expected) => {
+    expect(sendErrorMessage(code)).toBe(expected);
+  });
+
+  it.each([
+    // Names the INSTANCE-level switch — never a retry, which would be futile.
+    ['EBOOKS_DISABLED', /turned off.*instance/i, /try again|reload/i],
+    // Names the missing companion, not anything about the request or the instance.
+    ['EBOOK_UNAVAILABLE', /companion eBook/i, /try again|reload|instance/i],
+    // Tells the user their CLIENT sent something the route rejected — reload is the recovery.
+    ['BAD_REQUEST', /reload the page/i, /instance|companion/i],
+    // Owns the blame and invites a retry, since a 500 is genuinely transient.
+    ['INTERNAL', /our side.*try again|try again.*our side/i, /instance|companion|reload/i],
+  ])('gives %s the recovery instruction its code owns, and no other code’s', (code, owns, disowns) => {
+    const message = sendErrorMessage(code);
+    expect(message).toMatch(owns);
+    expect(message).not.toMatch(disowns);
+    // …and the predicate discriminates: no OTHER bespoke code's copy satisfies it.
+    const others = ['EBOOKS_DISABLED', 'EBOOK_UNAVAILABLE', 'BAD_REQUEST', 'INTERNAL']
+      .filter((c) => c !== code)
+      .map(sendErrorMessage);
+    expect(others.filter((m) => owns.test(m))).toHaveLength(0);
   });
 
   it.each([

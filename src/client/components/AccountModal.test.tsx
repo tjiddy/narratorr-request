@@ -468,3 +468,48 @@ describe('AccountModal — Amazon allowlist education (#149)', () => {
     expect(kindleInput().value).not.toContain('…');
   });
 });
+
+// --- Viewport containment (#149 F4) ------------------------------------------
+
+describe('AccountModal — the expanded education stays reachable on a short viewport', () => {
+  /**
+   * jsdom performs no layout, so the assertable contract is `Dialog`'s scrolling MODE: the card is
+   * height-capped and its content sits inside an internally-scrolling wrapper. Without that mode
+   * the card is `h-fit` inside a `position: fixed` overlay — content past the viewport bottom is
+   * simply unreachable, because the page behind it does not scroll the overlay.
+   */
+  it('caps the dialog height and scrolls its body internally', async () => {
+    await renderModal({ kindleEmail: null });
+    const card = screen.getByRole('dialog');
+
+    expect(card.className).toContain('max-h-[85vh]');
+    expect(card.className).toContain('overflow-hidden');
+
+    // The account content is INSIDE the scrolling region, not a sibling of it.
+    const scroller = card.querySelector('.overflow-y-auto');
+    expect(scroller).not.toBeNull();
+    expect(scroller).toContainElement(kindleInput());
+  });
+
+  it('keeps Close pinned OUTSIDE the scrolling region, so it never scrolls away', async () => {
+    await renderModal({ kindleEmail: null });
+    const card = screen.getByRole('dialog');
+
+    const scroller = card.querySelector('.overflow-y-auto')!;
+    expect(scroller).not.toContainElement(screen.getByRole('button', { name: 'Close' }));
+  });
+
+  it('still reaches the whole click path and the controls below it once expanded', async () => {
+    const user = userEvent.setup();
+    await renderModal({ kindleEmail: null });
+
+    await user.click(screen.getByRole('button', { name: AMAZON_APPROVED_LIST_DISCLOSURE_LABEL })!);
+
+    // The last step and the controls that sit BELOW the education are both inside the scroller —
+    // i.e. reachable — rather than rendered past a hard viewport edge.
+    const scroller = screen.getByRole('dialog').querySelector('.overflow-y-auto')!;
+    expect(scroller).toContainElement(screen.getByText('Enter the sender mailbox'));
+    expect(scroller).toContainElement(screen.getByText(/one-time setup per Amazon account/i));
+    expect(scroller).toContainElement(screen.getByRole('checkbox', { name: /approved/i }));
+  });
+});

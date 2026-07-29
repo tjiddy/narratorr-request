@@ -172,7 +172,11 @@ export function EbookSheet({
   }
 
   return (
-    <Dialog open onClose={onClose} labelledBy={titleId}>
+    // `scrollBody` for the same reason the account modal needs it (#149): State A renders the same
+    // eight-step expandable click path below the cover block, the two actions and the caption, and
+    // `Dialog`'s card is `h-fit` inside a FIXED overlay — expanded, it can run past a short
+    // viewport's bottom edge with nothing to scroll.
+    <Dialog open onClose={onClose} labelledBy={titleId} scrollBody>
       <div className="flex gap-4 p-5 pr-12">
         <Cover
           url={target.coverUrl}

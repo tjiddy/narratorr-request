@@ -696,6 +696,37 @@ describe('EbookSheet — State C (the instance cannot send)', () => {
     expectStateC();
   });
 
+  // THE case that actually proves the fail-safe gate is wired (#149 AC5). Every OTHER State-C case
+  // has `data === undefined`, so `kindleDeliveryVisible(features)` and a naive
+  // `features.data?.kindleDeliveryAvailable === true` are INDISTINGUISHABLE — the whole suite stays
+  // green with the gate deleted. React Query retains the last successful payload when a refetch
+  // fails (the reducer sets `status: 'error'` and leaves `data` alone), so a retained-payload error
+  // is the one state where `!state.isError` is the deciding term rather than a no-op: the gate says
+  // "hide", a raw `.data` read says "show from stale data".
+  it('fails safe to State C when a REFETCH errors while the successful payload is retained', async () => {
+    await renderSheet();
+    expect(isPrimary(sendButton())).toBe(true); // State A, from a genuinely successful fetch
+
+    featuresResponder = () => Promise.resolve(jsonRes(500, { error: { code: 'INTERNAL', message: 'boom' } }));
+    await act(async () => {
+      await client.refetchQueries({ queryKey: qk.features });
+    });
+
+    // The premise, asserted rather than assumed: the query is ERRORED and STILL holding the
+    // successful payload. Without the retention half a raw `.data` read would fail safe by
+    // accident and this case would prove nothing.
+    expect(client.getQueryState(qk.features)?.status).toBe('error');
+    expect(client.getQueryState(qk.features)?.data).toEqual(FEATURES_A);
+
+    // The observer re-renders ASYNCHRONOUSLY on this transition — settling the refetch inside
+    // `act` is not enough, because the notification is scheduled rather than applied inline. Wait
+    // for the POSITIVE effect of the gate first, so the synchronous absence assertions inside
+    // `expectStateC()` run against a state that has actually landed.
+    await waitFor(() => expect(sendButton()).toBeDisabled());
+
+    expectStateC();
+  });
+
   it('is also the answer while the features query is genuinely still IN FLIGHT', async () => {
     featuresResponder = () =>
       new Promise<Response>((resolve) => {
@@ -986,5 +1017,47 @@ describe('the default save / navigate seams', () => {
     expect(anchor.href).toBe('/api/ebooks/bk_1/download?title=Dune');
     expect(anchor.download).toBe('');
     expect(anchor.click).toHaveBeenCalledTimes(1);
+  });
+});
+
+// --- Viewport containment (#149 F4, sibling of the AccountModal instance) -----
+
+describe('EbookSheet — the expanded education stays reachable on a short viewport', () => {
+  /**
+   * The sheet hosts the SAME eight-step click path as the account modal, below the cover block,
+   * both actions and the caption. jsdom performs no layout, so the assertable contract is
+   * `Dialog`'s scrolling MODE — a height-capped card whose content sits in an internally-scrolling
+   * wrapper. Without it the card is `h-fit` inside a `position: fixed` overlay and anything past
+   * the viewport bottom is unreachable, because the page behind does not scroll the overlay.
+   */
+  it('caps the dialog height and scrolls its body internally', async () => {
+    await renderSheet();
+    const card = screen.getByRole('dialog');
+
+    expect(card.className).toContain('max-h-[85vh]');
+    expect(card.className).toContain('overflow-hidden');
+
+    const scroller = card.querySelector('.overflow-y-auto');
+    expect(scroller).not.toBeNull();
+    expect(scroller).toContainElement(downloadButton());
+    expect(scroller).toContainElement(sendButton());
+  });
+
+  it('keeps Close pinned OUTSIDE the scrolling region', async () => {
+    await renderSheet();
+    const card = screen.getByRole('dialog');
+
+    const scroller = card.querySelector('.overflow-y-auto')!;
+    expect(scroller).not.toContainElement(screen.getByRole('button', { name: 'Close' }));
+  });
+
+  it('reaches the last click-path step and the one-time note once expanded', async () => {
+    await renderSheet();
+
+    await userEvent.click(expanderTrigger()!);
+
+    const scroller = screen.getByRole('dialog').querySelector('.overflow-y-auto')!;
+    expect(scroller).toContainElement(screen.getByText('Enter the sender mailbox'));
+    expect(scroller).toContainElement(screen.getByText(/one-time setup per Amazon account/i));
   });
 });

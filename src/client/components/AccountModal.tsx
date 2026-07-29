@@ -30,7 +30,12 @@ import { BellIcon } from './icons';
 export function AccountModal({ me, open, onClose }: { me: MeDto; open: boolean; onClose: () => void }) {
   const headingId = useId();
   return (
-    <Dialog open={open} onClose={onClose} labelledBy={headingId}>
+    // `scrollBody` (#149): the allowlist education adds an eight-step expandable click path to an
+    // already tall modal — identity block, two email rows, the education, and the notification
+    // group. Without it `Dialog` caps nothing and the card is `h-fit` inside a FIXED overlay, so on
+    // a short viewport the expanded path and everything below it render past the bottom edge with
+    // no way to scroll to them. This is the same mode the notifier form already uses.
+    <Dialog open={open} onClose={onClose} labelledBy={headingId} scrollBody>
       <AccountModalContent me={me} headingId={headingId} />
     </Dialog>
   );
