@@ -1,5 +1,14 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { getMe, getFeatures, requestBookFrom, listMyRequests, listAdminQueue, listUserRequests, ApiError } from './api';
+import {
+  getMe,
+  getFeatures,
+  requestBookFrom,
+  listMyRequests,
+  listAdminQueue,
+  listUserRequests,
+  sendEbookToKindle,
+  ApiError,
+} from './api';
 import type { V1AudibleResult } from '@shared/schemas/v1/metadata';
 
 // parse<T> (api.ts:23) is a private module function — not exported — so its HTTP
@@ -188,5 +197,48 @@ describe('list wrappers — paging query string + total pass-through', () => {
       await listUserRequests('us_abc');
       expect(urlOf(mock)).toBe('/api/admin/users/us_abc/requests');
     });
+  });
+});
+
+describe('sendEbookToKindle (#149)', () => {
+  const bookId = 'bk_abc123';
+
+  it('POSTs the send route with the title body and same-origin credentials', async () => {
+    const mock = stubFetch(new Response(JSON.stringify({ outcome: 'sent' }), { status: 200 }));
+
+    await expect(sendEbookToKindle(bookId, 'The Hobbit')).resolves.toEqual({ outcome: 'sent' });
+
+    expect(mock).toHaveBeenCalledTimes(1);
+    const [url, init] = mock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/ebooks/bk_abc123/send-to-kindle');
+    expect(init.method).toBe('POST');
+    // The session cookie is what makes the route's requireActiveUser gate resolvable at all.
+    expect(init.credentials).toBe('same-origin');
+    expect(init.headers).toMatchObject({ 'content-type': 'application/json' });
+    // The body carries the title and NOTHING else — the route's schema is `.strict()`, and there
+    // is deliberately no recipient field anywhere (the server reads users.kindle_email itself).
+    expect(JSON.parse(init.body as string)).toEqual({ title: 'The Hobbit' });
+  });
+
+  it.each([
+    ['a failure outcome', 'failed' as const],
+    ['the indeterminate outcome', 'indeterminate' as const],
+  ])('returns %s as a 200 body, never as a rejection', async (_label, outcome) => {
+    stubFetch(new Response(JSON.stringify({ outcome }), { status: 200 }));
+    await expect(sendEbookToKindle(bookId, 'x')).resolves.toEqual({ outcome });
+  });
+
+  it('rejects with an ApiError carrying the envelope CODE for a business refusal', async () => {
+    stubFetch(
+      new Response(JSON.stringify({ error: { code: 'EBOOKS_DISABLED', message: 'off' } }), { status: 403 }),
+    );
+    const err = await sendEbookToKindle(bookId, 'x').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err).toMatchObject({ status: 403, code: 'EBOOKS_DISABLED' });
+  });
+
+  it('maps a non-JSON body to NON_JSON so the sheet can fall back to its generic copy', async () => {
+    stubFetch(new Response('<html>500</html>', { status: 500 }));
+    await expect(sendEbookToKindle(bookId, 'x')).rejects.toMatchObject({ code: 'NON_JSON' });
   });
 });

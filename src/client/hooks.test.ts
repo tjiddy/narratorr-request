@@ -26,6 +26,7 @@ const hoisted = vi.hoisted(() => ({
     updateMe: vi.fn(),
     updateConnectorSettings: vi.fn(),
     getFeatures: vi.fn(),
+    sendEbookToKindle: vi.fn(),
   },
   // A module-scoped slot backing the test-only `react` useState mock so a re-invoked
   // `useTheme()` observes the value a prior `toggleTheme()` wrote.
@@ -56,6 +57,7 @@ vi.mock('./api', async (importActual) => {
     updateMe: hoisted.api.updateMe,
     updateConnectorSettings: hoisted.api.updateConnectorSettings,
     getFeatures: hoisted.api.getFeatures,
+    sendEbookToKindle: hoisted.api.sendEbookToKindle,
   };
 });
 
@@ -108,12 +110,15 @@ import {
   useConnectorSettings,
   useUpdateEbooksEnabled,
   useFeatures,
+  useSendToKindle,
   useSystemInfo,
   useAuthProviders,
   useLocalAuth,
   useTheme,
 } from './hooks';
 import { ApiError } from './api';
+import { EBOOK_SEND_OUTCOMES } from '@shared/schemas/ebooks';
+import { sendOutcomeMessage, sendErrorMessage, GENERIC_SEND_ERROR } from './components/ebook-sheet';
 
 const success = vi.mocked(toast.success);
 const error = vi.mocked(toast.error);
@@ -970,5 +975,64 @@ describe('useTheme', () => {
     expect(second.theme).toBe('dark');
     expect(m.setItem).toHaveBeenLastCalledWith('theme', 'dark');
     expect(m.add).toHaveBeenLastCalledWith('dark');
+  });
+});
+
+describe('useSendToKindle — the send mutation (#149)', () => {
+  // This mutation is the ONE that converges no cache: a send changes no cached resource, so the
+  // right receipt here is exactly what the wholesale react-query mock can prove — which API call it
+  // dispatches, that it asks for NO cache operation, and which toast each answer raises
+  // (react-query-mock-hides-cache-convergence). It also OWNS the toasts: the sheet raises none, so
+  // "exactly one toast per answer" is assertable here.
+  const send = (bookId: string, title: string) =>
+    mutFn<{ bookId: string; title: string }>(useSendToKindle())({ bookId, title });
+
+  it('dispatches sendEbookToKindle with the book id and the sheet’s title', async () => {
+    hoisted.api.sendEbookToKindle.mockResolvedValue({ outcome: 'sent' });
+
+    await expect(send('bk_abc123', 'The Hobbit')).resolves.toEqual({ outcome: 'sent' });
+
+    expect(hoisted.api.sendEbookToKindle).toHaveBeenCalledTimes(1);
+    expect(hoisted.api.sendEbookToKindle).toHaveBeenCalledWith('bk_abc123', 'The Hobbit');
+  });
+
+  it('writes NO cache at all — no setQueryData, no invalidateQueries', () => {
+    const hook = useSendToKindle() as { onSettled?: unknown };
+    cb(useSendToKindle()).onSuccess({ outcome: 'sent' });
+    cb(useSendToKindle()).onError(new ApiError(500, 'INTERNAL', 'boom'));
+    // A send changes no cached resource: `me`, `features` and the request lists are all unaffected.
+    expect(hoisted.qc.setQueryData).not.toHaveBeenCalled();
+    expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalled();
+    // …and there is no settlement hook quietly reconciling either.
+    expect(hook.onSettled).toBeUndefined();
+  });
+
+  it('raises exactly ONE success toast for `sent`', () => {
+    cb(useSendToKindle()).onSuccess({ outcome: 'sent' });
+    expect(success).toHaveBeenCalledTimes(1);
+    expect(success).toHaveBeenCalledWith(sendOutcomeMessage('sent'));
+    expect(error).not.toHaveBeenCalled();
+  });
+
+  it.each(EBOOK_SEND_OUTCOMES.filter((o) => o !== 'sent'))(
+    'raises exactly ONE error toast for the %s outcome',
+    (outcome) => {
+      cb(useSendToKindle()).onSuccess({ outcome });
+      expect(error).toHaveBeenCalledTimes(1);
+      expect(error).toHaveBeenCalledWith(sendOutcomeMessage(outcome));
+      expect(success).not.toHaveBeenCalled();
+    },
+  );
+
+  it('maps a REJECTED request through the error-code table, not the outcome table', () => {
+    cb(useSendToKindle()).onError(new ApiError(403, 'EBOOKS_DISABLED', 'off'));
+    expect(error).toHaveBeenCalledTimes(1);
+    expect(error).toHaveBeenCalledWith(sendErrorMessage('EBOOKS_DISABLED'));
+  });
+
+  it('falls back to the generic copy for a non-ApiError rejection (a network failure)', () => {
+    cb(useSendToKindle()).onError(new TypeError('network'));
+    expect(error).toHaveBeenCalledTimes(1);
+    expect(error).toHaveBeenCalledWith(GENERIC_SEND_ERROR);
   });
 });
