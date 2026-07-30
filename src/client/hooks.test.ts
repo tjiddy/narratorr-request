@@ -13,7 +13,9 @@ import type * as ReactModule from 'react';
 // directly) and `useQueryClient` returns a fake client of spies. `sonner`'s toast
 // is spied so we can assert the surfaced text.
 const hoisted = vi.hoisted(() => ({
-  qc: { invalidateQueries: vi.fn(), setQueryData: vi.fn() },
+  // `cancelQueries` belongs here because `reconcileMeWrite` cancels an in-flight read before
+  // invalidating (#201 F2) — a client without it throws straight out of `onSettled`.
+  qc: { invalidateQueries: vi.fn(), setQueryData: vi.fn(), cancelQueries: vi.fn() },
   // Spies for the local-auth boundary functions and the three request-list wrappers
   // (so a paged hook's queryFn can be driven and its args asserted); the rest of `./api`
   // is preserved (importActual) so `ApiError` and unrelated exports stay real.
@@ -131,6 +133,14 @@ interface Callbacks {
   onSettled: (...args: any[]) => unknown;
 }
 const cb = (hook: unknown): Callbacks => hook as Callbacks;
+
+/**
+ * Flush pending microtasks. `reconcileMeWrite` AWAITS a `cancelQueries` before invalidating (#201
+ * F2), so a `qk.me` settlement's invalidation lands a tick after `onSettled` returns — asserting it
+ * synchronously reads zero calls. Only the two hooks routed through that helper need this; the
+ * request/decide/user settlements still invalidate synchronously.
+ */
+const settled = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 // `useMutation` returns the raw options; for the auth hook we drive its mutationFn.
 interface MutationOptions {
@@ -585,19 +595,34 @@ describe('useUpdateMe — account save with proportional feedback (#50, #134)', 
   it.each([
     ['a rejected save (partially committed, then 500)', undefined, new ApiError(500, 'E', 'quota lookup blew up')],
     ['a successful save', { notifyOn: [] } as unknown as MeDto, null],
-  ])('invalidates qk.me on %s', (_label, data, err) => {
+  ])('invalidates qk.me on %s', async (_label, data, err) => {
     cb(useUpdateMe()).onSettled(data, err, { email: 'new@x.com' });
+    await settled();
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.me });
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['me'] });
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledTimes(1);
+  });
+
+  // The cancel is what makes the invalidation issue a FRESH read even when the key holds no data —
+  // the state in which `Query.fetch`'s supersession arm is unavailable and a bare invalidation
+  // silently adopts the in-flight read (#201 F2). Both the arguments and the ORDER are the contract:
+  // cancelling after invalidating would kill the read it just asked for.
+  it('cancels any in-flight me read BEFORE invalidating', async () => {
+    cb(useUpdateMe()).onSettled({ notifyOn: [] } as unknown as MeDto, null, { email: 'new@x.com' });
+    await settled();
+    expect(hoisted.qc.cancelQueries).toHaveBeenCalledWith({ queryKey: qk.me }, { silent: true });
+    expect(hoisted.qc.cancelQueries.mock.invocationCallOrder[0]!).toBeLessThan(
+      hoisted.qc.invalidateQueries.mock.invocationCallOrder[0]!,
+    );
   });
 
   // Unconditional on purpose. Reconciling only the ERROR path would let an error-triggered GET
   // issued before a sibling's commit settle after that sibling's merge and replace the whole entry —
   // the exact #142 rollback `mergeMeCache` exists to prevent. Every settlement ending in an
   // invalidation is what makes the LAST settler's read the last word.
-  it('reconciles a notifyOn-only save too — no body-keyed exemption', () => {
+  it('reconciles a notifyOn-only save too — no body-keyed exemption', async () => {
     cb(useUpdateMe()).onSettled({ notifyOn: ['available'] } as unknown as MeDto, null, { notifyOn: ['available'] });
+    await settled();
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.me });
   });
 
@@ -993,11 +1018,18 @@ describe('useLocalAuth', () => {
     ['login', 'a successful attempt', { ok: true }, null],
     ['signup', 'a rejected attempt (cookie set, body unparseable)', undefined, new ApiError(200, 'NON_JSON', 'Unexpected non-JSON response (200)')],
     ['signup', 'a successful attempt', { ok: true }, null],
-  ] as const)('mode=%s invalidates the me query on %s (exact ["me"] key)', (mode, _label, data, err) => {
-    cb(useLocalAuth(mode)).onSettled(data, err, { email: 'a@b.c', password: 'pw' });
+  ] as const)('mode=%s invalidates the me query on %s (exact ["me"] key)', async (mode, _label, data, err) => {
+    // Awaiting the RETURNED promise, not just a tick: this hook returns its reconciliation from
+    // `onSettled` so the mutation stays pending across the read (#201 F1) — so the promise is the
+    // settlement, and awaiting it is also what pins that it is still handed back.
+    await cb(useLocalAuth(mode)).onSettled(data, err, { email: 'a@b.c', password: 'pw' });
+    expect(hoisted.qc.cancelQueries).toHaveBeenCalledWith({ queryKey: qk.me }, { silent: true });
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.me });
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['me'] });
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledTimes(1);
+    expect(hoisted.qc.cancelQueries.mock.invocationCallOrder[0]!).toBeLessThan(
+      hoisted.qc.invalidateQueries.mock.invocationCallOrder[0]!,
+    );
     expect(success).not.toHaveBeenCalled();
     expect(error).not.toHaveBeenCalled();
   });
