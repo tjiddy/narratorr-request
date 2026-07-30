@@ -101,6 +101,29 @@ export function drizzleConstraintError(opts: {
   );
 }
 
+/**
+ * A REAL drizzle/libSQL rejection from a duplicate `users` insert — the shape
+ * {@link drizzleConstraintError} claims to reproduce.
+ *
+ * Shared rather than inlined so the classifier tests and the factory's own contract test measure
+ * against the SAME driver error: that is what makes a libSQL upgrade which renumbers `rawCode` or
+ * renames a code spelling fail loudly instead of leaving a stale fixture certifying a shape
+ * production no longer produces.
+ */
+export async function realDuplicateInsertError(): Promise<unknown> {
+  const db = await createTestDb();
+  await insertUser(db, { provider: 'local', subject: 'a@b.com' });
+  try {
+    await db
+      .insert(users)
+      .values({ publicId: publicId('us'), authProvider: 'local', authSubject: 'a@b.com', username: 'dupe' })
+      .returning();
+  } catch (err: unknown) {
+    return err;
+  }
+  throw new Error('the duplicate insert did not reject');
+}
+
 /** Delete a user row by id — exercises the real session-lookup-miss boundary in tests. */
 export async function deleteUser(db: Db, id: number): Promise<void> {
   await db.delete(users).where(eq(users.id, id));
