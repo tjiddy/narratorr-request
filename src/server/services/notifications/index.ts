@@ -140,6 +140,7 @@ export { NOTIFIER_TYPES };
 export { Notifier } from './notifier.service.js';
 export { render } from './render.js';
 export { redact } from './redact.js';
+export { describeSendFailure } from './describe-send-failure.js';
 export type {
   NotificationEvent,
   NotificationPayload,
