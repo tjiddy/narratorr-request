@@ -32,6 +32,49 @@ export class NarratorrError extends ApiError {
   }
 }
 
+/**
+ * The ONE non-2xx body → `NarratorrError` decision, shared by `NarratorrClient.request()` and
+ * `NarratorrStreamClient.errorFor()`. The two clients acquire the body differently (one plain
+ * `res.text()`, one bounded/capped read), but what the resulting text MEANS must not diverge —
+ * a second copy of this policy is exactly what issue #173 was filed about.
+ *
+ * `label` is the caller's message prefix (`Narratorr POST /api/v1/books` vs
+ * `Narratorr GET /api/v1/books/:id/companion-epub`). It is the only reason the two clients'
+ * messages differ, and that stays deliberate: the endpoint belongs in the message.
+ *
+ * | `text`                        | `upstreamCode`      | `message`                     |
+ * |-------------------------------|---------------------|-------------------------------|
+ * | empty                         | `NON_JSON`          | `… returned an empty body`    |
+ * | fails `JSON.parse`            | `NON_JSON`          | `… returned non-JSON`         |
+ * | parses, is the error envelope | envelope code       | envelope message              |
+ * | parses, not an envelope       | `HTTP_${status}`    | `… failed (${status})`        |
+ *
+ * An EMPTY body is a non-JSON body, not a non-envelope JSON one: `HTTP_<status>` is reserved for
+ * a body we successfully parsed and found the wrong shape.
+ */
+export function classifyErrorBody(label: string, status: number, text: string): NarratorrError {
+  if (!text) {
+    return new NarratorrError(status, 'NON_JSON', `${label} returned an empty body`);
+  }
+
+  let json: unknown;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    return new NarratorrError(status, 'NON_JSON', `${label} returned non-JSON`);
+  }
+
+  const parsed = errorEnvelopeSchema.safeParse(json);
+  // The companion codes (`companion_epub_unavailable` / `_disabled` / `_busy`) are frozen
+  // lowercase contract — pass them through verbatim, never normalized.
+  const { code, message } = parsed.success
+    ? parsed.data.error
+    : { code: `HTTP_${status}`, message: `${label} failed (${status})` };
+  // The RAW parsed JSON, never `parsed.data`: `errorEnvelopeSchema` is a plain `z.object`, so
+  // Zod strips unknown siblings and `addBook()`'s 409 `existingId` read would go null.
+  return new NarratorrError(status, code, message, json);
+}
+
 const DEFAULT_TIMEOUT_MS = 15_000;
 
 /** Pull `existingId` out of a `POST /books` 409 body (`{ error, existingId }`). */
@@ -163,6 +206,11 @@ export class NarratorrClient {
       res = await fetch(url, {
         method,
         signal: controller.signal,
+        // A redirect must surface as OUR error rather than replaying the api key at the target:
+        // the WHATWG cross-origin stripping rule covers `Authorization`, not our custom
+        // `X-Api-Key`, so a followed 30x would hand the key to a host the upstream chose.
+        // `redirect: 'error'` rejects the fetch, which the catch below classifies as NETWORK.
+        redirect: 'error',
         headers: {
           'X-Api-Key': this.apiKey,
           ...(opts.body !== undefined ? { 'content-type': 'application/json' } : {}),
@@ -171,35 +219,31 @@ export class NarratorrClient {
         ...(opts.body !== undefined ? { body: JSON.stringify(opts.body) } : {}),
       });
       text = await res.text();
-    } catch (err) {
+    } catch (err: unknown) {
       const reason = err instanceof Error && err.name === 'AbortError' ? 'timed out' : 'unreachable';
       throw new NarratorrError(0, 'NETWORK', `Narratorr ${method} ${path} ${reason}`);
     } finally {
       clearTimeout(timer);
     }
 
+    const label = `Narratorr ${method} ${path}`;
+
+    // The non-2xx branch owns the WHOLE text→error decision, ahead of any parse. Keeping the
+    // parse below it is what scopes the empty-body → NON_JSON rule to failures structurally: a
+    // 2xx with no body still falls through to the contract check and stays CONTRACT_MISMATCH.
+    if (!res.ok) throw classifyErrorBody(label, res.status, text);
+
+    // 2xx only from here.
     let json: unknown;
     try {
       json = text ? JSON.parse(text) : undefined;
     } catch {
-      throw new NarratorrError(res.status, 'NON_JSON', `Narratorr ${method} ${path} returned non-JSON`);
-    }
-
-    if (!res.ok) {
-      const parsed = errorEnvelopeSchema.safeParse(json);
-      const { code, message } = parsed.success
-        ? parsed.data.error
-        : { code: `HTTP_${res.status}`, message: `Narratorr ${method} ${path} failed (${res.status})` };
-      throw new NarratorrError(res.status, code, message, json);
+      throw new NarratorrError(res.status, 'NON_JSON', `${label} returned non-JSON`);
     }
 
     const result = schema.safeParse(json);
     if (!result.success) {
-      throw new NarratorrError(
-        res.status,
-        'CONTRACT_MISMATCH',
-        `Narratorr ${method} ${path} response did not match the v1 contract`,
-      );
+      throw new NarratorrError(res.status, 'CONTRACT_MISMATCH', `${label} response did not match the v1 contract`);
     }
     return result.data;
   }

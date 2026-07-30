@@ -1,5 +1,4 @@
-import { errorEnvelopeSchema } from '../../shared/schemas/v1/common.js';
-import { NarratorrError } from './narratorr-client.js';
+import { classifyErrorBody, NarratorrError } from './narratorr-client.js';
 
 /**
  * Header-acquisition deadline. Covers ONLY the response headers — see
@@ -175,29 +174,10 @@ export class NarratorrStreamClient {
    */
   private async errorFor(path: string, res: Response): Promise<NarratorrError> {
     const text = await this.readBoundedErrorBody(res);
-
-    // An EMPTY non-2xx body is a non-JSON body, not a non-envelope JSON one: `HTTP_<status>` is
-    // reserved for a body we successfully parsed and found the wrong shape. (This is a deliberate
-    // divergence from `NarratorrClient.request()`, which coerces empty to `undefined` and lands on
-    // `HTTP_<status>` — that client's mapping is shipped and out of scope here.)
-    if (!text) {
-      return new NarratorrError(res.status, 'NON_JSON', `Narratorr GET ${path} returned an empty body`);
-    }
-
-    let json: unknown;
-    try {
-      json = JSON.parse(text);
-    } catch {
-      return new NarratorrError(res.status, 'NON_JSON', `Narratorr GET ${path} returned non-JSON`);
-    }
-
-    const parsed = errorEnvelopeSchema.safeParse(json);
-    // The companion codes (`companion_epub_unavailable` / `_disabled` / `_busy`) are frozen
-    // lowercase contract — pass them through verbatim, never normalized.
-    const { code, message } = parsed.success
-      ? parsed.data.error
-      : { code: `HTTP_${res.status}`, message: `Narratorr GET ${path} failed (${res.status})` };
-    return new NarratorrError(res.status, code, message, json);
+    // The bounded read is this class's own concern; what the resulting text MEANS is the SHARED
+    // decision `NarratorrClient` applies too (issue #171/#173) — the two clients now agree on
+    // empty vs malformed vs non-envelope, and only the message prefix differs by endpoint.
+    return classifyErrorBody(`Narratorr GET ${path}`, res.status, text);
   }
 
   private async readBoundedErrorBody(res: Response): Promise<string> {

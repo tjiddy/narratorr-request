@@ -1,9 +1,9 @@
-import { createServer, type Server } from 'node:http';
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
 import { http, HttpResponse, delay } from 'msw';
 import { setupServer } from 'msw/node';
-import { NarratorrClient, NarratorrError } from './narratorr-client.js';
+import { classifyErrorBody, NarratorrClient, NarratorrError } from './narratorr-client.js';
 import { errorBody, errorEnvelopeSchema } from '../../shared/schemas/v1/common.js';
 import { v1CapabilitiesSchema } from '../../shared/schemas/v1/capabilities.js';
 import { narratorrV1Handlers, resetMockNarratorrState, MOCK_BASE_URL } from '../mocks/narratorr-v1.js';
@@ -194,6 +194,193 @@ describe('NarratorrClient error handling', () => {
     await expect(client.addBook('B07KCQDQR9')).rejects.toMatchObject({ upstreamStatus: 409 });
     expect(getBookSpy).not.toHaveBeenCalled();
     getBookSpy.mockRestore();
+  });
+});
+
+describe('classifyErrorBody — the shared non-2xx body decision (#171/#173)', () => {
+  // The one copy of the policy both clients call. It is pure, so its four branches are covered
+  // here directly rather than through either client's transport; each client keeps its own
+  // assertions as the wiring proof that it actually calls this.
+  const LABEL = 'Narratorr GET /api/v1/thing';
+
+  it('maps an empty body to NON_JSON with the "empty body" message', () => {
+    const err = classifyErrorBody(LABEL, 503, '');
+    expect(err).toMatchObject({ upstreamStatus: 503, upstreamCode: 'NON_JSON' });
+    expect(err.message).toBe(`${LABEL} returned an empty body`);
+    expect(err.body).toBeUndefined();
+  });
+
+  it('maps an unparseable body to NON_JSON with the DISTINCT "non-JSON" message', () => {
+    const err = classifyErrorBody(LABEL, 502, '<html>bad gateway</html>');
+    expect(err).toMatchObject({ upstreamStatus: 502, upstreamCode: 'NON_JSON' });
+    expect(err.message).toBe(`${LABEL} returned non-JSON`);
+    expect(err.body).toBeUndefined();
+  });
+
+  it('falls back to HTTP_<status> for parsed JSON that is not the error envelope', () => {
+    const err = classifyErrorBody(LABEL, 500, JSON.stringify({ oops: true }));
+    expect(err).toMatchObject({ upstreamStatus: 500, upstreamCode: 'HTTP_500' });
+    expect(err.message).toBe(`${LABEL} failed (500)`);
+    expect(err.body).toEqual({ oops: true }); // the RAW parsed JSON, retained
+  });
+
+  it('passes an error envelope’s code + message through VERBATIM, keeping the raw body', () => {
+    // The raw-body rule is load-bearing: `errorEnvelopeSchema` is a plain `z.object`, so
+    // `parsed.data` would strip the 409's sibling `existingId` and `addBook()`'s idempotency
+    // resolution would silently start returning null.
+    const raw = { error: { code: 'book_exists', message: 'A book with this ASIN already exists.' }, existingId: 'bk_x' };
+    const err = classifyErrorBody(LABEL, 409, JSON.stringify(raw));
+    expect(err).toMatchObject({ upstreamStatus: 409, upstreamCode: 'book_exists' });
+    expect(err.message).toBe('A book with this ASIN already exists.');
+    expect(err.body).toEqual(raw);
+    expect((err.body as { existingId?: string }).existingId).toBe('bk_x');
+  });
+
+  it('differs between callers ONLY by the label prefix — the parity contract', () => {
+    // AC7: for the same (status, text) the two clients must agree on upstreamStatus,
+    // upstreamCode and body. `message` deliberately still carries each caller's endpoint.
+    const text = JSON.stringify({ oops: true });
+    const json = classifyErrorBody('Narratorr POST /api/v1/books', 500, text);
+    const stream = classifyErrorBody('Narratorr GET /api/v1/books/bk_1/companion-epub', 500, text);
+    expect(json.upstreamStatus).toBe(stream.upstreamStatus);
+    expect(json.upstreamCode).toBe(stream.upstreamCode);
+    expect(json.body).toEqual(stream.body);
+    expect(json.message).toBe('Narratorr POST /api/v1/books failed (500)');
+    expect(stream.message).toBe('Narratorr GET /api/v1/books/bk_1/companion-epub failed (500)');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Redirect hardening (#171) — REAL `node:http`, MSW taken out of the loop per request.
+// A redirect can only be exercised over a real socket: MSW resolves handlers in-process, so
+// there is no second host for the api key to be replayed at and nothing to record. Each test
+// does the documented close/re-arm dance (learning `msw-cannot-test-body-read-abort`, #95) —
+// `server.close()` restores native fetch, the `finally` re-arms MSW for the rest of the file.
+// Tests in a file run serially, so this is safe.
+// ---------------------------------------------------------------------------
+
+interface RecordingServer {
+  baseUrl: string;
+  /** Every request URL this server saw — the api-key-replay detector. */
+  requests: string[];
+  close(): Promise<void>;
+}
+
+async function startRecordingServer(
+  handler: (req: IncomingMessage, res: ServerResponse) => void,
+): Promise<RecordingServer> {
+  const requests: string[] = [];
+  const s = createServer((req, res) => {
+    requests.push(req.url ?? '');
+    // A client that walks away mid-response makes the socket error (EPIPE/ECONNRESET) — swallow
+    // it so a hardening test can't take the whole worker down with an unhandled 'error'.
+    res.on('error', () => {});
+    req.on('error', () => {});
+    handler(req, res);
+  });
+  await new Promise<void>((resolve) => s.listen(0, '127.0.0.1', () => resolve()));
+  const { port } = s.address() as AddressInfo;
+  return {
+    baseUrl: `http://127.0.0.1:${port}`,
+    requests,
+    close: async () => {
+      s.closeAllConnections(); // undici pools keep-alive sockets; without this `close` hangs
+      await new Promise<void>((resolve) => s.close(() => resolve()));
+    },
+  };
+}
+
+describe('NarratorrClient — redirect hardening (#171)', () => {
+  it.each([301, 302, 303, 307, 308])(
+    'does NOT follow a %d — the api key is never replayed at an upstream-chosen host',
+    async (status) => {
+      const target = await startRecordingServer((_req, res) => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{"data":[],"total":0}');
+      });
+      const redirector = await startRecordingServer((_req, res) => {
+        res.writeHead(status, { location: `${target.baseUrl}/api/v1/metadata/search`, 'content-length': '0' });
+        res.end();
+      });
+
+      server.close(); // restore native fetch — MSW rejects a real-socket request outright
+      try {
+        const c = new NarratorrClient({ baseUrl: redirector.baseUrl, apiKey: 'test-key' });
+        const err = await c.searchMetadata('x').catch((e: unknown) => e);
+        // The WHATWG cross-origin stripping rule covers `Authorization`, not our custom
+        // `X-Api-Key` — so this must surface as OUR error, never as a raw fetch TypeError.
+        expect(err).toBeInstanceOf(NarratorrError);
+        expect(err).toMatchObject({ upstreamStatus: 0, upstreamCode: 'NETWORK' });
+        expect(target.requests).toHaveLength(0);
+      } finally {
+        server.listen({ onUnhandledRequest: 'error' }); // re-arm MSW for the remaining tests
+        await redirector.close();
+        await target.close();
+      }
+    },
+  );
+
+  it('does NOT normalize a 300 — a non-redirect 3xx keeps its real status', async () => {
+    // 300 carries `Location` but is outside Fetch's redirect-status set, so it separates
+    // "has a Location header" from "is a redirect status". It was never followed, before or
+    // after this change; what IS new is that its empty body classifies as NON_JSON.
+    const target = await startRecordingServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"data":[],"total":0}');
+    });
+    const multiple = await startRecordingServer((_req, res) => {
+      res.writeHead(300, { location: `${target.baseUrl}/api/v1/metadata/search`, 'content-length': '0' });
+      res.end();
+    });
+
+    server.close();
+    try {
+      const c = new NarratorrClient({ baseUrl: multiple.baseUrl, apiKey: 'test-key' });
+      const err = await c.searchMetadata('x').catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(NarratorrError);
+      expect(err).toMatchObject({ upstreamStatus: 300, upstreamCode: 'NON_JSON' });
+      expect(target.requests).toHaveLength(0);
+    } finally {
+      server.listen({ onUnhandledRequest: 'error' });
+      await multiple.close();
+      await target.close();
+    }
+  });
+});
+
+describe('NarratorrClient — empty vs malformed non-2xx bodies (#171/#173)', () => {
+  const SEARCH_URL = `${MOCK_BASE_URL}/api/v1/metadata/search`;
+
+  it.each([500, 404])('maps an EMPTY %d body to NON_JSON, not HTTP_<status>', async (status) => {
+    // An empty body is a non-JSON body. `HTTP_<status>` is reserved for a body we parsed and
+    // found the wrong shape — the same rule `NarratorrStreamClient` already applies.
+    server.use(http.get(SEARCH_URL, () => new HttpResponse(null, { status })));
+    const err = await client.searchMetadata('x').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(NarratorrError);
+    expect(err).toMatchObject({ upstreamStatus: status, upstreamCode: 'NON_JSON' });
+    expect((err as NarratorrError).message).toMatch(/returned an empty body$/);
+  });
+
+  it('keeps a non-empty unparseable body on the distinct "returned non-JSON" message', async () => {
+    // The pair to the case above: both are NON_JSON, and their messages must NOT collapse into
+    // one string — the empty and malformed causes stay tellable apart in a log line.
+    server.use(http.get(SEARCH_URL, () => HttpResponse.text('<html>bad gateway</html>', { status: 500 })));
+    const err = await client.searchMetadata('x').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(NarratorrError);
+    expect(err).toMatchObject({ upstreamStatus: 500, upstreamCode: 'NON_JSON' });
+    expect((err as NarratorrError).message).toMatch(/returned non-JSON$/);
+  });
+
+  it('still flags an EMPTY 2xx body as CONTRACT_MISMATCH, never NON_JSON', async () => {
+    // The empty-body mapping is scoped to the non-2xx branch only: `system.ts` maps
+    // CONTRACT_MISMATCH to `state: 'unavailable'` and `feature.service.ts` treats it as
+    // transient drift, so hoisting the empty check above the `res.ok` check would change two
+    // shipped dispositions.
+    server.use(http.get(SEARCH_URL, () => new HttpResponse(null, { status: 200 })));
+    await expect(client.searchMetadata('x')).rejects.toMatchObject({
+      upstreamStatus: 200,
+      upstreamCode: 'CONTRACT_MISMATCH',
+    });
   });
 });
 
