@@ -59,6 +59,15 @@ const unparseableRes = (status: number): Response =>
 
 const fail = (status: number, code: string, message: string) => jsonRes(status, { error: { code, message } });
 
+/** A response the test resolves by hand — used where a read has to be held open deliberately. */
+function deferred() {
+  let resolve!: (res: Response) => void;
+  const promise = new Promise<Response>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
 const baseMe = (over: Partial<MeDto> = {}): MeDto => ({
   publicId: 'us_1',
   username: 'todd',
@@ -442,6 +451,101 @@ describe('useLocalAuth — a session minted behind a response the client cannot 
     await waitFor(() => expect(client.getQueryState(qk.me)?.fetchStatus).toBe('idle'));
     expect(result.current.me.isError).toBe(true);
     expect(result.current.me.data).toBeUndefined();
+  });
+});
+
+describe('useLocalAuth — a corrected retry cannot be stranded by the failed attempt’s read (#201 F1)', () => {
+  /**
+   * The failed-attempt × immediate-retry intersection. Unlike every other `qk.me` reconciliation,
+   * the one issued from the LOGIN SCREEN runs against a query with NO DATA — and `Query.fetch` only
+   * supersedes an in-flight fetch when `state.data !== undefined`. With no data, a second
+   * invalidation issues no request at all and returns the FIRST retryer's promise, so a read that
+   * went out before the session cookie existed is the one that lands.
+   *
+   * The guard is the mutation's own pending boundary: `useLocalAuth.onSettled` RETURNS the
+   * reconciliation promise, so `auth.isPending` stays true across the read and `LoginPage`'s
+   * `disabled={auth.isPending}` submit cannot dispatch the retry into that window.
+   *
+   * Every step is gated — the credentials response and each `GET /api/me`'s delivery — because a
+   * fake that resolves reads immediately can never produce the overlap this row exists to rule out.
+   */
+  function fakeServer() {
+    const state = { signedIn: false, meGets: 0 };
+    const reads: { signedInAtIssue: boolean; release: () => void }[] = [];
+    let gateReads = false;
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        const url = String(input);
+        if (url === '/api/me') {
+          state.meGets += 1;
+          // The answer is decided at ISSUE time — the whole point: a read that goes out before the
+          // cookie exists answers 401 however late it is delivered.
+          const signedInAtIssue = state.signedIn;
+          const answer = () =>
+            signedInAtIssue ? jsonRes(200, baseMe()) : fail(401, 'UNAUTHORIZED', 'not signed in');
+          if (!gateReads) return Promise.resolve(answer());
+          const gate = deferred();
+          reads.push({ signedInAtIssue, release: () => gate.resolve(answer()) });
+          return gate.promise;
+        }
+        if (url.startsWith('/api/auth/local/login')) {
+          const body = JSON.parse(String(init?.body)) as { password: string };
+          if (body.password !== 'correct') return Promise.resolve(fail(401, 'UNAUTHORIZED', 'Invalid email or password'));
+          state.signedIn = true; // Set-Cookie
+          return Promise.resolve(jsonRes(200, { ok: true }));
+        }
+        throw new Error(`unstubbed fetch: ${init?.method ?? 'GET'} ${url}`);
+      }),
+    );
+    return { state, reads, openReadGate: () => (gateReads = true) };
+  }
+
+  it('holds the submit lock across the data-less reconciliation read, so the retry issues a FRESH one', async () => {
+    const server = fakeServer();
+    const client = newClient();
+    const { result } = renderHook(() => ({ me: useMe(), auth: useLocalAuth('login') }), { wrapper: wrapper(client) });
+    await waitFor(() => expect(result.current.me.isError).toBe(true)); // the login screen's 401
+    server.openReadGate();
+
+    // 1. A bad attempt. Its settlement issues read #1, which we hold open.
+    result.current.auth.mutate({ email: 'a@b.c', password: 'wrong' });
+    await waitFor(() => expect(server.reads).toHaveLength(1));
+    expect(server.reads[0]!.signedInAtIssue).toBe(false); // issued before any session exists
+
+    // 2. PROVE the hazard is armed: the query is fetching with NO data, which is exactly the state
+    //    in which a later invalidation cannot supersede. Issuing one here adds no request — it
+    //    rides read #1 — so a retry dispatched now would be answered by that pre-cookie read.
+    expect(client.getQueryState(qk.me)?.fetchStatus).toBe('fetching');
+    expect(client.getQueryState(qk.me)?.data).toBeUndefined();
+    const readsBefore = server.state.meGets;
+    void client.invalidateQueries({ queryKey: qk.me });
+    await act(async () => {});
+    expect(server.state.meGets).toBe(readsBefore); // no new GET — the supersession path is unavailable
+    expect(server.reads).toHaveLength(1);
+
+    // 3. THE GUARD: the mutation has not settled, so `LoginPage`'s submit stays disabled and the
+    //    retry cannot be dispatched into that window. This is the assertion that fails if
+    //    `onSettled` fires the reconciliation and forgets it.
+    expect(result.current.auth.isPending).toBe(true);
+    expect(result.current.auth.isError).toBe(false);
+
+    // 4. Release the stale read; only now does the form unlock.
+    server.reads[0]!.release();
+    await waitFor(() => expect(result.current.auth.isPending).toBe(false));
+    expect(result.current.auth.isError).toBe(true); // the bad attempt still surfaces on the form
+    expect(client.getQueryState(qk.me)?.data).toBeUndefined();
+
+    // 5. The corrected retry mints a session. Because it is strictly sequential, its settlement
+    //    issues a FRESH read — one that sees the cookie.
+    result.current.auth.mutate({ email: 'a@b.c', password: 'correct' });
+    await waitFor(() => expect(server.reads).toHaveLength(2));
+    expect(server.reads[1]!.signedInAtIssue).toBe(true);
+
+    server.reads[1]!.release();
+    await waitFor(() => expect(result.current.me.data?.publicId).toBe('us_1'));
+    expect(result.current.auth.isPending).toBe(false);
   });
 });
 

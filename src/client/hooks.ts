@@ -129,9 +129,27 @@ export const useMe = () =>
  * later invalidation SUPERSEDES an earlier in-flight refetch instead of racing it. (That suppresses
  * the stale RESULT; `getMe()` doesn't consume the query's abort signal, so the earlier HTTP request
  * still completes — each settlement costs its own GET, they don't coalesce on the wire.)
+ *
+ * THE `data !== undefined` PRECONDITION IS LOAD-BEARING, and it is why this returns its promise
+ * instead of firing and forgetting. `Query.fetch` reads:
+ *
+ *     if (this.state.data !== undefined && fetchOptions?.cancelRefetch) this.cancel({ silent: true })
+ *     else if (this.#retryer) { this.#retryer.continueRetry(); return this.#retryer.promise }
+ *
+ * so on a query with NO data a second invalidation issues no request at all — it returns the
+ * in-flight retryer's promise, and the earlier read's result is the one that lands. Every caller
+ * whose key already holds data (the account save — the modal only renders inside the authenticated
+ * shell, so `qk.me` is populated by construction) is on the supersession path and can safely ignore
+ * the promise. `useLocalAuth` is the one caller that is NOT: on the login screen `qk.me` is a 401
+ * with no data, so a reconciliation read cannot be superseded and must instead be AWAITED — see
+ * there (#201 F1).
+ *
+ * Returning the promise is safe to `await`: `refetchQueries` catches each query's rejection
+ * (`promise.catch(noop)`) and resolves `Promise.all(...).then(noop)`, so this never rejects and can
+ * never turn a settled mutation into a failed one.
  */
-function reconcileMeWrite(qc: ReturnType<typeof useQueryClient>): void {
-  void qc.invalidateQueries({ queryKey: qk.me });
+function reconcileMeWrite(qc: ReturnType<typeof useQueryClient>): Promise<void> {
+  return qc.invalidateQueries({ queryKey: qk.me });
 }
 
 /** The account modal's self-scoped save (issue #131). Backs three callers — the explicit contact-email
@@ -158,12 +176,19 @@ function reconcileMeWrite(qc: ReturnType<typeof useQueryClient>): void {
  *  settle AFTER that sibling's merge and replace the whole entry: the exact #142 rollback the merge
  *  exists to prevent. Invalidating on every settlement makes the last settler's GET the last word
  *  (see {@link reconcileMeWrite} for the cancellation mechanic). The cost is one extra `GET /api/me`
- *  per save, including each instant-apply notification checkbox. */
+ *  per save, including each instant-apply notification checkbox.
+ *
+ *  The reconciliation is deliberately FIRE-AND-FORGET here (the explicit `void`), unlike
+ *  {@link useLocalAuth}. Two reasons, both specific to this caller: `qk.me` always holds data by the
+ *  time the account modal can be opened (the shell only renders the app when `me.data` is present),
+ *  so this caller is on the cancel-supersession path where a later settlement genuinely wins; and
+ *  each row's Save is gated on its own `isPending`, so awaiting the trailing GET would keep a button
+ *  locked after its write already settled and its merge already repainted the row. */
 export function useUpdateMe() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (body: UpdateMeBody) => updateMe(body),
-    onSettled: () => reconcileMeWrite(qc),
+    onSettled: () => void reconcileMeWrite(qc),
     onSuccess: (dto, body) => {
       qc.setQueryData<MeDto>(qk.me, (prev) => mergeMeCache(prev, dto, body));
       const message = meSuccessToast(body);
@@ -552,6 +577,25 @@ export const useAuthProviders = () =>
  *
  * A genuinely failed login (bad password, no session) simply re-reads a 401, which leaves the login
  * screen rendered — see `resolveMeShell` state 3.
+ *
+ * `onSettled` RETURNS the reconciliation promise, so the mutation stays `pending` until that read
+ * settles (TanStack awaits `options.onSettled` on both the success and the error path before
+ * dispatching the final state). `LoginPage`'s submit button is `disabled={auth.isPending}`, so this
+ * is what holds the form locked across the read — and that lock is load-bearing, not cosmetic
+ * (#201 F1):
+ *
+ *   On this screen `qk.me` is a 401 with NO DATA, and `Query.fetch` only supersedes an in-flight
+ *   fetch when data exists — with none, a second invalidation returns the FIRST retryer's promise
+ *   and issues no request. So if a corrected retry could be submitted while the failed attempt's
+ *   reconciliation GET were still open, the retry's own settlement would ride that earlier read: a
+ *   request issued BEFORE the session cookie existed, answering 401. The user would hold a valid
+ *   session and still be looking at the login screen, with nothing scheduled to repair it (`useMe`
+ *   has no `refetchInterval` and a 60s `staleTime`). Awaiting the read makes the retry strictly
+ *   sequential, so its settlement always issues a FRESH GET that sees the cookie.
+ *
+ * This is the one `reconcileMeWrite` caller that awaits; the account save explicitly voids it,
+ * because its key always holds data. The extra pending time is one GET the user was already
+ * waiting on — the app cannot render until that read lands anyway.
  */
 export function useLocalAuth(mode: 'login' | 'signup') {
   const qc = useQueryClient();
