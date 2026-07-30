@@ -225,8 +225,8 @@ describe('insert-time unique-violation race', () => {
   // so a pre-seeded duplicate alone only retests preflight dedupe and never reaches the
   // catch at insertRequest():225-232. Simulate the race window explicitly: drive the DB
   // read seam (db.query.requests.findFirst) so preflight MISSES and the catch re-query
-  // HITS, and make the insert throw the unique violation. (:memory: libSQL breaks across
-  // db.transaction() per CLAUDE.md, so a spy is preferred over real concurrency.)
+  // HITS, and let the REAL insert trip the partial unique index. (:memory: libSQL breaks
+  // across db.transaction() per CLAUDE.md, so a read spy is preferred over real concurrency.)
   afterEach(() => {
     vi.restoreAllMocks();
   });
@@ -245,14 +245,13 @@ describe('insert-time unique-violation race', () => {
       .values({ publicId: 'rq_dupe', userId: admin.id, asin: 'B1', title: 't', status: 'approved' })
       .returning();
 
-    // Preflight (create():154) misses; catch re-query (insertRequest():228) hits the seed.
+    // ONLY the read seam is stubbed: preflight (create():154) misses, catch re-query
+    // (insertRequest():228) hits the seed. The insert stays REAL, so idx_requests_user_asin_active
+    // raises an actual drizzle error — the classifier is proven against the driver's shape
+    // (constraint text on `cause`, not on the wrapper message), not a synthetic string.
     vi.spyOn(db.query.requests, 'findFirst')
       .mockResolvedValueOnce(undefined)
       .mockResolvedValueOnce(seeded);
-    // The insert trips the partial unique index between preflight and write.
-    vi.spyOn(db, 'insert').mockImplementation(() => {
-      throw new Error('UNIQUE constraint failed: requests.user_id, requests.asin');
-    });
 
     const svc = new RequestService(db, client, policy());
     const { row, created } = await svc.create(admin.id, body('B1'));
@@ -272,18 +271,23 @@ describe('insert-time unique-violation race', () => {
     expect(rows).toHaveLength(1);
   });
 
-  it('re-throws the original error when the catch re-query finds no duplicate (no silent null)', async () => {
+  it('re-throws the ORIGINAL error object when the catch re-query finds no duplicate (no silent null)', async () => {
     const user = await insertUser(db, { role: 'user' });
     // Both preflight and catch re-query miss; the unique violation must surface unchanged.
+    // Identity-checked with toBe against a drizzle-shaped sentinel: a re-wrap carrying the
+    // same message would pass a message-only assertion while dropping the driver's cause chain.
+    const original = new Error('Failed query: insert into "requests" (...) values (...) returning ...', {
+      cause: new Error('SQLITE_CONSTRAINT: UNIQUE constraint failed: requests.user_id, requests.asin'),
+    });
     vi.spyOn(db.query.requests, 'findFirst')
       .mockResolvedValueOnce(undefined)
       .mockResolvedValueOnce(undefined);
     vi.spyOn(db, 'insert').mockImplementation(() => {
-      throw new Error('UNIQUE constraint failed: requests.user_id, requests.asin');
+      throw original;
     });
 
     const svc = new RequestService(db, client, policy());
-    await expect(svc.create(user.id, body('B1'))).rejects.toThrow('UNIQUE constraint failed');
+    await expect(svc.create(user.id, body('B1'))).rejects.toBe(original);
   });
 });
 

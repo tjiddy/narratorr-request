@@ -259,7 +259,23 @@ describe('UserService createIdentity unique-violation race', () => {
     vi.restoreAllMocks();
   });
 
-  it('resolves a unique violation to the existing identity (created=false)', async () => {
+  it('resolves a REAL unique violation to the existing identity (created=false)', async () => {
+    // No insert spy: the seeded identity makes the real idx_users_provider_subject index
+    // fire, so this proves the classifier against an actual drizzle error (whose top-level
+    // message never names the constraint), not a synthetic one.
+    const existing = await insertUser(db, {
+      provider: 'local',
+      subject: 'todd@example.com',
+      username: 'todd',
+    });
+
+    // createLocalUser() lowercases + trims the email into authSubject, so this collides.
+    const result = await svc.createLocalUser({ email: 'Todd@Example.com', passwordHash: 'h' });
+    expect(result.created).toBe(false);
+    expect(result.user.id).toBe(existing.id); // re-queried via findByIdentity, not a new signup
+  });
+
+  it('resolves a synthetic unique violation too (fast shape check)', async () => {
     const existing = await insertUser(db, {
       provider: 'local',
       subject: 'todd@example.com',
@@ -271,7 +287,7 @@ describe('UserService createIdentity unique-violation race', () => {
 
     const result = await svc.createLocalUser({ email: 'Todd@Example.com', passwordHash: 'h' });
     expect(result.created).toBe(false);
-    expect(result.user.id).toBe(existing.id); // re-queried via findByIdentity, not a new signup
+    expect(result.user.id).toBe(existing.id);
   });
 
   it('re-throws a non-unique error unchanged (the catch does not swallow it)', async () => {
@@ -282,14 +298,18 @@ describe('UserService createIdentity unique-violation race', () => {
     await expect(svc.createLocalUser({ email: 'todd@example.com', passwordHash: 'h' })).rejects.toThrow('boom');
   });
 
-  it('re-throws the original unique error when the re-query finds no identity (no silent null)', async () => {
+  it('re-throws the ORIGINAL unique error object when the re-query finds no identity (no silent null)', async () => {
     // No seeded identity → findByIdentity misses after the matched violation → fallthrough.
-    vi.spyOn(db, 'insert').mockImplementation(() => {
-      throw new Error('UNIQUE constraint failed: users.auth_provider, users.auth_subject');
+    // The sentinel is drizzle-shaped (constraint text only on the cause) and identity-checked
+    // with toBe: re-wrapping it in a fresh Error with the same message would discard the
+    // driver's type/cause chain while still satisfying a message-only assertion.
+    const original = new Error('Failed query: insert into "users" (...) values (...) returning ...', {
+      cause: new Error('SQLITE_CONSTRAINT: UNIQUE constraint failed: users.auth_provider, users.auth_subject'),
     });
-    await expect(svc.createLocalUser({ email: 'ghost@x.com', passwordHash: 'h' })).rejects.toThrow(
-      'UNIQUE constraint failed',
-    );
+    vi.spyOn(db, 'insert').mockImplementation(() => {
+      throw original;
+    });
+    await expect(svc.createLocalUser({ email: 'ghost@x.com', passwordHash: 'h' })).rejects.toBe(original);
   });
 });
 

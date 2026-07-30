@@ -5,6 +5,8 @@
  * collision classifier are all decisions a test should be able to make without a socket or a DB.
  */
 
+import { causeChainMessages } from '../util/db.js';
+
 /** Hard cap on the RAW upstream EPUB we will ship. Amazon's own personal-document limit. */
 export const MAX_KINDLE_SEND_BYTES = 25 * 1024 * 1024;
 
@@ -84,20 +86,6 @@ export function sendBudgetMs(input: {
  */
 const ACTIVE_COLLISION_RE =
   /UNIQUE constraint failed:[^\n]*\bkindle_sends\.user_id\b[^\n]*\bkindle_sends\.book_id\b/i;
-
-/**
- * Every message in an error's CAUSE CHAIN, one per line.
- *
- * Walking the chain is required, not defensive: drizzle wraps a rejected statement in a
- * `Failed query: insert into "kindle_sends" …` error and hangs the libSQL error — the one that
- * actually names the constraint — off `cause`. A classifier that read only `err.message` would
- * never match a REAL collision, only a synthetic one in a unit test.
- */
-function causeChainMessages(err: unknown, depth = 0): string {
-  if (depth > 5) return '';
-  if (!(err instanceof Error)) return err === null || err === undefined ? '' : String(err);
-  return `${err.message}\n${causeChainMessages(err.cause, depth + 1)}`;
-}
 
 export function isActiveKindleSendCollision(err: unknown): boolean {
   // A RangeError is a value/programmer error, never a constraint breach.
