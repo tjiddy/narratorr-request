@@ -636,6 +636,21 @@ describe('handoff failure reasons (friendly per-code add-handoff errors)', () =>
     expect(row?.failureReason).toBe('some_new_code: a brand new reason');
   });
 
+  it('persists the NON_JSON fallback copy for a BODILESS terminal add failure (#171)', async () => {
+    // Since #171 a bodiless non-2xx classifies as NON_JSON rather than HTTP_<status>, so this
+    // row's copy changed. It is pinned here so it can never drift silently again: the terminal
+    // classification keys on `upstreamStatus` (422), which the change preserves, and
+    // `handoffFailureReason()` deliberately gains no NON_JSON special case — both strings are
+    // the same raw-code fallback for a response narratorr is not supposed to produce.
+    const admin = await insertUser(db, { role: 'admin' });
+    client.throwOnAdd = new NarratorrError(422, 'NON_JSON', 'Narratorr POST /api/v1/books returned an empty body');
+    const svc = new RequestService(db, client, policy());
+    await expect(svc.create(admin.id, body('B1'))).rejects.toBeInstanceOf(NarratorrError);
+    const [row] = await db.select().from(requests).where(eq(requests.asin, 'B1'));
+    expect(row?.status).toBe('failed');
+    expect(row?.failureReason).toBe('NON_JSON: Narratorr POST /api/v1/books returned an empty body');
+  });
+
   it('uses the generic fallback reason for a non-NarratorrError terminal throw', async () => {
     const admin = await insertUser(db, { role: 'admin' });
     client.throwOnAdd = new Error('db exploded');
