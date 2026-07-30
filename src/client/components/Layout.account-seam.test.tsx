@@ -55,9 +55,7 @@ const jsonRes = (status: number, payload: unknown): Response =>
   }) as unknown as Response;
 
 beforeEach(() => {
-  // `Layout` mounts `useTheme`, which falls back to the OS preference; jsdom implements no
-  // `matchMedia`. Nothing here turns on the theme — this just lets the real Layout render.
-  vi.stubGlobal('matchMedia', vi.fn(() => ({ matches: false })));
+  // `matchMedia` (which `Layout` needs for useTheme) comes from the shared jsdom setup stub.
   vi.stubGlobal(
     'fetch',
     vi.fn((input: RequestInfo | URL) => {

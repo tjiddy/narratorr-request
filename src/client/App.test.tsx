@@ -62,12 +62,7 @@ function MeProbe() {
 
 /** Boot the signed-in app, then make `GET /api/me` fail with the given response and refetch it. */
 async function bootThenFailRefetch(failure: Response) {
-  // `Layout` mounts `useTheme`, which reads `prefers-color-scheme` — jsdom implements no media
-  // queries at all, so without this the signed-in branch throws before anything can be asserted.
-  vi.stubGlobal(
-    'matchMedia',
-    vi.fn(() => ({ matches: false, addEventListener: () => {}, removeEventListener: () => {} })),
-  );
+  // `matchMedia` (which `Layout` needs for useTheme) comes from the shared jsdom setup stub.
   let meResponse = () => jsonRes(200, ME);
   vi.stubGlobal(
     'fetch',
