@@ -108,13 +108,21 @@ function LocalAuthForm() {
       >
         {auth.isPending ? '…' : mode === 'login' ? 'Sign in' : 'Create account'}
       </button>
+      {/* Disabled while an attempt is in flight (#201 F2). `auth.reset()` DETACHES this observer
+          from the still-running mutation and republishes an idle result, so leaving it live would
+          drop `isPending` mid-flight and re-enable Submit above — letting a second credentials POST
+          go out at a rate-limited route while the first is still settling. The stranded-session
+          hazard that made this urgent is fixed in `reconcileMeWrite` (it cancels before
+          invalidating, so the last settlement always reads fresh); this keeps the form itself to
+          one attempt at a time. */}
       <button
         type="button"
+        disabled={auth.isPending}
         onClick={() => {
           setMode((m) => (m === 'login' ? 'signup' : 'login'));
           auth.reset();
         }}
-        className="text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
+        className="text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline disabled:opacity-50"
       >
         {mode === 'login' ? 'Need an account? Sign up' : 'Have an account? Sign in'}
       </button>

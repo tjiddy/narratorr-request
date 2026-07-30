@@ -110,19 +110,91 @@ export const keepSameListData =
 export const useMe = () =>
   useQuery({ queryKey: qk.me, queryFn: getMe, retry: false, staleTime: 60_000 });
 
+/**
+ * Re-read the caller's own row from the server. The shared reconciler for the two mutations whose
+ * settlement key set is EXACTLY `qk.me` — the account save ({@link useUpdateMe}) and local
+ * signup/login ({@link useLocalAuth}). Nothing else here reconciles that exact set:
+ * {@link useRequestBook} also touches `qk.me` but pairs it with `qk.myRequests`, so it stays inline
+ * rather than being bent through this helper.
+ *
+ * Always from `onSettled`, on BOTH outcomes. Neither route's failure is evidence that nothing was
+ * written — `PATCH /api/me` applies its three fields as independent writes before a shared, fallible
+ * DTO tail, and the local-auth routes set the session cookie before the client has finished reading
+ * the response. Refetching after a genuine 4xx costs one GET returning the unchanged row; that is the
+ * cheap direction, and a client cannot tell from a status code which failures committed.
+ *
+ * Convergence under concurrency: the LAST settlement's read is the one that lands, for every caller
+ * and every cache state. CANCEL-THEN-INVALIDATE is what makes that unconditional, and the order is
+ * load-bearing (#201 F2) — `invalidateQueries` ALONE is not enough. `Query.fetch` reads:
+ *
+ *     if (this.state.data !== undefined && fetchOptions?.cancelRefetch) this.cancel({ silent: true })
+ *     else if (this.#retryer) { this.#retryer.continueRetry(); return this.#retryer.promise }
+ *
+ * so its supersession arm is gated on the key ALREADY HOLDING DATA. Where it does (the account
+ * modal — it only renders inside the authenticated shell, so `qk.me` is populated by construction) a
+ * bare invalidation is genuinely last-writer-wins. Where it does NOT — the login screen, where
+ * `qk.me` is a data-less 401 — a second invalidation issues no request at all and silently adopts
+ * the in-flight read's promise, so a read taken BEFORE the session cookie existed is what resolves
+ * into the cache: a valid session stranded behind the login screen.
+ *
+ * `queryClient.cancelQueries` has no such gate (`Query.cancel` → `retryer.cancel`, independent of
+ * `data`), so cancelling first returns the query to `idle` and the invalidation below always issues
+ * a FRESH read. That moves the guarantee from the UI layer into the cache layer: it no longer
+ * depends on any consumer holding a submit lock open, which is what #201 F1's pending boundary
+ * relied on and what F2 showed a single `auth.reset()` could bypass.
+ *
+ * `{ silent: true }` matches the library's own supersession call: the cancelled read must not
+ * publish an error state on its way out, because it is not an outcome the user should ever see —
+ * the fresh read decides. Awaiting is safe: `cancelQueries` resolves through `.then(noop).catch(noop)`
+ * and `refetchQueries` catches each query's rejection, so neither can reject a settled mutation into
+ * a failed one.
+ *
+ * `getMe()` still doesn't consume the query's abort signal, so a cancelled read's HTTP request runs
+ * to completion — cancellation discards its RESULT, it doesn't save the round-trip. Each settlement
+ * costs its own GET; they don't coalesce on the wire.
+ */
+async function reconcileMeWrite(qc: ReturnType<typeof useQueryClient>): Promise<void> {
+  await qc.cancelQueries({ queryKey: qk.me }, { silent: true });
+  await qc.invalidateQueries({ queryKey: qk.me });
+}
+
 /** The account modal's self-scoped save (issue #131). Backs three callers — the explicit contact-email
  *  Save, the explicit Kindle-address Save (#142), and the instant-apply notification checkboxes — each
  *  PATCHing `/api/me` through its OWN instance, so two saves can be in flight at once. Folds the fresh
  *  MeDto into the `me` cache so the control reflects the new state immediately, via `mergeMeCache`:
  *  a response is authoritative only for the fields its own body wrote, so an earlier request settling
- *  last can't roll back a newer sibling save (#142 F1). Still a direct cache write, not an
- *  invalidate — no refetch round-trip. Success feedback is proportional to the payload via
- *  `meSuccessToast` (#134): an address save acknowledges, a notifyOn-only toggle is silent (the
- *  persisted checkbox is the confirmation). Errors always toast. */
+ *  last can't roll back a newer sibling save (#142 F1). Success feedback is proportional to the payload
+ *  via `meSuccessToast` (#134): an address save acknowledges, a notifyOn-only toggle is silent (the
+ *  persisted checkbox is the confirmation). Errors always toast.
+ *
+ *  The merge is kept AND a settlement re-read is added — the one hook here that does both, because
+ *  the two answer different questions:
+ *    • `PATCH /api/me` applies `email`, `kindleEmail` and `notifyOn` as THREE independent writes and
+ *      only then re-reads and builds its DTO through `buildMeDto()` (which awaits `quotaUsage()` and
+ *      `getNotificationsConfig()`). So a multi-field save can PARTIALLY commit, and a fully-committed
+ *      save can still 500 in that shared tail. The merge never runs on those paths, so without a
+ *      settlement refetch the cache keeps pre-write values for a write that landed.
+ *    • The merge stays FIRST on the success path: the row updates without waiting for a round-trip,
+ *      and the trailing GET returns the same values (structural sharing keeps the reference stable),
+ *      so it costs a request, not a re-render storm.
+ *  The invalidation runs unconditionally on BOTH outcomes — deliberately, not only on failure.
+ *  Reconciling just the error path would let an error-triggered GET issued BEFORE a sibling's commit
+ *  settle AFTER that sibling's merge and replace the whole entry: the exact #142 rollback the merge
+ *  exists to prevent. Invalidating on every settlement makes the last settler's GET the last word
+ *  (see {@link reconcileMeWrite} for the cancellation mechanic). The cost is one extra `GET /api/me`
+ *  per save, including each instant-apply notification checkbox.
+ *
+ *  The reconciliation is deliberately FIRE-AND-FORGET here (the explicit `void`), unlike
+ *  {@link useLocalAuth}. That is now purely a PENDING-STATE choice, not a correctness one:
+ *  `reconcileMeWrite` cancels before invalidating, so the last settlement's read wins whether or not
+ *  anyone awaits it. Each row's Save is gated on its own `isPending`, and holding a button locked
+ *  after its write has already settled and its merge has already repainted the row would be a
+ *  regression in feel for no benefit. */
 export function useUpdateMe() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (body: UpdateMeBody) => updateMe(body),
+    onSettled: () => void reconcileMeWrite(qc),
     onSuccess: (dto, body) => {
       qc.setQueryData<MeDto>(qk.me, (prev) => mergeMeCache(prev, dto, body));
       const message = meSuccessToast(body);
@@ -173,14 +245,36 @@ export const useAdminQueue = (status: RequestStatus | undefined, limit: number) 
   });
 };
 
+/**
+ * Search's request action. Reconciles from `onSettled`, NEVER `onSuccess`.
+ *
+ * `POST /api/requests` commits before a fallible tail: `RequestService.create()` INSERTS the row and
+ * only then, for an auto-approving requester, calls `handoff()` — which rethrows after either marking
+ * the row `failed` (terminal upstream refusal) or leaving it `approved` (transient failure, later
+ * repaired by the status poller's stranded-handoff sweep). Both answer the route non-2xx over a row
+ * that is durably in the database, so a success-only reconciliation strands the SPA on pre-write
+ * state for a request that actually landed.
+ *
+ * BOTH keys, on both outcomes:
+ *   • `qk.myRequests` — the list Search badges against. It self-heals anyway (the list hooks poll at
+ *     4s), so this only closes the window; it is not what makes the settlement conversion necessary.
+ *   • `qk.me` — the load-bearing one. An `approved` row occupies a quota slot
+ *     (`OPEN_REQUEST_STATUSES`, counted by `countInWindow`), yet `useMe` has no `refetchInterval` and
+ *     a 60s `staleTime`: a stale mark schedules no refetch. Without this, a transient handoff failure
+ *     leaves `QuotaMeter` under-reporting usage on Search and My Requests with nothing to repair it.
+ * The key set differs from every other mutation here, so the invalidations stay inline rather than
+ * being forced through a shared reconciler.
+ */
 export function useRequestBook() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (result: V1AudibleResult) => requestBookFrom(result),
-    onSuccess: (req) => {
-      toast.success(req.status === 'available' ? `“${req.title}” is already available!` : `Requested “${req.title}”`);
+    onSettled: () => {
       void qc.invalidateQueries({ queryKey: qk.myRequests });
       void qc.invalidateQueries({ queryKey: qk.me });
+    },
+    onSuccess: (req) => {
+      toast.success(req.status === 'available' ? `“${req.title}” is already available!` : `Requested “${req.title}”`);
     },
     onError: (err) => toast.error(err instanceof ApiError ? err.message : 'Request failed'),
   });
@@ -201,26 +295,52 @@ export const useUserRequests = (publicId: string, limit: number) => {
   });
 };
 
+/**
+ * The Users table's role/status/quota edit. Reconciles `qk.users` from `onSettled`, on both outcomes.
+ *
+ * `PATCH /api/admin/users/:publicId` has no server-side post-commit tail — `UserService.updateUser()`
+ * is a single atomic `UPDATE … RETURNING`. The residual is the generic one: the write commits and the
+ * client still rejects, because the RESPONSE was lost or unreadable (`parse()` in `api.ts` throws
+ * `NON_JSON` on a body it cannot parse, and a dropped connection rejects the `fetch` itself).
+ *
+ * That weaker premise carries the highest staleness cost of the four: `useUsers` has no
+ * `refetchInterval` and no `staleTime` override, so nothing repairs this key on a schedule — a lost
+ * response would strand the Users table (and the `qk.userRequests` pages nested under the same
+ * prefix) on the pre-write row until a remount or a window refocus. One key, so it stays inline.
+ */
 export function useUpdateUser() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (v: { publicId: string; patch: UpdateUserBody }) => updateUser(v.publicId, v.patch),
+    onSettled: () => void qc.invalidateQueries({ queryKey: qk.users }),
     onSuccess: (user) => {
       toast.success(`Saved changes to ${user.username}`);
-      void qc.invalidateQueries({ queryKey: qk.users });
     },
     onError: (err) => toast.error(err instanceof ApiError ? err.message : 'Failed to update user'),
   });
 }
 
+/**
+ * The admin queue's approve/deny. Reconciles `qk.adminRequests` from `onSettled`, on both outcomes.
+ *
+ * `POST /api/admin/requests/:publicId/decision` commits before a fallible tail too:
+ * `RequestService.decide()` ATOMICALLY CLAIMS the status (`UPDATE … WHERE status = 'pending'`) and
+ * only then emits the decision email and calls `handoff()`, which can rethrow over a decision that
+ * is already durable; the route can also 404 afterwards if the requester row is missing.
+ *
+ * Lower urgency than the others — `useAdminQueue` polls at 5s, so the queue repairs itself either
+ * way — but the conversion is one line and it removes the window in which an admin watches a request
+ * they just approved still sitting in `pending`. `qk.adminRequests` is the prefix of every queue key
+ * variant, so one invalidation refetches every loaded page/filter; a single key, so it stays inline.
+ */
 export function useDecide() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (v: { publicId: string; action: 'approve' | 'deny'; note?: string }) =>
       decideRequest(v.publicId, v.action, v.note),
+    onSettled: () => void qc.invalidateQueries({ queryKey: qk.adminRequests }),
     onSuccess: (req, v) => {
       toast.success(v.action === 'approve' ? `Approved “${req.title}”` : `Denied “${req.title}”`);
-      void qc.invalidateQueries({ queryKey: qk.adminRequests });
     },
     onError: (err) => toast.error(err instanceof ApiError ? err.message : 'Action failed'),
   });
@@ -450,14 +570,50 @@ export function useTestNotifier() {
 export const useAuthProviders = () =>
   useQuery({ queryKey: qk.authProviders, queryFn: getAuthProviders, staleTime: Infinity, retry: false });
 
-/** Local signup/login. On success the server set a session cookie — refetch `me` so
- *  App routes to the app (or the pending screen). Errors surface on the form, not a toast. */
+/**
+ * Local signup/login. Refetches `me` so App routes to the app (or the pending screen) once the
+ * server has minted a session. Errors surface on the form, not a toast — that is unchanged.
+ *
+ * Reconciles from `onSettled`, not `onSuccess`, for the same lost-response reason as
+ * {@link useUpdateUser}: both routes call `setSessionCookie(reply, …)` BEFORE the response body is
+ * produced, and the client can still reject while reading or parsing that response (`parse()` throws
+ * `NON_JSON` on a body it cannot read). A rejected signup/login would then leave a VALID SESSION
+ * behind an unchanged login screen until the tab was reloaded — nothing else refetches `qk.me` on
+ * this screen. Re-reading on settlement recovers straight into the app instead.
+ *
+ * A genuinely failed login (bad password, no session) simply re-reads a 401, which leaves the login
+ * screen rendered — see `resolveMeShell` state 3.
+ *
+ * THE STRANDING HAZARD THIS SCREEN OWNS (#201 F1/F2). Here `qk.me` is a data-less 401, the one state
+ * in which `invalidateQueries` cannot supersede an in-flight read — it issues no request and adopts
+ * the running one instead. So a corrected retry that overlaps the failed attempt's reconciliation
+ * read would be answered by a GET taken BEFORE the session cookie existed: the user holds a valid
+ * session and keeps looking at the login screen, with nothing scheduled to repair it (`useMe` has no
+ * `refetchInterval`, and a `staleTime` lapse only MARKS stale).
+ *
+ * That is fixed IN {@link reconcileMeWrite}, which cancels before invalidating, so this settlement's
+ * read is always a fresh one that sees the cookie — no matter what else is in flight and no matter
+ * what the UI is doing. Correctness does NOT depend on the two locks below; they are ordering and
+ * double-submit hygiene on top of it. The earlier version of this fix relied on the submit lock
+ * alone, and F2 found the bypass: `auth.reset()` from the mode switch detaches the observer from the
+ * still-running mutation and republishes an idle result, so `isPending` drops to false while the
+ * read is still open. Any future consumer that unmounts, resets, or simply forgets to gate would
+ * reopen it just as easily — which is why the guarantee belongs in the cache layer, not the form.
+ *
+ * `onSettled` still RETURNS the promise, so the mutation stays `pending` until the read settles
+ * (TanStack awaits `options.onSettled` on both paths before dispatching the terminal state). Two
+ * reasons to keep it, both about behavior rather than correctness: `LoginPage`'s submit and mode
+ * switch are `disabled={auth.isPending}`, so one attempt is in flight at a time and the form cannot
+ * fire a second credentials POST at a rate-limited route; and the pending state now spans the read
+ * the app must complete before it can render anything, so the spinner ends when the app appears
+ * rather than a beat early. The account save voids the same promise — see {@link useUpdateMe}.
+ */
 export function useLocalAuth(mode: 'login' | 'signup') {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (v: { email: string; password: string }) =>
       (mode === 'login' ? localLogin : localSignup)(v.email, v.password),
-    onSuccess: () => qc.invalidateQueries({ queryKey: qk.me }),
+    onSettled: () => reconcileMeWrite(qc),
   });
 }
 
