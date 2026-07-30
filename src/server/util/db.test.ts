@@ -12,6 +12,33 @@ import { publicId } from './ids.js';
 const FORGED_PARAMS =
   'rq_x,4242,B1,UNIQUE constraint failed: kindle_sends.user_id, kindle_sends.book_id,pending';
 
+/** The `(message, code, rawCode)` triple of every link of a cause chain, outermost first. */
+function chainShape(err: unknown): Array<{ message: unknown; code: unknown; rawCode: unknown }> {
+  const levels: Array<{ message: unknown; code: unknown; rawCode: unknown }> = [];
+  let link: unknown = err;
+  while (link !== null && typeof link === 'object' && levels.length < 6) {
+    const l = link as { message?: unknown; code?: unknown; rawCode?: unknown; cause?: unknown };
+    levels.push({ message: l.message, code: l.code, rawCode: l.rawCode });
+    link = l.cause;
+  }
+  return levels;
+}
+
+/** A REAL duplicate-insert rejection from the driver — the shape everything else is measured against. */
+async function realDuplicateInsertError(): Promise<unknown> {
+  const db = await createTestDb();
+  await insertUser(db, { provider: 'local', subject: 'a@b.com' });
+  try {
+    await db
+      .insert(users)
+      .values({ publicId: publicId('us'), authProvider: 'local', authSubject: 'a@b.com', username: 'dupe' })
+      .returning();
+  } catch (err: unknown) {
+    return err;
+  }
+  throw new Error('the duplicate insert did not reject');
+}
+
 describe('causeChainMessages', () => {
   it('joins every message in the chain, one per line', () => {
     expect(causeChainMessages(new Error('outer', { cause: new Error('inner') }))).toBe('outer\ninner\n');
@@ -109,6 +136,9 @@ describe('hasSqliteRawCode — the structural chain walk', () => {
       return err;
     };
     expect(hasSqliteRawCode(buildChain(5), SQLITE_CONSTRAINT_UNIQUE)).toBe(true);
+    // Depth 6 is the EXACT forbidden boundary, and asserting it is what makes the cutoff
+    // mutation-sensitive: the 5-true/7-false pair alone is satisfied by `depth > 6` too.
+    expect(hasSqliteRawCode(buildChain(6), SQLITE_CONSTRAINT_UNIQUE)).toBe(false);
     expect(hasSqliteRawCode(buildChain(7), SQLITE_CONSTRAINT_UNIQUE)).toBe(false);
   });
 
@@ -121,18 +151,7 @@ describe('hasSqliteRawCode — the structural chain walk', () => {
 
 describe('isUniqueViolation', () => {
   it('classifies a REAL drizzle/libSQL duplicate insert as a unique violation', async () => {
-    const db = await createTestDb();
-    await insertUser(db, { provider: 'local', subject: 'a@b.com' });
-
-    let caught: unknown;
-    try {
-      await db
-        .insert(users)
-        .values({ publicId: publicId('us'), authProvider: 'local', authSubject: 'a@b.com', username: 'dupe' })
-        .returning();
-    } catch (err: unknown) {
-      caught = err;
-    }
+    const caught = await realDuplicateInsertError();
 
     expect(caught).toBeInstanceOf(Error);
     expect(isUniqueViolation(caught)).toBe(true);
@@ -245,5 +264,64 @@ describe('isUniqueViolation', () => {
     let err: Error = Object.assign(new Error('l7'), { rawCode: SQLITE_CONSTRAINT_UNIQUE });
     for (let i = 6; i >= 0; i -= 1) err = new Error(`l${i}`, { cause: err });
     expect(isUniqueViolation(err)).toBe(false);
+  });
+});
+
+describe('drizzleConstraintError — the synthetic driver shape the whole suite rests on', () => {
+  const DRIVER_MESSAGE = 'UNIQUE constraint failed: users.auth_provider, users.auth_subject';
+  const built = drizzleConstraintError({
+    rawCode: SQLITE_CONSTRAINT_UNIQUE,
+    code: 'SQLITE_CONSTRAINT_UNIQUE',
+    driverMessage: DRIVER_MESSAGE,
+    table: 'users',
+    params: 'us_x,local,a@b.com,dupe',
+  });
+
+  // Every classifier consumer can be satisfied by L1 alone, so without this block the inner
+  // sqlite link could be dropped or mis-shaped and the entire suite would stay green.
+  it('builds all THREE levels, each carrying exactly the fields its real counterpart does', () => {
+    const [l0, l1, l2, ...beyond] = chainShape(built);
+    expect(beyond).toEqual([]); // exactly three links — no deeper tail
+
+    // L0 — drizzle's own wrapper: the statement plus the echoed params, and NO driver fields.
+    // Its message must NOT name the constraint; that is what the param-echo defect exploited.
+    expect(l0?.message).toContain('Failed query: insert into "users"');
+    expect(l0?.message).toContain('\nparams: us_x,local,a@b.com,dupe');
+    expect(l0?.message).not.toMatch(/UNIQUE constraint failed/);
+    expect(l0?.code).toBeUndefined();
+    expect(l0?.rawCode).toBeUndefined();
+
+    // L1 — libSQL's wrapper: the GENERIC code spelling, prefixed message, extended rawCode.
+    expect(l1).toEqual({
+      message: `SQLITE_CONSTRAINT: ${DRIVER_MESSAGE}`,
+      code: 'SQLITE_CONSTRAINT',
+      rawCode: SQLITE_CONSTRAINT_UNIQUE,
+    });
+
+    // L2 — the inner sqlite error: the EXTENDED code spelling, the bare driver message, and
+    // the SAME rawCode. This is the link no classifier test would miss if it vanished.
+    expect(l2).toEqual({
+      message: DRIVER_MESSAGE,
+      code: 'SQLITE_CONSTRAINT_UNIQUE',
+      rawCode: SQLITE_CONSTRAINT_UNIQUE,
+    });
+  });
+
+  it('reproduces what a REAL libSQL duplicate insert produces, level for level', async () => {
+    // The drift guard: asserting the factory against literals only proves it matches ITSELF.
+    // Diffing it against the driver is what catches a libSQL upgrade that renumbers `rawCode`,
+    // renames a code spelling, or collapses the chain — the fixture would otherwise keep
+    // certifying a shape production no longer produces.
+    const realShape = chainShape(await realDuplicateInsertError());
+    expect(realShape).toHaveLength(3);
+
+    // L1 and L2 must match the factory EXACTLY — same messages, same code spellings, same codes.
+    expect(realShape.slice(1)).toEqual(chainShape(built).slice(1));
+
+    // L0 differs only in the generated SQL/params text; its FIELD shape must still agree.
+    expect(realShape[0]?.code).toBeUndefined();
+    expect(realShape[0]?.rawCode).toBeUndefined();
+    expect(realShape[0]?.message).toMatch(/^Failed query: insert into "users"/);
+    expect(realShape[0]?.message).toMatch(/\nparams: /);
   });
 });
