@@ -78,8 +78,9 @@ function testContext(event: NotificationEvent, publicUrl: string | null): SendCo
 
 /**
  * The resolved (plaintext) secret values in a candidate notifier config — passed to
- * redact() so a Test error embedding a token/key/capability-URL never reaches the admin
- * raw. Walks the registry's secret metadata, so it covers every type without a per-type branch.
+ * describeSendFailure() (and through it to redact()) so a Test error embedding a
+ * token/key/capability-URL never reaches the admin raw on the fallback path. Walks the
+ * registry's secret metadata, so it covers every type without a per-type branch.
  */
 function candidateSecrets(candidate: { type: NotifierType; config: Record<string, unknown> }): string[] {
   return NOTIFIER_REGISTRY[candidate.type].secretFields
