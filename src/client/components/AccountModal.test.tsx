@@ -378,27 +378,33 @@ describe('AccountModal — Amazon allowlist education (#149)', () => {
     ['an address already saved', 'device@kindle.com'],
     // The SETUP-time teaching moment: it must be there before there is anything to teach about.
     ['no address saved yet', null],
-  ])('renders the link and the expander with %s', async (_label, kindleEmail) => {
+  ])('renders the expander (the whole education folds inside it) with %s', async (_label, kindleEmail) => {
+    const user = userEvent.setup();
     await renderModal({ kindleEmail });
 
-    expect(link()).toBeInTheDocument();
+    // One quiet row at rest (UAT de-busying): the link lives INSIDE the disclosure now.
     expect(expander()).toBeInTheDocument();
+    expect(link()).toBeNull();
+
+    await user.click(expander()!);
+    expect(link()).toBeInTheDocument();
   });
 
-  it('renders them beside the KINDLE row, not the contact-email row', async () => {
+  it('renders it beside the KINDLE row, not the contact-email row', async () => {
     await renderModal({ kindleEmail: null });
 
     // Each row is `<div><div class="flex items-end">…input…</div><p>error|help</p></div>`; the
     // education is a sibling of that row inside a shared wrapper.
     const kindleGroup = kindleInput().closest('div')?.parentElement?.parentElement;
     const emailRow = emailInput().closest('div')?.parentElement;
-    expect(kindleGroup).toContainElement(link());
     expect(kindleGroup).toContainElement(expander());
-    expect(emailRow).not.toContainElement(link());
+    expect(emailRow).not.toContainElement(expander());
   });
 
   it('opens the deep link in a new tab with both rel tokens', async () => {
+    const user = userEvent.setup();
     await renderModal({ kindleEmail: null });
+    await user.click(expander()!);
 
     expect(link()).toHaveAttribute('href', AMAZON_APPROVED_LIST_URL);
     expect(link()).toHaveAttribute('target', '_blank');
@@ -437,8 +443,9 @@ describe('AccountModal — Amazon allowlist education (#149)', () => {
 
     // The help copy is gone (the existing error/help swap, untouched) — the education is not.
     expect(screen.queryByText(KINDLE_EMAIL_HELP)).not.toBeInTheDocument();
-    expect(link()).toBeInTheDocument();
     expect(expander()).toBeInTheDocument();
+    await user.click(expander()!);
+    expect(link()).toBeInTheDocument();
   });
 
   it('leaves the existing help/error swap exactly as it was', async () => {
@@ -553,14 +560,18 @@ describe('AccountModal — sectioned groups + features gating (#193)', () => {
     await screen.findByLabelText('Email');
     await waitFor(() => expect(screen.queryByRole('heading', { name: 'eBooks' })).not.toBeInTheDocument());
     expect(screen.queryByLabelText('Kindle address')).not.toBeInTheDocument();
-    expect(screen.queryByText(AMAZON_APPROVED_LIST_LINK_LABEL)).not.toBeInTheDocument();
+    // The EXPANDER, not the link: since the de-busying fold the link is never at rest anywhere,
+    // so a link-absence assertion would pass even with the feature on (a vacuous absence).
+    expect(screen.queryByRole('button', { name: AMAZON_APPROVED_LIST_DISCLOSURE_LABEL })).not.toBeInTheDocument();
     // The Audiobooks half is unaffected.
     expect(screen.getByText('Email me when my request is')).toBeInTheDocument();
   });
 
-  it('names the SENDER mailbox in the education when features carry it', async () => {
+  it('names the SENDER mailbox inside the expanded education when features carry it', async () => {
+    const user = userEvent.setup();
     featuresRes = { ebooksEnabled: true, kindleDeliveryAvailable: true, kindleSenderEmail: 'bot@household.dev' };
     await renderModal();
+    await user.click(screen.getByRole('button', { name: AMAZON_APPROVED_LIST_DISCLOSURE_LABEL }));
 
     // The named-sender line: the address Amazon approves is the system's From…
     const sender = await screen.findByText('bot@household.dev');
@@ -573,8 +584,10 @@ describe('AccountModal — sectioned groups + features gating (#193)', () => {
   });
 
   it('omits the named-sender line when no sender is configured, keeping the generic label', async () => {
+    const user = userEvent.setup();
     featuresRes = { ebooksEnabled: true, kindleDeliveryAvailable: false, kindleSenderEmail: null };
     await renderModal();
+    await user.click(screen.getByRole('button', { name: AMAZON_APPROVED_LIST_DISCLOSURE_LABEL }));
 
     expect(screen.queryByText(/Amazon must allow mail from/)).not.toBeInTheDocument();
     expect(screen.getByRole('link', { name: AMAZON_APPROVED_LIST_LINK_LABEL })).toBeInTheDocument();

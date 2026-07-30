@@ -25,8 +25,13 @@ export const AMAZON_APPROVED_LIST_URL = 'https://www.amazon.com/hz/mycd/myx#/hom
  */
 export const AMAZON_APPROVED_LIST_LINK_LABEL = 'Add the sender address to Amazon’s approved list ↗';
 
-/** The disclosure trigger — collapsed by default at both sites. */
-export const AMAZON_APPROVED_LIST_DISCLOSURE_LABEL = 'Where is that?';
+/**
+ * The disclosure trigger — collapsed by default at both sites. Since the UAT de-busying pass
+ * (2026-07-29) the disclosure contains the ENTIRE education (named sender, deep link, click
+ * path), so its label must say what's inside, not "Where is that?" relative to a link that no
+ * longer sits above it.
+ */
+export const AMAZON_APPROVED_LIST_DISCLOSURE_LABEL = 'Approve the sender at Amazon';
 
 /**
  * The full click path, in order. Rendered inside the disclosure panel; the last step is the one

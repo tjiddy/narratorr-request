@@ -575,8 +575,10 @@ describe('EbookSheet — State A (an address saved, delivery available)', () => 
     await renderSheet();
 
     expect(screen.getByText(`Sends to ${MASKED_ADDRESS} · arrives from ${SENDER}`)).toBeInTheDocument();
-    expect(allowlistLink()).toBeInTheDocument();
+    // One quiet row (UAT de-busying): the link folded inside the disclosure, so at rest only
+    // the trigger shows — the caption above already names the sender.
     expect(expanderTrigger()).toBeInTheDocument();
+    expect(allowlistLink()).toBeNull();
   });
 
   it('NEVER puts the full Kindle address in the sheet’s DOM — text or attribute', async () => {
@@ -816,6 +818,7 @@ describe('EbookSheet — reads me and features LIVE while it stays open', () => 
 describe('EbookSheet — the Amazon allowlist education', () => {
   it('opens the deep link in a new tab, with both rel tokens', async () => {
     await renderSheet();
+    await userEvent.click(expanderTrigger()!);
     const link = allowlistLink()!;
 
     expect(link).toHaveAttribute('href', AMAZON_APPROVED_LIST_URL);
