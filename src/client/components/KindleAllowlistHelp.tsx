@@ -18,9 +18,27 @@ import {
  * the destination is external and outside our control, and `noopener` is what stops it reaching
  * back through `window.opener`.
  */
-export function KindleAllowlistHelp({ className }: { className?: string | undefined }) {
+export function KindleAllowlistHelp({
+  className,
+  senderEmail,
+}: {
+  className?: string | undefined;
+  /**
+   * The system's From mailbox (`/api/features`' `kindleSenderEmail`), when the caller knows it.
+   * Named outright so nobody mistakes the approval target for their own kindle.com address —
+   * the UAT misread this component's copy invited (2026-07-29). Null/omitted = line not rendered
+   * (the ebook sheet's caption already names the sender, so it passes nothing).
+   */
+  senderEmail?: string | null | undefined;
+}) {
   return (
     <div className={`flex flex-col gap-1.5${className ? ` ${className}` : ''}`}>
+      {senderEmail != null && (
+        <p className="text-xs text-muted-foreground/80">
+          Amazon must allow mail from <strong className="font-mono">{senderEmail}</strong> — your
+          Kindle address is where books arrive, not what gets approved.
+        </p>
+      )}
       <a
         href={AMAZON_APPROVED_LIST_URL}
         target="_blank"

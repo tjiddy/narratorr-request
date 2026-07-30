@@ -61,6 +61,9 @@ let patchBodies: PatchBody[];
 let serverMe: MeDto;
 /** Per-test override for how a PATCH resolves. Default: apply it the way the server would. */
 let patchResponder: (body: PatchBody) => Promise<Response>;
+/** The /api/features payload — the eBooks group is gated on `ebooksEnabled` (#193 follow-up),
+ *  so the default keeps it visible and the existing Kindle-row tests meaningful. */
+let featuresRes: { ebooksEnabled: boolean; kindleDeliveryAvailable: boolean; kindleSenderEmail: string | null };
 
 /** What the server does to an address before storing it: trim + lowercase (`kindleEmailSchema`). */
 const normalize = (value: unknown): string | null =>
@@ -80,6 +83,7 @@ function installFetchStub(): void {
     vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.startsWith('/api/auth/providers')) return Promise.resolve(jsonRes(200, { local: true, providers: [] }));
+      if (url.startsWith('/api/features')) return Promise.resolve(jsonRes(200, featuresRes));
       if (url.startsWith('/api/me')) {
         if (init?.method === 'PATCH') {
           const body = JSON.parse(String(init.body)) as PatchBody;
@@ -120,6 +124,7 @@ const emailSave = () => screen.getByRole('button', { name: 'Save email' });
 beforeEach(() => {
   patchBodies = [];
   patchResponder = applyPatch;
+  featuresRes = { ebooksEnabled: true, kindleDeliveryAvailable: false, kindleSenderEmail: null };
   installFetchStub();
 });
 afterEach(() => {
@@ -201,7 +206,7 @@ describe('AccountModal — Kindle address row (#142)', () => {
     const error = await screen.findByText('enter your Kindle address');
     // The error replaced the KINDLE row's helper copy; the contact row's is untouched.
     expect(screen.queryByText(KINDLE_EMAIL_HELP)).not.toBeInTheDocument();
-    expect(screen.getByText('Where notifications are sent.')).toBeInTheDocument();
+    expect(screen.getByText('Where request notifications are sent.')).toBeInTheDocument();
     // And it is rendered inside the KINDLE row's own container, not the contact row's. (Each row is
     // `<div><div class="flex items-end">…input…</div><p>error|help</p></div>`, so the input's nearest
     // div is the field line and its parent is the row wrapper.)
@@ -511,5 +516,67 @@ describe('AccountModal — the expanded education stays reachable on a short vie
     expect(scroller).toContainElement(screen.getByText('Enter the sender mailbox'));
     expect(scroller).toContainElement(screen.getByText(/one-time setup per Amazon account/i));
     expect(scroller).toContainElement(screen.getByRole('checkbox', { name: /approved/i }));
+  });
+});
+
+/**
+ * The #193 follow-up (UAT 2026-07-29): the modal is sectioned — Audiobooks (contact email +
+ * request-notification opt-ins) and eBooks (Kindle address + allowlist education) — the eBooks
+ * group is gated on the features payload, and the allowlist education names the SENDER mailbox,
+ * never implying the user's own kindle.com address is what Amazon approves.
+ */
+describe('AccountModal — sectioned groups + features gating (#193)', () => {
+  it('renders both group headers, with the notify opt-ins inside the Audiobooks group', async () => {
+    await renderModal();
+
+    expect(screen.getByRole('heading', { name: 'Audiobooks' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'eBooks' })).toBeInTheDocument();
+    // Structural claim, not just presence: the notify line and the contact email share the
+    // Audiobooks group's container, and the Kindle row does NOT live in it.
+    const audiobooks = screen.getByRole('heading', { name: 'Audiobooks' }).closest('div[class*="border-t"]');
+    expect(audiobooks).not.toBeNull();
+    expect(audiobooks).toContainElement(screen.getByText('Email me when my request is'));
+    expect(audiobooks).toContainElement(screen.getByLabelText('Email'));
+    expect(audiobooks).not.toContainElement(screen.getByLabelText('Kindle address'));
+  });
+
+  it('hides the entire eBooks group when the feature is off — no Kindle row, no allowlist education', async () => {
+    featuresRes = { ebooksEnabled: false, kindleDeliveryAvailable: false, kindleSenderEmail: null };
+    serverMe = { ...baseMe };
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <Harness />
+      </QueryClientProvider>,
+    );
+    // Anchor on something the modal always renders, then assert the absence.
+    await screen.findByLabelText('Email');
+    await waitFor(() => expect(screen.queryByRole('heading', { name: 'eBooks' })).not.toBeInTheDocument());
+    expect(screen.queryByLabelText('Kindle address')).not.toBeInTheDocument();
+    expect(screen.queryByText(AMAZON_APPROVED_LIST_LINK_LABEL)).not.toBeInTheDocument();
+    // The Audiobooks half is unaffected.
+    expect(screen.getByText('Email me when my request is')).toBeInTheDocument();
+  });
+
+  it('names the SENDER mailbox in the education when features carry it', async () => {
+    featuresRes = { ebooksEnabled: true, kindleDeliveryAvailable: true, kindleSenderEmail: 'bot@household.dev' };
+    await renderModal();
+
+    // The named-sender line: the address Amazon approves is the system's From…
+    const sender = await screen.findByText('bot@household.dev');
+    expect(sender.tagName).toBe('STRONG');
+    expect(screen.getByText(/Amazon must allow mail from/)).toBeInTheDocument();
+    // …and the link label says "sender address", never "that address" (which read as the
+    // user's own kindle.com address sitting right under the Kindle input).
+    expect(screen.getByRole('link', { name: AMAZON_APPROVED_LIST_LINK_LABEL })).toBeInTheDocument();
+    expect(AMAZON_APPROVED_LIST_LINK_LABEL).not.toMatch(/that address/);
+  });
+
+  it('omits the named-sender line when no sender is configured, keeping the generic label', async () => {
+    featuresRes = { ebooksEnabled: true, kindleDeliveryAvailable: false, kindleSenderEmail: null };
+    await renderModal();
+
+    expect(screen.queryByText(/Amazon must allow mail from/)).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: AMAZON_APPROVED_LIST_LINK_LABEL })).toBeInTheDocument();
   });
 });

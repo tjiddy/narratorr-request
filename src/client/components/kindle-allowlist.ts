@@ -15,8 +15,15 @@
  */
 export const AMAZON_APPROVED_LIST_URL = 'https://www.amazon.com/hz/mycd/myx#/home/settings/pdoc';
 
-/** The link's visible text. The ↗ is the app's affordance for "opens in a new tab". */
-export const AMAZON_APPROVED_LIST_LINK_LABEL = 'Add that address to Amazon’s approved list ↗';
+/**
+ * The link's visible text. The ↗ is the app's affordance for "opens in a new tab".
+ *
+ * "SENDER address", never "that address" (UAT 2026-07-29): in the account modal this link sits
+ * directly under the Kindle-address input, where "that address" reads as the user's OWN kindle.com
+ * address — the exact opposite of what Amazon needs. The thing to approve is always the system's
+ * From mailbox; when the app knows it, `KindleAllowlistHelp` names it outright.
+ */
+export const AMAZON_APPROVED_LIST_LINK_LABEL = 'Add the sender address to Amazon’s approved list ↗';
 
 /** The disclosure trigger — collapsed by default at both sites. */
 export const AMAZON_APPROVED_LIST_DISCLOSURE_LABEL = 'Where is that?';

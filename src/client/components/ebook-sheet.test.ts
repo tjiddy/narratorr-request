@@ -600,8 +600,8 @@ describe('the Amazon allowlist constants (one definition, two render sites)', ()
     expect(AMAZON_APPROVED_LIST_URL).toBe('https://www.amazon.com/hz/mycd/myx#/home/settings/pdoc');
   });
 
-  it('pins the exact link label', () => {
-    expect(AMAZON_APPROVED_LIST_LINK_LABEL).toBe('Add that address to Amazon’s approved list ↗');
+  it('pins the exact link label — "sender address", never "that address" (UAT 2026-07-29: under the modal Kindle input, "that address" read as the user\'s own kindle.com address)', () => {
+    expect(AMAZON_APPROVED_LIST_LINK_LABEL).toBe('Add the sender address to Amazon’s approved list ↗');
   });
 
   it.each([
