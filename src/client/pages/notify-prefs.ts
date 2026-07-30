@@ -67,12 +67,22 @@ export function providerLabel(
 
 /**
  * Whether an email-field Save button is active (dirty): true when the trimmed draft differs from the
- * stored value (null reads as the empty string). Each Save is spatially scoped to its own row — it
- * commits ONLY that field — so this drives its at-rest-vs-amber state independent of the other row
- * and of the notify toggles. Shared by the contact-email row and the Kindle-address row (#142).
+ * stored value, CASE-INSENSITIVELY (null reads as the empty string). Each Save is spatially scoped to
+ * its own row — it commits ONLY that field — so this drives its at-rest-vs-amber state independent of
+ * the other row and of the notify toggles. Shared by the contact-email row and the Kindle-address row
+ * (#142).
+ *
+ * The comparison ignores case because both stored addresses are trim+lowercased BEFORE storage
+ * (`contactEmailSchema`; `kindleEmailSchema` derives from it), so a case-only difference can never
+ * represent a pending change — saving it would store the identical value. That matters on the error
+ * path (#168 AC7): a save that COMMITTED `Foo@Ex.COM` and then failed in the route's DTO tail leaves
+ * the typed draft untouched (drafts are only reconciled on success, deliberately — the client cannot
+ * tell a committed failure from an uncompleted one, and rewriting the field would discard input after
+ * an ordinary validation 400), so once the settlement refetch lands the normalized `foo@ex.com` the
+ * row must read CLEAN rather than falsely amber.
  */
 export function isEmailFieldDirty(stored: string | null, draft: string): boolean {
-  return draft.trim() !== (stored ?? '');
+  return draft.trim().toLowerCase() !== (stored ?? '').toLowerCase();
 }
 
 /**
