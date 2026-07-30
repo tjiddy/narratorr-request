@@ -60,7 +60,7 @@ export function emitFailed(deps: RequestFailureNotifyDeps | undefined, row: Requ
     let requester: { username: string } | undefined;
     try {
       requester = await deps.users.getById(row.userId);
-    } catch (err) {
+    } catch (err: unknown) {
       // redact() before logging: a lookup fault's error text could embed a secret-bearing value.
       deps.logger?.warn(
         { err: redact(err), request: row.publicId },
@@ -74,7 +74,7 @@ export function emitFailed(deps: RequestFailureNotifyDeps | undefined, row: Requ
         requester: { username: requester?.username ?? UNKNOWN_REQUESTER },
         reason,
       });
-    } catch (err) {
+    } catch (err: unknown) {
       // A lost notification must be diagnosable. The failed transition already committed; never
       // propagate. redact() before logging: a dispatch error can embed a webhook URL / token.
       deps.logger?.warn(

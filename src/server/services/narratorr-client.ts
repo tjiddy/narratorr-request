@@ -120,7 +120,7 @@ export class NarratorrClient {
   async addBook(asin: string): Promise<V1Book> {
     try {
       return await this.request('POST', '/api/v1/books', v1BookSchema, { body: { asin } });
-    } catch (err) {
+    } catch (err: unknown) {
       if (err instanceof NarratorrError && err.upstreamStatus === 409) {
         const existingId = readExistingId(err.body);
         if (existingId) return this.getBook(existingId);
@@ -166,7 +166,7 @@ export class NarratorrClient {
   async ping(): Promise<void> {
     try {
       await this.getBook('__healthcheck__');
-    } catch (err) {
+    } catch (err: unknown) {
       if (err instanceof NarratorrError && err.upstreamStatus === 404) return;
       throw err;
     }

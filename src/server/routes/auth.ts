@@ -181,7 +181,7 @@ export function registerAuthRoutes(app: FastifyInstance, deps: AppDeps): void {
       setSessionCookie(reply, deps.config, result.user);
       notifyIfPending(result);
       return await reply.redirect(postLoginRedirect);
-    } catch (err) {
+    } catch (err: unknown) {
       // This is a top-level browser navigation — a raw JSON error page is a dead end.
       // Log the detail and bounce back to the login screen with a generic error flag.
       request.log.warn({ err, provider }, 'OIDC callback failed');

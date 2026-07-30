@@ -284,7 +284,7 @@ export class UserService {
         .returning();
       if (!created) throw new Error('failed to create user');
       return { user: created, created: true };
-    } catch (err) {
+    } catch (err: unknown) {
       if (isUniqueViolation(err)) {
         // Lost a race to a concurrent identical login — the row already exists and we
         // did NOT create it, so the caller must not treat this as a new signup.

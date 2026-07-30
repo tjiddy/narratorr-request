@@ -220,7 +220,7 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: AppDeps): voi
         // DB state, so building it here (still inside the try) needs no lock.
         candidate = await writeLock.run(() => deps.connectorSettings.buildCandidateNotifier(body));
         channel = buildNotifierChannel(candidate.type, candidate.config);
-      } catch (err) {
+      } catch (err: unknown) {
         // A bad candidate (e.g. a required secret that won't resolve) is a failed test. No
         // resolved candidate config to enumerate here → pattern-based redaction only.
         return { success: false, message: redact(err) };
@@ -229,7 +229,7 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: AppDeps): voi
       try {
         await channel.send(testContext(body.event, body.publicUrl ?? null));
         return { success: true, message: 'Test notification sent.' };
-      } catch (err) {
+      } catch (err: unknown) {
         // redact() before returning: a fetch/network error can embed the capability webhook
         // URL or a token — scrub both the resolved candidate secrets and URL-path secrets.
         return { success: false, message: redact(err, candidateSecrets(candidate)) };
@@ -252,7 +252,7 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: AppDeps): voi
       try {
         await new NarratorrClient({ baseUrl: cfg.url, apiKey: cfg.apiKey }).ping();
         return { success: true, message: 'Connected to narratorr.' };
-      } catch (err) {
+      } catch (err: unknown) {
         return { success: false, message: describeNarratorrError(err) };
       }
     },

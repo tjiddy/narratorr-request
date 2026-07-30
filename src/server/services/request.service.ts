@@ -336,7 +336,7 @@ export class RequestService {
         .returning();
       if (!created) throw new Error('insert returned no row');
       return { row: created, created: true };
-    } catch (err) {
+    } catch (err: unknown) {
       // Race: the partial unique index fired between our preflight and insert.
       if (isUniqueViolation(err)) {
         const dupe = await this.findActiveDuplicate(userId, body.asin);
@@ -412,7 +412,7 @@ export class RequestService {
         .where(and(eq(requests.id, row.id), eq(requests.status, row.status)))
         .returning();
       return updated ?? row;
-    } catch (err) {
+    } catch (err: unknown) {
       if (!isTerminalHandoffError(err)) throw err; // transient — stays `approved`, poller retries
       // Terminal handoff failure: claim the failed edge (emits request.failed once) and
       // PRESERVE the existing rethrow — callers/tests depend on the error surfacing.
@@ -435,7 +435,7 @@ export class RequestService {
     try {
       const result = await this.handoff(row);
       return result.status === 'failed' ? 'failed' : 'recovered';
-    } catch (err) {
+    } catch (err: unknown) {
       if (!isTerminalHandoffError(err)) throw err; // transient — poller counts an upstream error & retries
       return 'failed'; // terminal: handoff already claimed `failed` and emitted once — a real transition
     }
@@ -608,7 +608,7 @@ export class RequestService {
     for (const { request: row, notifyOn, email } of owed) {
       try {
         await this.notifyOneAvailable(row, notifyOn, email, sender, logger);
-      } catch (err) {
+      } catch (err: unknown) {
         // Transient SMTP failure (send threw) or a post-delivery marker-write fault. Never unwind the
         // sweep; leave the marker null so the row is re-attempted. redact() before logging: a send
         // fault can embed SMTP credentials.

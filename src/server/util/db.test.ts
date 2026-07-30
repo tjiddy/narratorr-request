@@ -56,7 +56,7 @@ describe('isUniqueViolation', () => {
         .insert(users)
         .values({ publicId: publicId('us'), authProvider: 'local', authSubject: 'a@b.com', username: 'dupe' })
         .returning();
-    } catch (err) {
+    } catch (err: unknown) {
       caught = err;
     }
 

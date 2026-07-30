@@ -117,7 +117,7 @@ export class FeatureService {
     try {
       const caps = await this.narratorr.getCapabilities();
       return this.install(generation, caps.companionEpub.enabled, nowMs, CAPABILITY_TTL_MS);
-    } catch (err) {
+    } catch (err: unknown) {
       if (err instanceof NarratorrError) {
         // No narratorr saved at all: permanent-for-now, and deliberately NOT a transient failure —
         // it installs nothing, so it neither starts nor consumes a stale window.
