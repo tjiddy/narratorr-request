@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { UserService } from './user.service.js';
 import { makeOidcMapper, type OidcProfile } from './oidc.service.js';
-import { createTestDb, insertUser } from '../test-support/db.js';
+import { createTestDb, drizzleConstraintError, insertUser } from '../test-support/db.js';
+import { isUniqueViolation } from '../util/db.js';
 import type { Db } from '../../db/client.js';
 
 let db: Db;
@@ -282,7 +283,15 @@ describe('UserService createIdentity unique-violation race', () => {
       username: 'todd',
     });
     vi.spyOn(db, 'insert').mockImplementation(() => {
-      throw new Error('UNIQUE constraint failed: users.auth_provider, users.auth_subject');
+      // Built through the shared factory so the synthetic error carries the STRUCTURAL shape the
+      // classifier keys on (`rawCode: 2067` on the chain) — a message-only error would classify
+      // false and quietly turn this into a vacuous test.
+      throw drizzleConstraintError({
+        rawCode: 2067,
+        code: 'SQLITE_CONSTRAINT_UNIQUE',
+        driverMessage: 'UNIQUE constraint failed: users.auth_provider, users.auth_subject',
+        table: 'users',
+      });
     });
 
     const result = await svc.createLocalUser({ email: 'Todd@Example.com', passwordHash: 'h' });
@@ -300,16 +309,45 @@ describe('UserService createIdentity unique-violation race', () => {
 
   it('re-throws the ORIGINAL unique error object when the re-query finds no identity (no silent null)', async () => {
     // No seeded identity → findByIdentity misses after the matched violation → fallthrough.
-    // The sentinel is drizzle-shaped (constraint text only on the cause) and identity-checked
-    // with toBe: re-wrapping it in a fresh Error with the same message would discard the
-    // driver's type/cause chain while still satisfying a message-only assertion.
-    const original = new Error('Failed query: insert into "users" (...) values (...) returning ...', {
-      cause: new Error('SQLITE_CONSTRAINT: UNIQUE constraint failed: users.auth_provider, users.auth_subject'),
+    // The sentinel is drizzle-shaped (constraint code only on the cause, per the shared factory)
+    // and identity-checked with toBe: re-wrapping it in a fresh Error with the same message would
+    // discard the driver's type/cause chain while still satisfying a message-only assertion.
+    // The `rawCode` is what makes this test about the RE-QUERY MISS: without it the error never
+    // matches the classifier at all and the assertion passes without exercising the catch.
+    const original = drizzleConstraintError({
+      rawCode: 2067,
+      code: 'SQLITE_CONSTRAINT_UNIQUE',
+      driverMessage: 'UNIQUE constraint failed: users.auth_provider, users.auth_subject',
+      table: 'users',
     });
+    expect(isUniqueViolation(original)).toBe(true); // the sentinel really does enter the catch
+    const findFirst = vi.spyOn(db.query.users, 'findFirst');
     vi.spyOn(db, 'insert').mockImplementation(() => {
       throw original;
     });
     await expect(svc.createLocalUser({ email: 'ghost@x.com', passwordHash: 'h' })).rejects.toBe(original);
+    // createLocalUser → createIdentity has no preflight lookup, so the single call IS the
+    // catch's re-query — proof the fallthrough, not a classification miss, produced the throw.
+    expect(findFirst).toHaveBeenCalledTimes(1);
+  });
+
+  it('surfaces a NON-UNIQUE constraint breach directly — no re-query, no race-resolution path', async () => {
+    // A CHECK breach used to match the broad `SQLITE_CONSTRAINT` arm and route into the
+    // re-query path (bounded only by the re-query missing). It now surfaces at once.
+    const original = drizzleConstraintError({
+      rawCode: 275,
+      code: 'SQLITE_CONSTRAINT_CHECK',
+      driverMessage: 'CHECK constraint failed: users_status',
+      table: 'users',
+    });
+    // `db.query.users.findFirst` is the real read seam behind the private findByIdentity;
+    // createLocalUser has no preflight lookup, so ANY call means the catch fired.
+    const findFirst = vi.spyOn(db.query.users, 'findFirst');
+    vi.spyOn(db, 'insert').mockImplementation(() => {
+      throw original;
+    });
+    await expect(svc.createLocalUser({ email: 'ghost@x.com', passwordHash: 'h' })).rejects.toBe(original);
+    expect(findFirst).not.toHaveBeenCalled();
   });
 });
 

@@ -63,6 +63,67 @@ export async function insertUser(
   return { id: row.id, publicId: row.publicId, role: row.role, status: row.status, authSubject: row.authSubject };
 }
 
+/**
+ * A synthetic error shaped like a REAL drizzle/libSQL constraint rejection, so a classifier test
+ * that cannot afford a real insert still sees the shape the classifier actually keys on.
+ *
+ * The chain is the real 3-level one (probed against `@libsql/client` 0.17.3):
+ *
+ *   L0 `DrizzleQueryError` — `Failed query: …\nparams: …`, NO `code`/`rawCode`
+ *   L1 `LibsqlError`       — `SQLITE_CONSTRAINT: <driver message>`, generic `code`, `rawCode`
+ *   L2 `SqliteError`       — `<driver message>`, EXTENDED `code`, the same `rawCode`
+ *
+ * `params` is the wrapper's echoed parameter line — the user-controlled text that made a
+ * message-text classifier forgeable (issue #195). Hand-rolling this shape per call site is what
+ * let the synthetic cases drift from the driver; build them all here.
+ */
+export function drizzleConstraintError(opts: {
+  /** SQLite EXTENDED result code — 2067 UNIQUE, 787 FOREIGNKEY, 275 CHECK, 1299 NOTNULL. */
+  rawCode: number;
+  /** The extended code SPELLING on the inner sqlite error, e.g. `SQLITE_CONSTRAINT_UNIQUE`. */
+  code: string;
+  /** The driver's own message, e.g. `UNIQUE constraint failed: users.auth_provider, …`. */
+  driverMessage: string;
+  /** The wrapper's `params:` line. Defaults to a value that names no constraint. */
+  params?: string;
+  /** Table named in the wrapper's `Failed query:` line. */
+  table?: string;
+}): Error {
+  const inner = Object.assign(new Error(opts.driverMessage), { code: opts.code, rawCode: opts.rawCode });
+  const libsql = Object.assign(new Error(`SQLITE_CONSTRAINT: ${opts.driverMessage}`, { cause: inner }), {
+    code: 'SQLITE_CONSTRAINT',
+    rawCode: opts.rawCode,
+  });
+  return new Error(
+    `Failed query: insert into "${opts.table ?? 'requests'}" (...) values (...) returning ...\n` +
+      `params: ${opts.params ?? 'rq_x,1,B1,a title,pending'}`,
+    { cause: libsql },
+  );
+}
+
+/**
+ * A REAL drizzle/libSQL rejection from a duplicate `users` insert — the shape
+ * {@link drizzleConstraintError} claims to reproduce.
+ *
+ * Shared rather than inlined so the classifier tests and the factory's own contract test measure
+ * against the SAME driver error: that is what makes a libSQL upgrade which renumbers `rawCode` or
+ * renames a code spelling fail loudly instead of leaving a stale fixture certifying a shape
+ * production no longer produces.
+ */
+export async function realDuplicateInsertError(): Promise<unknown> {
+  const db = await createTestDb();
+  await insertUser(db, { provider: 'local', subject: 'a@b.com' });
+  try {
+    await db
+      .insert(users)
+      .values({ publicId: publicId('us'), authProvider: 'local', authSubject: 'a@b.com', username: 'dupe' })
+      .returning();
+  } catch (err: unknown) {
+    return err;
+  }
+  throw new Error('the duplicate insert did not reject');
+}
+
 /** Delete a user row by id — exercises the real session-lookup-miss boundary in tests. */
 export async function deleteUser(db: Db, id: number): Promise<void> {
   await db.delete(users).where(eq(users.id, id));
