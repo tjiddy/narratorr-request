@@ -11,6 +11,7 @@ export default tseslint.config(
   {
     ignores: [
       '**/dist/**',
+      '.scratch/**',
       '**/node_modules/**',
       '**/*.config.js',
       '**/*.config.ts',

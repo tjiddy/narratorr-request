@@ -1,12 +1,11 @@
 import { useState } from 'react';
 import type { ConnectorSettingsDto, TestConnectorBody } from '@shared/schemas/connectors';
-import { useUpdateConnectors, useTestConnector, useUpdateEbooksEnabled } from '../hooks';
+import { useUpdateConnectors, useTestConnector } from '../hooks';
 import { Button } from '../components/Button';
 import { CheckIcon, SendIcon, SlidersIcon, ServerIcon } from '../components/icons';
 import { Field, SectionHeader, SettingsCard } from './settings-ui';
 import { inputCls, secretPlaceholder } from './settings-fields';
 import { initNarratorr, buildNarratorr, isNarratorrDirty, isPublicUrlDirty } from './settings-narratorr';
-import { initEbooksEnabled, isEbooksDirty, buildEbooksEnabled } from './settings-ebooks';
 import {
   initDefaultQuota,
   buildDefaultQuota,
@@ -40,68 +39,16 @@ function SaveButton({ pending }: { pending: boolean }) {
 export function GeneralSection({
   publicUrl,
   defaultQuota,
-  ebooksEnabled,
 }: {
   publicUrl: ConnectorSettingsDto['publicUrl'];
   defaultQuota: ConnectorSettingsDto['defaultQuota'];
-  ebooksEnabled: ConnectorSettingsDto['ebooksEnabled'];
 }) {
   return (
     <div className="flex flex-col gap-5">
       <SectionHeader icon={SlidersIcon} title="General" subtitle="App-wide settings for this install." />
       <PublicUrlCard key={publicUrl ?? ''} saved={publicUrl} />
       <DefaultQuotaCard key={JSON.stringify(defaultQuota)} saved={defaultQuota} />
-      <EbooksCard key={String(ebooksEnabled)} saved={ebooksEnabled} />
     </div>
-  );
-}
-
-// The companion-ebook publishing opt-in (issue #144). Default OFF — the owner may support ebooks
-// in narratorr without publishing them to family — and it is only HALF the gate: the eBook
-// affordances appear once this AND narratorr's own companion-ebook capability are on, which is
-// what the hint spells out so an admin isn't left wondering why nothing changed.
-function EbooksCard({ saved }: { saved: boolean }) {
-  const update = useUpdateEbooksEnabled();
-  const initial = initEbooksEnabled({ ebooksEnabled: saved });
-  const [enabled, setEnabled] = useState(initial);
-  const dirty = isEbooksDirty(enabled, initial);
-
-  return (
-    <SettingsCard delay="180ms">
-      <form
-        className="flex flex-col gap-4 p-5"
-        onSubmit={(e) => {
-          e.preventDefault();
-          update.mutate(buildEbooksEnabled(enabled));
-        }}
-      >
-        <Field
-          label="Companion eBooks"
-          hint="Offer the eBook edition alongside the audiobook, when narratorr has one. Requires companion ebooks to be enabled in narratorr too."
-        >
-          <div className="flex items-center gap-3">
-            {/* Explicit accessible name: the wrapping <Field> label also carries the hint and the
-                state copy, so its text content is not a usable name — the same reason the quota
-                card labels its own controls. */}
-            <input
-              type="checkbox"
-              className="h-4 w-4 accent-primary"
-              checked={enabled}
-              onChange={(e) => setEnabled(e.target.checked)}
-              aria-label="Companion eBooks"
-            />
-            <span className="text-sm text-muted-foreground">
-              {enabled ? 'Available to approved users' : 'Hidden from everyone'}
-            </span>
-          </div>
-        </Field>
-        {dirty && (
-          <div className="flex justify-end">
-            <SaveButton pending={update.isPending} />
-          </div>
-        )}
-      </form>
-    </SettingsCard>
   );
 }
 
