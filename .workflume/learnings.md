@@ -343,9 +343,9 @@ Walk the chain instead:
       return `${err.message}\n${causeChainMessages(err.cause, depth + 1)}`;
     }
 
-With @libsql/client 0.17.3 the nested error is `LibsqlError: SQLITE_CONSTRAINT: UNIQUE constraint failed: <table>.<col>, <table>.<col>` carrying `code: 'SQLITE_CONSTRAINT'` and `rawCode: 2067` (`SQLITE_CONSTRAINT_UNIQUE`). Reference implementation: `isActiveKindleSendCollision()` in `src/server/services/kindle-send.policy.ts`.
+With @libsql/client 0.17.3 the nested error is `LibsqlError: SQLITE_CONSTRAINT: UNIQUE constraint failed: <table>.<col>, <table>.<col>` carrying `code: 'SQLITE_CONSTRAINT'` and `rawCode: 2067` (`SQLITE_CONSTRAINT_UNIQUE`). Canonical helper: `causeChainMessages()` is exported from `src/server/util/db.ts` (#183 moved it there); `isUniqueViolation()` (same file) and `isActiveKindleSendCollision()` (`src/server/services/kindle-send.policy.ts`) both classify over it.
 
-Corollary for tests: a synthetic-error unit test CANNOT validate one of these classifiers. Drive at least one case through a real in-memory libSQL insert (`src/server/services/kindle-send.admission.test.ts` does). Known exception still outstanding: `isUniqueViolation()` in `src/server/util/db.ts` has the message-only form, so its race-resolution consumer in `user.service.ts` never fires.
+Corollary for tests: a synthetic-error unit test CANNOT validate one of these classifiers. Drive at least one case through a real in-memory libSQL insert (`src/server/services/kindle-send.admission.test.ts` and `src/server/util/db.test.ts` both do). (The once-outstanding exception is fixed: #183 rewired `isUniqueViolation()` over the chain, so both race-resolution consumers — `user.service.ts` and `request.service.ts` — are live, each covered by a real-violation test.)
 
 ## nodemailer-destroy-attachment-with-error
 
@@ -432,3 +432,55 @@ Working pattern for the repo's mandated genuine-red step:
 4. `git checkout -- .` (commit new files first — checkout does not revert untracked ones).
 
 The cost of skipping step 2 is asymmetric: a false "still green" invites deleting or weakening a good assertion, which is precisely the vacuous-test outcome the genuine-red bar exists to prevent.
+
+## settlement-invalidate-both-outcomes
+
+**source:** #168  
+**added:** 2026-07-30  
+**files:** src/client/hooks.ts  
+**tags:** react-query, tanstack-query, cache-invalidation, concurrency, setQueryData
+
+---
+
+A shared query key written by several concurrent mutation instances needs its reconciliation on EVERY settlement — both outcomes, unconditionally — not just on the error path.
+
+Why the half-measure fails: combining a field-wise `setQueryData` merge on success (learning [[concurrent-mutations-full-dto-cache-rollback]]) with an error-only invalidation (learning [[settings-routes-commit-before-fallible-tail]]) reintroduces the very rollback the merge prevents. The error path's GET can be ISSUED before a sibling's commit and DELIVERED after that sibling's merge, replacing the whole entry with a pre-write snapshot.
+
+Why invalidating on every settlement converges: `invalidateQueries` delegates to `refetchQueries` with `cancelRefetch: true`, and `Query.fetch` cancels the in-flight retryer when `cancelRefetch` is set and `state.data !== undefined` (query-core 5.101.0) — so on a POPULATED key a later invalidation SUPERSEDES an earlier in-flight refetch, and the last mutation to settle issues the last GET. Callback order is `onSuccess` → `onSettled`, so the merge still updates the row without a round-trip and the trailing GET returns the same values (structural sharing keeps the reference stable): it costs a request, not a re-render storm. Note the supersession arm is DATA-GATED, which is a real trap on empty keys — see [[no-supersession-on-data-less-query]]; this repo's final reconciler (`reconcileMeWrite`, `src/client/hooks.ts`) cancels the in-flight read before invalidating, which makes last-settler-wins unconditional instead of resting on that gate.
+
+Two caveats worth stating explicitly:
+  • Supersession/cancellation is RESULT-level, not transport-level. `getMe()` (`src/client/api.ts`) never consumes the `QueryFunctionContext` abort signal, so the superseded HTTP request still completes on the wire. Every settlement costs a GET; they do not coalesce. Do not write "concurrent saves collapse into one request" in a spec or comment.
+  • Testing it needs SEPARATE gates for each COMMIT, each mutation RESPONSE, and each GET's snapshot and delivery. A fake that commits both fields before the first reconciliation GET is issued passes even with cancellation disabled — the assertion has to prove the first GET captured pre-sibling state AND was still pending. Exemplar: `AccountModal.test.tsx`, 'a stale reconciliation read cannot overwrite a newer sibling save'.
+
+Corollary for existing suites: a fake server that models RESPONSES but not durable state goes red the moment settlement reconciliation is added, because the reconciliation GET reads a row it never wrote. Either commit in the fake, or hold its reads open on purpose so the older rows keep asserting the merge in isolation.
+
+Implemented as `reconcileMeWrite()` in `src/client/hooks.ts`, used by `useUpdateMe` (fire-and-forget) and `useLocalAuth` (promise returned — see the sibling entry for why that distinction is hygiene, not correctness).
+
+## no-supersession-on-data-less-query
+
+**source:** #168  
+**added:** 2026-07-30  
+**files:** src/client/hooks.ts  
+**tags:** react-query, tanstack-query, cache-invalidation, concurrency, auth
+
+---
+
+`invalidateQueries` → `refetchQueries` defaults to `cancelRefetch: true`, but `Query.fetch` honours it ONLY when the query already holds data (`query-core@5.101.0`, `query.js:188`):
+
+    if (this.state.data !== void 0 && fetchOptions?.cancelRefetch) this.cancel({ silent: true })
+    else if (this.#retryer) { this.#retryer.continueRetry(); return this.#retryer.promise }
+
+With data: the later invalidation supersedes the in-flight fetch and wins — the assumption [[settlement-invalidate-both-outcomes]] rests on. WITHOUT data: no request is issued at all and the caller gets the ALREADY-RUNNING retryer's promise, so a read taken under older server state is the one that lands in the cache.
+
+That asymmetry bites wherever a reconciliation runs against a key that is legitimately empty — most obviously an auth/session key on a signed-out screen. Shape of the bug: failed login → settlement re-read issued while `qk.me` is a data-less 401 → user retries with correct credentials → the retry's settlement cannot supersede, so the pre-cookie 401 resolves → valid session, login screen still rendered, and nothing scheduled to repair it (`useMe` has no `refetchInterval`, and a `staleTime` lapse only MARKS stale).
+
+Remedy: CANCEL before invalidating — in the reconciler, not the UI:
+
+    await qc.cancelQueries({ queryKey }, { silent: true })
+    await qc.invalidateQueries({ queryKey })
+
+`cancelQueries` has no `data !== undefined` gate (`Query.cancel` → `retryer.cancel`), so it returns the query to `idle` and the invalidation ALWAYS issues a fresh read, for every caller and cache state. `{ silent: true }` matches the library's own supersession call — the cancelled read must not publish an error state on its way out; the fresh read decides. Both awaits are rejection-safe (`cancelQueries` resolves through `.then(noop).catch(noop)`; `refetchQueries` catches per-query rejections), and the ORDER is part of the contract: cancelling after invalidating kills the read you just requested.
+
+A UI pending-lock is NOT the correctness mechanism (PR #201 F2 disproved the first-draft remedy): returning the invalidation promise from `onSettled` does keep the mutation `pending` across the read (`mutation.js:137,181` await it on both paths), but the pending state only holds while the mutation observer stays attached — `MutationObserver.reset()` (which `LoginPage`'s login/signup mode switch calls) does `removeObserver(this)` on the still-running mutation and republishes an idle result, so `isPending` drops and any `disabled={isPending}` affordance re-enables while the data-less read is still open. A UI-layer lock cannot defend a cache-layer invariant. Keep the returned promise where double-submit ordering is nice to have (`useLocalAuth` returns it; `useUpdateMe` voids it — `qk.me` is populated by construction behind the authenticated shell, and each row's Save gates on its own `isPending`), but state it as hygiene, not the guarantee.
+
+Testing notes, earned the hard way: (1) making the reconciler async means a mocked `useQueryClient` must stub `cancelQueries`, and settlement assertions must flush a microtask (the reconciler awaits the cancel before invalidating — this broke the node project on first push); (2) a convergence test must FORCE the lock bypass (`auth.reset()` mid-read) rather than rely on the lock, or it only proves the lock works. Exemplars: `src/client/hooks.request-error-path.test.tsx` — 'holds the submit lock across the data-less reconciliation read' and 'converges even when the submit lock is bypassed mid-read by auth.reset() (the mode-switch shape)'; the cancel-then-invalidate ORDER is pinned in `hooks.test.ts` via `invocationCallOrder`.
