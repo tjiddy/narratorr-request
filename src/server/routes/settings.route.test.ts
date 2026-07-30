@@ -675,7 +675,9 @@ describe('settings routes — notifier test over a REAL redirecting socket (#207
   });
 });
 
-describe('settings routes — narratorr test endpoint (unchanged)', () => {
+const NARRATORR_UNREACHABLE_COPY = 'Could not reach narratorr — check the URL, including whether it redirects.';
+
+describe('settings routes — narratorr test endpoint', () => {
   it('an unreachable narratorr (NarratorrError status 0 / NETWORK) gets the redirect-aware copy (#207 AC8)', async () => {
     // NarratorrClient maps a fetch rejection — including the `redirect: 'error'` one (#171) —
     // into NarratorrError(0, 'NETWORK', …), which is the branch whose copy changed.
@@ -683,7 +685,41 @@ describe('settings routes — narratorr test endpoint (unchanged)', () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('fetch failed')));
     const res = await app.inject({ method: 'POST', url: `${CONNECTORS_URL}/test`, headers: asAdmin, payload: { channel: 'narratorr', narratorr: { url: 'https://n.example.com:443' } } });
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ success: false, message: 'Could not reach narratorr — check the URL, including whether it redirects.' });
+    expect(res.json()).toEqual({ success: false, message: NARRATORR_UNREACHABLE_COPY });
+  });
+
+  it('a narratorr that never answers (local timeout) gets its OWN copy, not the unreachable one (#213)', async () => {
+    // What undici raises when the client's own `controller.abort()` fires. The route builds
+    // NarratorrClient without a `timeoutMs`, so the real 15s default is not waitable here — the
+    // genuine end-to-end abort is covered by the client's own timeout tests.
+    await connectorSettings.update({ narratorr: { url: 'https://n.example.com:443', apiKey: 'k' } });
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new DOMException('This operation was aborted', 'AbortError')));
+    const res = await app.inject({ method: 'POST', url: `${CONNECTORS_URL}/test`, headers: asAdmin, payload: { channel: 'narratorr', narratorr: { url: 'https://n.example.com:443' } } });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ success: false, message: 'Narratorr did not respond in time.' });
+    // The pair with the TypeError test above: the two network classes no longer collapse.
+    expect(res.json().message).not.toBe(NARRATORR_UNREACHABLE_COPY);
+  });
+
+  // The `TIMEOUT` code is only trustworthy as a LOCAL signal — `errorEnvelopeSchema.error.code` is
+  // an unrestricted string, so a hostile narratorr can answer any status with `{"error":{"code":
+  // "TIMEOUT"}}`. These resolve a real Response so the production `classifyErrorBody` builds the
+  // error: only a STATUS-ZERO code is locally authored, and an HTTP-sourced one keeps its
+  // status-derived copy.
+  it.each([
+    [401, 'Authentication failed — check the API key.'],
+    [500, 'narratorr responded 500.'],
+  ])('a forged HTTP %i + upstream code "TIMEOUT" keeps its status copy (#213 AC5)', async (status, message) => {
+    await connectorSettings.update({ narratorr: { url: 'https://n.example.com:443', apiKey: 'k' } });
+    const forged = 'forged-timeout-marker';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => Promise.resolve(new Response(JSON.stringify({ error: { code: 'TIMEOUT', message: forged } }), { status }))),
+    );
+    const res = await app.inject({ method: 'POST', url: `${CONNECTORS_URL}/test`, headers: asAdmin, payload: { channel: 'narratorr', narratorr: { url: 'https://n.example.com:443' } } });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ success: false, message });
+    expect(res.body).not.toContain(forged);
   });
 
   it('reports not-configured without throwing (always 200)', async () => {

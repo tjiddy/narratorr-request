@@ -107,7 +107,7 @@ describe('NarratorrClient error handling', () => {
     });
   });
 
-  it('maps a request that exceeds the timeout to a NETWORK error ending in "timed out"', async () => {
+  it('maps a request that exceeds the timeout to a TIMEOUT error ending in "timed out"', async () => {
     server.use(
       http.get(`${MOCK_BASE_URL}/api/v1/metadata/search`, async () => {
         await delay(200);
@@ -117,7 +117,8 @@ describe('NarratorrClient error handling', () => {
     const slow = new NarratorrClient({ baseUrl: MOCK_BASE_URL, apiKey: 'test-key', timeoutMs: 10 });
     const err = await slow.searchMetadata('x').catch((e: unknown) => e);
     expect(err).toBeInstanceOf(NarratorrError);
-    expect((err as NarratorrError).upstreamCode).toBe('NETWORK');
+    expect((err as NarratorrError).upstreamStatus).toBe(0);
+    expect((err as NarratorrError).upstreamCode).toBe('TIMEOUT');
     expect((err as NarratorrError).message).toMatch(/timed out$/);
   });
 
@@ -130,7 +131,7 @@ describe('NarratorrClient error handling', () => {
     // The timings are picked so the deadline splits the header read from the body read:
     // headers + a partial body flush immediately (well under the 100ms `timeoutMs`, even with
     // localhost connection setup), then the rest of the body lands at 400ms — past the deadline.
-    // Post-fix the abort lands inside `res.text()` at ~100ms → NETWORK/timed out. Pre-fix the
+    // Post-fix the abort lands inside `res.text()` at ~100ms → TIMEOUT/timed out. Pre-fix the
     // timer was cleared once headers arrived, so the body read ran unbounded and would resolve
     // the full JSON at 400ms → `searchMetadata` returns `[]` and the NarratorrError assertion
     // fails. Auto-completing the body (rather than stalling forever) keeps that pre-fix failure
@@ -152,7 +153,8 @@ describe('NarratorrClient error handling', () => {
       const slow = new NarratorrClient({ baseUrl: stallBaseUrl, apiKey: 'test-key', timeoutMs: 100 });
       const err = await slow.searchMetadata('x').catch((e: unknown) => e);
       expect(err).toBeInstanceOf(NarratorrError);
-      expect((err as NarratorrError).upstreamCode).toBe('NETWORK');
+      expect((err as NarratorrError).upstreamStatus).toBe(0);
+      expect((err as NarratorrError).upstreamCode).toBe('TIMEOUT');
       expect((err as NarratorrError).message).toMatch(/timed out$/);
     } finally {
       server.listen({ onUnhandledRequest: 'error' }); // re-arm MSW for the remaining tests

@@ -65,6 +65,9 @@ const asPair = (stub: ICapabilityClient): NarratorrClientPair => ({
 
 const upstream = (status: number, code: string) => new NarratorrError(status, code, `upstream ${code}`);
 const NETWORK = upstream(0, 'NETWORK');
+// #213 split the status-0 transport class: NETWORK is now unreachable-only, TIMEOUT is the
+// client's own deadline. Both must stay transient here.
+const TIMEOUT = upstream(0, 'TIMEOUT');
 const CONTRACT_MISMATCH = upstream(200, 'CONTRACT_MISMATCH');
 
 /**
@@ -117,7 +120,8 @@ describe('FeatureService — outcome classification', () => {
     ['401 (auth, never "unsupported")', upstream(401, 'HTTP_401')],
     ['403', upstream(403, 'HTTP_403')],
     ['CONTRACT_MISMATCH (provider drift on a 200)', CONTRACT_MISMATCH],
-    ['NETWORK (transport error or timeout)', NETWORK],
+    ['NETWORK (transport error — unreachable)', NETWORK],
+    ['TIMEOUT (the client\'s own deadline)', TIMEOUT],
     ['some other non-2xx', upstream(503, 'HTTP_503')],
     ['a non-NarratorrError escaping the client', new Error('boom')],
   ])('treats %s as transient — never a cached false', async (_label, err) => {

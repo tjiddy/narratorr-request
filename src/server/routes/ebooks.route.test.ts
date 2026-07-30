@@ -434,6 +434,8 @@ const ERROR_ROWS: ErrorRow[] = [
   { label: '403', error: () => new NarratorrError(403, 'FORBIDDEN', UPSTREAM_MESSAGE), status: 502, code: 'NARRATORR_UNAVAILABLE' },
   { label: '500', error: () => new NarratorrError(500, 'HTTP_500', UPSTREAM_MESSAGE), status: 502, code: 'NARRATORR_UNAVAILABLE' },
   { label: 'NETWORK (status 0)', error: () => new NarratorrError(0, 'NETWORK', UPSTREAM_MESSAGE), status: 502, code: 'NARRATORR_UNAVAILABLE' },
+  // #213 split the status-0 class into NETWORK/TIMEOUT; TIMEOUT is inert here — same row as NETWORK.
+  { label: 'TIMEOUT (status 0)', error: () => new NarratorrError(0, 'TIMEOUT', UPSTREAM_MESSAGE), status: 502, code: 'NARRATORR_UNAVAILABLE' },
   { label: 'NO_BODY', error: () => new NarratorrError(204, 'NO_BODY', UPSTREAM_MESSAGE), status: 502, code: 'NARRATORR_UNAVAILABLE' },
   { label: 'NON_JSON with an unmapped status', error: () => new NarratorrError(418, 'NON_JSON', UPSTREAM_MESSAGE), status: 502, code: 'NARRATORR_UNAVAILABLE' },
   { label: 'a raw non-NarratorrError (F22)', error: () => new TypeError('undici exploded'), status: 502, code: 'NARRATORR_UNAVAILABLE' },

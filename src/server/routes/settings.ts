@@ -29,8 +29,21 @@ import {
 } from '../services/notifications/index.js';
 import { NOTIFIER_REGISTRY, type NotifierType } from '../../shared/notifier-registry.js';
 
+/**
+ * Deliberately NOT the notifier's `'The destination did not respond in time.'` (#207): the two
+ * sentences name different subjects, so they stay separate strings rather than a shared constant.
+ */
+const NARRATORR_TIMEOUT_COPY = 'Narratorr did not respond in time.';
+
 function describeNarratorrError(err: unknown): string {
   if (err instanceof NarratorrError) {
+    // The FIRST code-keyed branch here, so the status guard is load-bearing, not decoration:
+    // `errorEnvelopeSchema.error.code` is an unrestricted string that `classifyErrorBody` passes
+    // through with the REAL HTTP status, so a hostile narratorr can answer 401 with
+    // `{"error":{"code":"TIMEOUT"}}`. Only a STATUS-ZERO code is locally authored by our own
+    // client (#213) — the same provenance rule `mapUpstreamFailure` applies to NOT_CONFIGURED.
+    // Ordered ahead of the generic status-0 branch below, which would otherwise swallow it.
+    if (err.upstreamStatus === 0 && err.upstreamCode === 'TIMEOUT') return NARRATORR_TIMEOUT_COPY;
     // Same admin-facing gap as the notifier Test (#207): NarratorrClient folds a `redirect:
     // 'error'` rejection (#171) into this same status-0 NETWORK branch, so an `http://` base
     // behind a proxy that 301s lands here indistinguishable from a dead host. Name both.

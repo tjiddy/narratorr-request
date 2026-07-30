@@ -97,12 +97,17 @@ describe('GET /api/admin/system — narratorr reachability', () => {
     expect(res.json().narratorr).toMatchObject({ state: 'connected', version: 'v1.0.0', commit: 'abc1234' });
   });
 
-  it('network error / non-2xx → state "unreachable", our-side fields still present', async () => {
+  // Both status-0 classes land the same way — #213 split NETWORK into NETWORK/TIMEOUT and the
+  // System card must not start distinguishing them.
+  it.each([
+    ['NETWORK', new NarratorrError(0, 'NETWORK', 'unreachable')],
+    ['TIMEOUT', new NarratorrError(0, 'TIMEOUT', 'timed out')],
+  ])('%s error → state "unreachable", our-side fields still present', async (_label, err) => {
     h = await buildRouteApp({
       register: registerSystemRoutes,
       enableTestRoleOverride: true,
       narratorr: systemClient(async () => {
-        throw new NarratorrError(0, 'NETWORK', 'unreachable');
+        throw err;
       }),
     });
     const res = await getSystem(h.asRole('admin'));

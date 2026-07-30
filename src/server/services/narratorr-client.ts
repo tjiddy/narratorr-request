@@ -220,8 +220,18 @@ export class NarratorrClient {
       });
       text = await res.text();
     } catch (err: unknown) {
-      const reason = err instanceof Error && err.name === 'AbortError' ? 'timed out' : 'unreachable';
-      throw new NarratorrError(0, 'NETWORK', `Narratorr ${method} ${path} ${reason}`);
+      // Structural classification, never message text (#213). The mechanism is OUR OWN manual
+      // `controller.abort()` above, which surfaces as `AbortError` — an `AbortSignal.timeout`
+      // would surface as `TimeoutError` instead, so switching to that API means revisiting this
+      // predicate. A `redirect: 'error'` rejection is a `TypeError` and stays NETWORK.
+      // ONE evaluation feeds both the code and the message word, so the two cannot drift apart.
+      // `NarratorrStreamClient` classifies identically — a change here is a change there (#173).
+      const timedOut = err instanceof Error && err.name === 'AbortError';
+      throw new NarratorrError(
+        0,
+        timedOut ? 'TIMEOUT' : 'NETWORK',
+        `Narratorr ${method} ${path} ${timedOut ? 'timed out' : 'unreachable'}`,
+      );
     } finally {
       clearTimeout(timer);
     }

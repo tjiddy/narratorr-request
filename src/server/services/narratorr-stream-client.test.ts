@@ -245,7 +245,7 @@ describe('NarratorrStreamClient — timeout shape', () => {
 
     const err = await rejection(clientFor(s).openCompanionEpub('bk_1'));
     expect(err).toBeInstanceOf(NarratorrError);
-    expect(err).toMatchObject({ upstreamStatus: 0, upstreamCode: 'NETWORK' });
+    expect(err).toMatchObject({ upstreamStatus: 0, upstreamCode: 'TIMEOUT' });
     expect((err as NarratorrError).message).toMatch(/timed out$/);
     // Not merely a locally dropped stream — the upstream really saw the request cancelled.
     await s.whenAborted();

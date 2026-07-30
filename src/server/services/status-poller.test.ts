@@ -346,10 +346,15 @@ describe('StatusPoller cron lifecycle (fixed-clock)', () => {
 });
 
 describe('StatusPoller.pollOnce reconciliation edges', () => {
-  it('AC#2 counts a transient stranded-handoff failure, leaves the row approved, and still checks the batch', async () => {
+  // #213: retry semantics branch on status (404 vs everything else), never on `upstreamCode`, so
+  // the new status-0 `TIMEOUT` must count and retry exactly like the 5xx case it sits beside.
+  it.each([
+    ['5xx UPSTREAM', () => new NarratorrError(503, 'UPSTREAM', 'flaky')],
+    ['status-0 TIMEOUT', () => new NarratorrError(0, 'TIMEOUT', 'timed out')],
+  ])('AC#2 counts a transient stranded-handoff failure (%s), leaves the row approved, and still checks the batch', async (_label, err) => {
     await seedStranded('A9'); // approved, no book
     await seedAcquiring('A1'); // co-existing in-flight row
-    client.throwOnAdd = new NarratorrError(503, 'UPSTREAM', 'flaky'); // handoff rethrows (transient)
+    client.throwOnAdd = err(); // handoff rethrows (transient)
     client.status = 'downloading'; // acquiring row stays acquiring when checked
 
     const summary = await poller.pollOnce();
