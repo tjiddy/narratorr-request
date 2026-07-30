@@ -5,7 +5,7 @@
  * collision classifier are all decisions a test should be able to make without a socket or a DB.
  */
 
-import { causeChainMessages } from '../util/db.js';
+import { SQLITE_CONSTRAINT_UNIQUE, causeChainMessages, hasSqliteRawCode } from '../util/db.js';
 
 /** Hard cap on the RAW upstream EPUB we will ship. Amazon's own personal-document limit. */
 export const MAX_KINDLE_SEND_BYTES = 25 * 1024 * 1024;
@@ -78,17 +78,30 @@ export function sendBudgetMs(input: {
 /**
  * Whether an insert error is the ACTIVE-RESERVATION unique collision specifically.
  *
- * Deliberately NOT `isUniqueViolation()`: that helper treats every `SQLITE_CONSTRAINT` — foreign
- * key, CHECK and NOT NULL included — as a unique breach, so reusing it here would report genuine
- * corruption or a programmer error to the user as `rate_limited`. Matching the table AND both
- * indexed columns keeps the classification target-specific; every other insert error is an
- * operational failure and takes the pre-reservation 500 path.
+ * Deliberately NOT `isUniqueViolation()`: that helper answers "is this a unique breach at all",
+ * and a unique breach on ANY OTHER index of the same insert is not THIS collision — reporting
+ * one to the user as `rate_limited` would mask it. So the table and both indexed columns still
+ * have to be matched by name, which only the message text carries; every other insert error is
+ * an operational failure and takes the pre-reservation 500 path.
  */
 const ACTIVE_COLLISION_RE =
   /UNIQUE constraint failed:[^\n]*\bkindle_sends\.user_id\b[^\n]*\bkindle_sends\.book_id\b/i;
 
+/**
+ * Gated on the structural code FIRST, then the target regex — both must hold.
+ *
+ * The structural gate is DEFENSE IN DEPTH on this exported function, not a fix to a reachable
+ * caller defect. drizzle's wrapper message embeds the statement's echoed `params:` line, so a
+ * user-controlled value containing the collision text can forge the regex; `reserve()` — the sole
+ * production caller — inserts only numeric ids, the literal `'started'`, timestamps, nulls and a
+ * `bookId` already constrained to `^bk_[A-Za-z0-9_-]{1,61}$`, a grammar with no space, colon or
+ * dot, so ITS params line cannot carry the text. The gate is what keeps the classifier exact if
+ * it is ever called on an error from a different insert.
+ */
 export function isActiveKindleSendCollision(err: unknown): boolean {
-  // A RangeError is a value/programmer error, never a constraint breach.
+  // A RangeError is a value/programmer error, never a constraint breach. Load-bearing, and
+  // evaluated first: the structural walk reaches past the top-level value into the chain.
   if (err instanceof RangeError) return false;
+  if (!hasSqliteRawCode(err, SQLITE_CONSTRAINT_UNIQUE)) return false;
   return ACTIVE_COLLISION_RE.test(causeChainMessages(err));
 }
