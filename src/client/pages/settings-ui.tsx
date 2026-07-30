@@ -4,7 +4,12 @@ import type { ElementType, ReactNode } from 'react';
 // list/cards, and the add/edit modal. Component-only (react-refresh): pure constants/helpers
 // live in settings-fields.ts; pure logic in settings-narratorr.ts / settings-notifiers.ts.
 
-/** A labelled form field — shows an error in place of the hint when one is present. */
+/** A labelled form field — shows an error in place of the hint when one is present.
+ *  The hint/error sits OUTSIDE the `<label>` (which still wraps the control for the implicit
+ *  association): label content feeds the control's accessible name, so wrapping the hint too
+ *  made every screen reader announce the entire hint sentence as the field's NAME (#163).
+ *  A Field with multiple controls inside still needs per-control `aria-label`s — a wrapping
+ *  label can only ever name its first labelable descendant (see the quota row). */
 export function Field({
   label,
   hint,
@@ -17,15 +22,17 @@ export function Field({
   children: ReactNode;
 }) {
   return (
-    <label className="flex flex-col gap-1">
-      <span className="text-sm font-medium">{label}</span>
-      {children}
+    <div className="flex flex-col gap-1">
+      <label className="flex flex-col gap-1">
+        <span className="text-sm font-medium">{label}</span>
+        {children}
+      </label>
       {error ? (
         <span className="text-xs text-destructive">{error}</span>
       ) : (
         hint && <span className="text-xs text-muted-foreground/70">{hint}</span>
       )}
-    </label>
+    </div>
   );
 }
 

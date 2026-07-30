@@ -71,10 +71,6 @@ export function KindleSenderCard({
         >
           <select
             className={inputCls}
-            // Explicit accessible name: `Field`'s <label> also wraps the hint text, so the
-            // computed name would otherwise swallow the whole paragraph (same reason the quota
-            // selects carry one).
-            aria-label="Kindle sender"
             value={selectedId ?? NONE}
             onChange={(e) => setSelectedId(e.target.value === NONE ? null : e.target.value)}
           >

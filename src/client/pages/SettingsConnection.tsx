@@ -122,6 +122,9 @@ function DefaultQuotaCard({ saved }: { saved: ConnectorSettingsDto['defaultQuota
           hint="Applies only to users without a per-user quota override (overrides set on the Users page still win). Admins are always unlimited."
           error={valid ? undefined : 'Enter a whole number greater than zero.'}
         >
+          {/* One Field, three controls: the wrapping label can only name its FIRST labelable
+              descendant, so each control carries its own aria-label (these are per-control
+              names, not the #163 hint-swallowing workaround). */}
           <div className="flex flex-wrap items-center gap-3">
             <select
               className={`${inputCls} w-44`}
