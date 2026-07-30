@@ -3,7 +3,7 @@ import type { AddressInfo } from 'node:net';
 import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
 import { http, HttpResponse, delay } from 'msw';
 import { setupServer } from 'msw/node';
-import { classifyErrorBody, NarratorrClient, NarratorrError } from './narratorr-client.js';
+import { classifyErrorBody, classifyTransportFailure, NarratorrClient, NarratorrError } from './narratorr-client.js';
 import { errorBody, errorEnvelopeSchema } from '../../shared/schemas/v1/common.js';
 import { v1CapabilitiesSchema } from '../../shared/schemas/v1/capabilities.js';
 import { narratorrV1Handlers, resetMockNarratorrState, MOCK_BASE_URL } from '../mocks/narratorr-v1.js';
@@ -98,13 +98,15 @@ describe('NarratorrClient error handling', () => {
     });
   });
 
-  it('maps a transport failure to upstreamStatus 0 / NETWORK', async () => {
+  it('maps a transport failure to upstreamStatus 0 / NETWORK, ending in "unreachable"', async () => {
     server.use(http.get(`${MOCK_BASE_URL}/api/v1/metadata/search`, () => HttpResponse.error()));
-    await expect(client.searchMetadata('x')).rejects.toMatchObject({
-      statusCode: 502,
-      upstreamStatus: 0,
-      upstreamCode: 'NETWORK',
-    });
+    const err = await client.searchMetadata('x').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(NarratorrError);
+    expect(err).toMatchObject({ statusCode: 502, upstreamStatus: 0, upstreamCode: 'NETWORK' });
+    // The message word is asserted, not just the code: both come off the same `timedOut` boolean
+    // in `classifyTransportFailure`, so a code-only assertion would let the pair drift apart.
+    expect((err as NarratorrError).message).toMatch(/unreachable$/);
+    expect((err as NarratorrError).message).not.toMatch(/timed out$/);
   });
 
   it('maps a request that exceeds the timeout to a TIMEOUT error ending in "timed out"', async () => {
@@ -196,6 +198,26 @@ describe('NarratorrClient error handling', () => {
     await expect(client.addBook('B07KCQDQR9')).rejects.toMatchObject({ upstreamStatus: 409 });
     expect(getBookSpy).not.toHaveBeenCalled();
     getBookSpy.mockRestore();
+  });
+});
+
+describe('classifyTransportFailure — the shared status-0 decision (#173/#213)', () => {
+  // The ONE owner of the timeout taxonomy. Both clients decide `timedOut` themselves (their abort
+  // mechanisms differ) but hand the boolean here, so this table IS the cross-client contract —
+  // each client's own transport tests are the wiring proof that it actually calls this.
+  const LABEL = 'Narratorr GET /api/v1/thing';
+
+  it.each([
+    [true, 'TIMEOUT', `${LABEL} timed out`],
+    [false, 'NETWORK', `${LABEL} unreachable`],
+  ])('timedOut=%s → status-0 %s with the matching message word', (timedOut, code, message) => {
+    const err = classifyTransportFailure(LABEL, timedOut);
+    expect(err).toBeInstanceOf(NarratorrError);
+    // Status 0 is the provenance marker every code-keyed consumer guards on — a transport failure
+    // is locally authored, never parsed out of an upstream envelope.
+    expect(err).toMatchObject({ statusCode: 502, upstreamStatus: 0, upstreamCode: code });
+    expect(err.message).toBe(message);
+    expect(err.body).toBeUndefined();
   });
 });
 
@@ -313,6 +335,9 @@ describe('NarratorrClient — redirect hardening (#171)', () => {
         // `X-Api-Key` — so this must surface as OUR error, never as a raw fetch TypeError.
         expect(err).toBeInstanceOf(NarratorrError);
         expect(err).toMatchObject({ upstreamStatus: 0, upstreamCode: 'NETWORK' });
+        // A `redirect: 'error'` rejection is a TypeError, never an abort — it must keep the
+        // unreachable WORD too, not just the code.
+        expect((err as NarratorrError).message).toMatch(/unreachable$/);
         expect(target.requests).toHaveLength(0);
       } finally {
         server.listen({ onUnhandledRequest: 'error' }); // re-arm MSW for the remaining tests

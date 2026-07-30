@@ -615,6 +615,8 @@ describe('NarratorrStreamClient — request shape hardening', () => {
     // must surface as our own error, never as a raw fetch TypeError escaping the client.
     expect(err).toBeInstanceOf(NarratorrError);
     expect(err).toMatchObject({ upstreamStatus: 0, upstreamCode: 'NETWORK' });
+    // A redirect rejection is a TypeError, never an abort — it keeps the unreachable WORD too.
+    expect((err as NarratorrError).message).toMatch(/unreachable$/);
     expect(target.requests).toHaveLength(0);
   });
 

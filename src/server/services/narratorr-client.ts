@@ -75,6 +75,30 @@ export function classifyErrorBody(label: string, status: number, text: string): 
   return new NarratorrError(status, code, message, json);
 }
 
+/**
+ * The ONE status-0 (transport) `NarratorrError` decision, shared by `NarratorrClient.request()`
+ * and `NarratorrStreamClient.openCompanionEpub()` — the sibling of `classifyErrorBody` above, and
+ * for the same reason: a second copy of a decision both clients make is exactly what #173 was
+ * filed about. Each client keeps its own MECHANISM-specific predicate (their abort controllers
+ * differ, and the stream client must let a caller disconnect win first) and hands the resulting
+ * boolean here, so the code ↔ message-word pairing has a single owner and cannot drift.
+ *
+ * | `timedOut` | `upstreamCode` | `message`         |
+ * |------------|----------------|-------------------|
+ * | `true`     | `TIMEOUT`      | `… timed out`     |
+ * | `false`    | `NETWORK`      | `… unreachable`   |
+ *
+ * `timedOut` MUST be decided structurally at the call site, never from message text (#213). Both
+ * callers arm their own `controller.abort()`, which surfaces as an `AbortError`; an
+ * `AbortSignal.timeout` would surface as a `TimeoutError` instead, and a `redirect: 'error'`
+ * rejection is a `TypeError` that must stay NETWORK.
+ */
+export function classifyTransportFailure(label: string, timedOut: boolean): NarratorrError {
+  return timedOut
+    ? new NarratorrError(0, 'TIMEOUT', `${label} timed out`)
+    : new NarratorrError(0, 'NETWORK', `${label} unreachable`);
+}
+
 const DEFAULT_TIMEOUT_MS = 15_000;
 
 /** Pull `existingId` out of a `POST /books` 409 body (`{ error, existingId }`). */
@@ -191,6 +215,7 @@ export class NarratorrClient {
     opts: { body?: unknown; headers?: Record<string, string>; query?: Record<string, unknown> } = {},
   ): Promise<z.infer<S>> {
     const url = this.buildUrl(path, opts.query);
+    const label = `Narratorr ${method} ${path}`;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
 
@@ -220,23 +245,15 @@ export class NarratorrClient {
       });
       text = await res.text();
     } catch (err: unknown) {
-      // Structural classification, never message text (#213). The mechanism is OUR OWN manual
-      // `controller.abort()` above, which surfaces as `AbortError` — an `AbortSignal.timeout`
-      // would surface as `TimeoutError` instead, so switching to that API means revisiting this
-      // predicate. A `redirect: 'error'` rejection is a `TypeError` and stays NETWORK.
-      // ONE evaluation feeds both the code and the message word, so the two cannot drift apart.
-      // `NarratorrStreamClient` classifies identically — a change here is a change there (#173).
-      const timedOut = err instanceof Error && err.name === 'AbortError';
-      throw new NarratorrError(
-        0,
-        timedOut ? 'TIMEOUT' : 'NETWORK',
-        `Narratorr ${method} ${path} ${timedOut ? 'timed out' : 'unreachable'}`,
-      );
+      // Our OWN manual `controller.abort()` above is the mechanism, and it surfaces as an
+      // `AbortError` — this predicate is the only part of the classification that is specific to
+      // THIS client. What the boolean MEANS (code + message word) belongs to the shared
+      // `classifyTransportFailure`, which `NarratorrStreamClient` calls too, so the taxonomy
+      // cannot drift between them (#173).
+      throw classifyTransportFailure(label, err instanceof Error && err.name === 'AbortError');
     } finally {
       clearTimeout(timer);
     }
-
-    const label = `Narratorr ${method} ${path}`;
 
     // The non-2xx branch owns the WHOLE text→error decision, ahead of any parse. Keeping the
     // parse below it is what scopes the empty-body → NON_JSON rule to failures structurally: a

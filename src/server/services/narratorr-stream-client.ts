@@ -1,4 +1,4 @@
-import { classifyErrorBody, NarratorrError } from './narratorr-client.js';
+import { classifyErrorBody, classifyTransportFailure, NarratorrError } from './narratorr-client.js';
 
 /**
  * Header-acquisition deadline. Covers ONLY the response headers — see
@@ -138,17 +138,13 @@ export class NarratorrStreamClient {
       // dead" are the same AbortError here but very different log lines. The caller's signal
       // wins — a composed abort we did not schedule is theirs.
       if (opts.signal?.aborted) throw abortedError(path);
-      // Structural classification, never message text (#213). Our OWN header timer fired the
-      // abort, which surfaces as `AbortError` — an `AbortSignal.timeout` would surface as
-      // `TimeoutError` instead, so switching to that API means revisiting this predicate. A
-      // `redirect: 'error'` rejection is a `TypeError` and stays NETWORK. ONE evaluation feeds
-      // both the code and the message word so they cannot drift, and `NarratorrClient.request()`
-      // classifies identically — a change here is a change there (#173).
-      const timedOut = headerTimedOut && err instanceof Error && err.name === 'AbortError';
-      throw new NarratorrError(
-        0,
-        timedOut ? 'TIMEOUT' : 'NETWORK',
-        `Narratorr GET ${path} ${timedOut ? 'timed out' : 'unreachable'}`,
+      // Our OWN header timer fired the abort, and it surfaces as an `AbortError` — this predicate
+      // is the only part of the classification specific to THIS client (the JSON client has no
+      // caller signal to disambiguate, so its predicate is the `headerTimedOut`-free version).
+      // What the boolean MEANS is the SHARED decision `NarratorrClient` applies too (#173).
+      throw classifyTransportFailure(
+        `Narratorr GET ${path}`,
+        headerTimedOut && err instanceof Error && err.name === 'AbortError',
       );
     } finally {
       // Cleared on BOTH paths — a leaked timer is an open handle aimed at nothing.
