@@ -41,7 +41,7 @@ import {
 import { decideBadge } from './instance-badge';
 import { featuresQueryEnabled } from './features';
 import { meSuccessToast, mergeMeCache } from './pages/notify-prefs';
-import { sendOutcomeMessage, sendErrorMessage } from './components/ebook-sheet';
+
 
 export const qk = {
   me: ['me'] as const,
@@ -267,14 +267,12 @@ export const useFeatures = (me: MeDto | undefined) =>
  *   • a REJECTED request is a different thing entirely and maps through its own code table.
  */
 export function useSendToKindle() {
+  // Deliberately BARE: outcome presentation lives in the sheet — an in-sheet success panel and
+  // inline failure text (UAT 2026-07-29: the toast fired in the corner while the user's eyes were
+  // in the modal, so the first real send read as a dead click). A send converges no cache either,
+  // so this is a mutation with no handlers at all; the caller reads `data`/`error`.
   return useMutation({
     mutationFn: (v: { bookId: string; title: string }) => sendEbookToKindle(v.bookId, v.title),
-    onSuccess: (result) => {
-      const message = sendOutcomeMessage(result.outcome);
-      if (result.outcome === 'sent') toast.success(message);
-      else toast.error(message);
-    },
-    onError: (err) => toast.error(sendErrorMessage(err instanceof ApiError ? err.code : '')),
   });
 }
 

@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { isNarratorrBookId } from '@shared/schemas/book-id';
 import { EBOOK_SEND_OUTCOMES, type EbookSendOutcome } from '@shared/schemas/ebooks';
+import { ApiError } from '../api';
 import {
   formatEbookSize,
   buildEbookDownloadUrl,
@@ -15,6 +16,7 @@ import {
   kindleSendCaption,
   sendOutcomeMessage,
   sendErrorMessage,
+  sendFailureText,
   MAX_BUFFERED_EPUB_BYTES,
   EPUB_MEDIA_TYPE,
   GENERIC_DOWNLOAD_ERROR,
@@ -633,5 +635,32 @@ describe('the Amazon allowlist constants (one definition, two render sites)', ()
   it('records that this is one-time setup per Amazon account', () => {
     expect(AMAZON_APPROVED_LIST_NOTE).toMatch(/one-time/i);
     expect(AMAZON_APPROVED_LIST_NOTE).toMatch(/Amazon account/i);
+  });
+});
+
+describe('sendFailureText — the inline failure line (UAT 2026-07-29)', () => {
+  const base = { isPending: false, isError: false, outcome: undefined, error: null } as const;
+
+  it('is null while a retry is in flight — stale text must not sit beside the spinner', () => {
+    expect(sendFailureText({ ...base, isPending: true, outcome: 'failed' })).toBeNull();
+  });
+
+  it('is null for the sent outcome (the success panel owns that state) and when idle', () => {
+    expect(sendFailureText({ ...base, outcome: 'sent' })).toBeNull();
+    expect(sendFailureText({ ...base })).toBeNull();
+  });
+
+  it.each(EBOOK_SEND_OUTCOMES.filter((o) => o !== 'sent'))('maps the %s outcome through the outcome table', (outcome) => {
+    expect(sendFailureText({ ...base, outcome })).toBe(sendOutcomeMessage(outcome));
+  });
+
+  it('maps a rejected request through the error-CODE table when the error is an ApiError', () => {
+    expect(sendFailureText({ ...base, isError: true, error: new ApiError(403, 'EBOOKS_DISABLED', 'no') })).toBe(
+      sendErrorMessage('EBOOKS_DISABLED'),
+    );
+  });
+
+  it('falls back to the generic message for a non-ApiError rejection (network failure)', () => {
+    expect(sendFailureText({ ...base, isError: true, error: new TypeError('network') })).toBe(GENERIC_SEND_ERROR);
   });
 });

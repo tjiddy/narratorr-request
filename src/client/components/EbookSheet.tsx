@@ -8,7 +8,7 @@ import { Dialog } from './Dialog';
 import { Cover } from './Cover';
 import { Badge } from './Badge';
 import { Button } from './Button';
-import { DownloadIcon, SendIcon } from './icons';
+import { CheckIcon, DownloadIcon, SendIcon } from './icons';
 import { KindleAllowlistHelp } from './KindleAllowlistHelp';
 import { useOpenAccountModal } from './account-modal-seam';
 import {
@@ -20,6 +20,9 @@ import {
   filenameFromContentDisposition,
   formatEbookSize,
   kindleSendCaption,
+  sendFailureText,
+  SENT_CONFIRMATION_DETAIL,
+  SENT_CONFIRMATION_HEADLINE,
   navigateToDownload as defaultNavigate,
   parseContentLength,
   readBoundedBlob,
@@ -249,6 +252,17 @@ function EbookSheetActions({
   const openAccount = useOpenAccountModal();
   const sendPrimary = hierarchy.kind === 'send-primary';
 
+  // Outcome presentation is IN-SHEET (UAT 2026-07-29: the toast fired in the corner while the
+  // user's eyes were in the modal — the first real end-to-end send read as a dead click).
+  // `sent` replaces the whole action area with a persistent confirmation; every failure renders
+  // inline under the buttons. The four-way decision is the pure `sendFailureText`.
+  const failureText = sendFailureText({
+    isPending: send.isPending,
+    isError: send.isError,
+    outcome: send.data?.outcome,
+    error: send.error,
+  });
+
   function onSend(): void {
     // Unreachable: both hosts gate the affordance on the same grammar the route enforces. Belt and
     // braces, and it keeps the raw path interpolation in `sendEbookToKindle` honest.
@@ -295,9 +309,31 @@ function EbookSheetActions({
     </Button>
   );
 
+  // The terminal state for this sheet visit: the book is on its way, nothing left to press.
+  // The X (and backdrop) still close the dialog.
+  if (send.data?.outcome === 'sent') {
+    return (
+      <div
+        role="status"
+        className="flex flex-col items-center gap-1.5 rounded-xl border border-success/40 bg-success/10 p-4 text-center"
+      >
+        <p className="flex items-center gap-2 text-sm font-semibold">
+          <CheckIcon className="h-4 w-4 text-success" aria-hidden />
+          {SENT_CONFIRMATION_HEADLINE}
+        </p>
+        <p className="text-xs text-muted-foreground">{SENT_CONFIRMATION_DETAIL}</p>
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-col gap-2.5">
       {sendPrimary ? [sendControl, download] : [download, sendControl]}
+      {failureText != null && (
+        <p role="alert" className="text-xs text-destructive">
+          {failureText}
+        </p>
+      )}
       {hierarchy.kind === 'send-primary' && (
         <div className="mt-0.5 flex flex-col gap-1.5">
           <p className="text-xs text-muted-foreground/80">

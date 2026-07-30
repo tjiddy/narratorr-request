@@ -117,8 +117,7 @@ import {
   useTheme,
 } from './hooks';
 import { ApiError } from './api';
-import { EBOOK_SEND_OUTCOMES } from '@shared/schemas/ebooks';
-import { sendOutcomeMessage, sendErrorMessage, GENERIC_SEND_ERROR } from './components/ebook-sheet';
+
 
 const success = vi.mocked(toast.success);
 const error = vi.mocked(toast.error);
@@ -981,9 +980,9 @@ describe('useTheme', () => {
 describe('useSendToKindle — the send mutation (#149)', () => {
   // This mutation is the ONE that converges no cache: a send changes no cached resource, so the
   // right receipt here is exactly what the wholesale react-query mock can prove — which API call it
-  // dispatches, that it asks for NO cache operation, and which toast each answer raises
-  // (react-query-mock-hides-cache-convergence). It also OWNS the toasts: the sheet raises none, so
-  // "exactly one toast per answer" is assertable here.
+  // dispatches and that it carries NO handlers at all. Outcome PRESENTATION is the sheet's
+  // (in-sheet success panel + inline failures, UAT 2026-07-29 — a corner toast was invisible from
+  // inside the modal), covered in EbookSheet.test.tsx.
   it('dispatches sendEbookToKindle with the book id and the sheet’s title', async () => {
     hoisted.api.sendEbookToKindle.mockResolvedValue({ outcome: 'sent' });
 
@@ -995,43 +994,21 @@ describe('useSendToKindle — the send mutation (#149)', () => {
     expect(hoisted.api.sendEbookToKindle).toHaveBeenCalledWith('bk_abc123', 'The Hobbit');
   });
 
-  it('writes NO cache at all — no setQueryData, no invalidateQueries', () => {
-    const hook = useSendToKindle() as { onSettled?: unknown };
-    cb(useSendToKindle()).onSuccess({ outcome: 'sent' });
-    cb(useSendToKindle()).onError(new ApiError(500, 'INTERNAL', 'boom'));
-    // A send changes no cached resource: `me`, `features` and the request lists are all unaffected.
+  it('is a BARE mutation — no cache writes, no toast handlers; the sheet owns presentation', () => {
+    const hook = useSendToKindle() as { onSuccess?: unknown; onError?: unknown; onSettled?: unknown };
+    // No handlers at all: a handler here would be presentation the sheet cannot see or a cache
+    // write the send has no business making (`me`, `features` and the request lists are all
+    // unaffected by a send).
+    expect(hook.onSuccess).toBeUndefined();
+    expect(hook.onError).toBeUndefined();
+    expect(hook.onSettled).toBeUndefined();
     expect(hoisted.qc.setQueryData).not.toHaveBeenCalled();
     expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalled();
-    // …and there is no settlement hook quietly reconciling either.
-    expect(hook.onSettled).toBeUndefined();
-  });
-
-  it('raises exactly ONE success toast for `sent`', () => {
-    cb(useSendToKindle()).onSuccess({ outcome: 'sent' });
-    expect(success).toHaveBeenCalledTimes(1);
-    expect(success).toHaveBeenCalledWith(sendOutcomeMessage('sent'));
+    expect(success).not.toHaveBeenCalled();
     expect(error).not.toHaveBeenCalled();
   });
 
-  it.each(EBOOK_SEND_OUTCOMES.filter((o) => o !== 'sent'))(
-    'raises exactly ONE error toast for the %s outcome',
-    (outcome) => {
-      cb(useSendToKindle()).onSuccess({ outcome });
-      expect(error).toHaveBeenCalledTimes(1);
-      expect(error).toHaveBeenCalledWith(sendOutcomeMessage(outcome));
-      expect(success).not.toHaveBeenCalled();
-    },
-  );
-
-  it('maps a REJECTED request through the error-code table, not the outcome table', () => {
-    cb(useSendToKindle()).onError(new ApiError(403, 'EBOOKS_DISABLED', 'off'));
-    expect(error).toHaveBeenCalledTimes(1);
-    expect(error).toHaveBeenCalledWith(sendErrorMessage('EBOOKS_DISABLED'));
-  });
-
-  it('falls back to the generic copy for a non-ApiError rejection (a network failure)', () => {
-    cb(useSendToKindle()).onError(new TypeError('network'));
-    expect(error).toHaveBeenCalledTimes(1);
-    expect(error).toHaveBeenCalledWith(GENERIC_SEND_ERROR);
-  });
+  // The rejected-request → error-code-table mapping (ApiError code vs generic fallback) moved
+  // WITH the presentation into the sheet: `sendFailureText`'s pure tests in ebook-sheet.test.ts
+  // pin both branches, and EbookSheet.test.tsx pins them through the DOM.
 });

@@ -21,6 +21,8 @@ import {
   downloadErrorMessage,
   sendErrorMessage,
   sendOutcomeMessage,
+  SENT_CONFIRMATION_DETAIL,
+  SENT_CONFIRMATION_HEADLINE,
   type NavigateToDownload,
   type SaveBlob,
 } from './ebook-sheet';
@@ -871,7 +873,7 @@ describe('EbookSheet — the send request', () => {
 
     await userEvent.click(sendButton());
 
-    await waitFor(() => expect(toast.success).toHaveBeenCalledTimes(1));
+    await screen.findByText(SENT_CONFIRMATION_HEADLINE);
     expect(fetchCalls).toHaveLength(1);
     const [url, init] = fetchCalls[0]!;
     expect(url).toBe(`/api/ebooks/${BOOK_ID}/send-to-kindle`);
@@ -880,36 +882,57 @@ describe('EbookSheet — the send request', () => {
     expect(JSON.parse(String(init?.body))).toEqual({ title: 'The Hobbit' });
   });
 
-  it.each(EBOOK_SEND_OUTCOMES)('surfaces the %s outcome and leaves the sheet usable', async (outcome) => {
-    sendResponder = () => Promise.resolve(jsonRes(200, { outcome }));
+  // Outcome presentation is IN-SHEET since the UAT fix (2026-07-29): the first real end-to-end
+  // send read as a dead click because the toast fired in a corner the modal user never saw.
+  it('replaces the action area with the persistent success panel on `sent` — and raises NO toast', async () => {
+    sendResponder = () => Promise.resolve(jsonRes(200, { outcome: 'sent' }));
     await renderSheet();
 
     await userEvent.click(sendButton());
 
-    const channel = outcome === 'sent' ? toast.success : toast.error;
-    const silent = outcome === 'sent' ? toast.error : toast.success;
-    await waitFor(() => expect(channel).toHaveBeenCalledWith(sendOutcomeMessage(outcome)));
-    // Exactly ONE notification per answer — the hook owns the toast, the sheet raises none.
-    expect(channel).toHaveBeenCalledTimes(1);
-    expect(silent).not.toHaveBeenCalled();
-    // NO outcome closes the sheet: Download stays available as the fallback after any failure.
+    await screen.findByText(SENT_CONFIRMATION_HEADLINE);
+    expect(screen.getByText(SENT_CONFIRMATION_DETAIL)).toBeInTheDocument();
+    // Terminal state for the visit: both buttons are gone; the dialog stays for the user to close.
+    expect(screen.queryByRole('button', { name: /send to kindle/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /download ebook/i })).not.toBeInTheDocument();
     expect(screen.getByRole('dialog', { name: 'The Hobbit' })).toBeInTheDocument();
     expect(onClose).not.toHaveBeenCalled();
-    await waitFor(() => expect(sendButton()).toBeEnabled());
-    expect(downloadButton()).toBeEnabled();
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(toast.error).not.toHaveBeenCalled();
   });
+
+  it.each(EBOOK_SEND_OUTCOMES.filter((o) => o !== 'sent'))(
+    'renders the %s outcome INLINE and leaves the sheet usable — no toast',
+    async (outcome) => {
+      sendResponder = () => Promise.resolve(jsonRes(200, { outcome }));
+      await renderSheet();
+
+      await userEvent.click(sendButton());
+
+      const alert = await screen.findByRole('alert');
+      expect(alert).toHaveTextContent(sendOutcomeMessage(outcome));
+      expect(toast.error).not.toHaveBeenCalled();
+      expect(toast.success).not.toHaveBeenCalled();
+      // NO failure closes the sheet: Download stays available as the fallback.
+      expect(screen.getByRole('dialog', { name: 'The Hobbit' })).toBeInTheDocument();
+      expect(onClose).not.toHaveBeenCalled();
+      await waitFor(() => expect(sendButton()).toBeEnabled());
+      expect(downloadButton()).toBeEnabled();
+    },
+  );
 
   it.each([
     ['a 403 EBOOKS_DISABLED envelope', 403, 'EBOOKS_DISABLED'],
     ['a 500 INTERNAL envelope', 500, 'INTERNAL'],
-  ])('maps %s through the error-CODE table and keeps the sheet open', async (_label, status, code) => {
+  ])('maps %s through the error-CODE table, inline, and keeps the sheet open', async (_label, status, code) => {
     sendResponder = () => Promise.resolve(jsonRes(status, { error: { code, message: 'nope' } }));
     await renderSheet();
 
     await userEvent.click(sendButton());
 
-    await waitFor(() => expect(toast.error).toHaveBeenCalledWith(sendErrorMessage(code)));
-    expect(toast.error).toHaveBeenCalledTimes(1);
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(sendErrorMessage(code));
+    expect(toast.error).not.toHaveBeenCalled();
     expect(screen.getByRole('dialog')).toBeInTheDocument();
     expect(downloadButton()).toBeEnabled();
   });
@@ -917,16 +940,38 @@ describe('EbookSheet — the send request', () => {
   it.each([
     ['a rejected fetch (a network failure)', () => Promise.reject(new TypeError('network'))],
     ['a non-JSON body', () => Promise.resolve({ ok: false, status: 502, text: () => Promise.resolve('<html>') } as unknown as Response)],
-  ])('falls back to ONE generic toast for %s', async (_label, responder) => {
+  ])('falls back to the generic message, inline, for %s', async (_label, responder) => {
     sendResponder = responder;
     await renderSheet();
 
     await userEvent.click(sendButton());
 
-    await waitFor(() => expect(toast.error).toHaveBeenCalledWith(GENERIC_SEND_ERROR));
-    expect(toast.error).toHaveBeenCalledTimes(1);
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(GENERIC_SEND_ERROR);
+    expect(toast.error).not.toHaveBeenCalled();
     expect(screen.getByRole('dialog')).toBeInTheDocument();
     expect(downloadButton()).toBeEnabled();
+  });
+
+  it('clears the inline failure while a retry is in flight', async () => {
+    // The stale-error guard: text from attempt N must not sit beside attempt N+1's spinner.
+    let call = 0;
+    let release!: (value: Response) => void;
+    sendResponder = () => {
+      call += 1;
+      if (call === 1) return Promise.resolve(jsonRes(200, { outcome: 'failed' }));
+      return new Promise<Response>((resolve) => (release = resolve));
+    };
+    await renderSheet();
+
+    await userEvent.click(sendButton());
+    await screen.findByRole('alert');
+
+    await userEvent.click(sendButton());
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+
+    release(jsonRes(200, { outcome: 'sent' }));
+    await screen.findByText(SENT_CONFIRMATION_HEADLINE);
   });
 });
 
@@ -950,7 +995,8 @@ describe('EbookSheet — the two actions hold INDEPENDENT locks (AC22)', () => {
     expect(fetchCalls.filter(([url]) => url.includes('/download'))).toHaveLength(1);
 
     release(jsonRes(200, { outcome: 'sent' }));
-    await waitFor(() => expect(sendButton()).toBeEnabled());
+    // Post-fix terminal state: the action area becomes the success panel, not a re-enabled button.
+    await screen.findByText(SENT_CONFIRMATION_HEADLINE);
   });
 
   it('and the reverse: a download in flight leaves Send enabled and sendable', async () => {
@@ -964,13 +1010,13 @@ describe('EbookSheet — the two actions hold INDEPENDENT locks (AC22)', () => {
     expect(sendButton()).toBeEnabled();
     await userEvent.click(sendButton());
 
-    await waitFor(() => expect(toast.success).toHaveBeenCalledTimes(1));
+    await screen.findByText(SENT_CONFIRMATION_HEADLINE);
     expect(fetchCalls.filter(([url]) => url.includes('send-to-kindle'))).toHaveLength(1);
-    // The download is still genuinely in flight throughout.
-    expect(downloadButton()).toBeDisabled();
 
+    // The success panel replaced the buttons, but the in-flight download is untouched by that —
+    // releasing it still lands the file through the save seam.
     releaseDownload(okDownload());
-    await waitFor(() => expect(downloadButton()).not.toBeDisabled());
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1));
   });
 });
 

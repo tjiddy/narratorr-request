@@ -1,6 +1,7 @@
 import { isNarratorrBookId } from '@shared/schemas/book-id';
 import type { EbookSendOutcome } from '@shared/schemas/ebooks';
 import { humanizeBytes } from '../format-bytes';
+import { ApiError } from '../api';
 
 // Every DECISION the companion-ebook sheet makes (issue #147), extracted out of the component so
 // it is unit-tested directly rather than through the DOM. `EbookSheet.tsx` is left with the DOM
@@ -361,6 +362,33 @@ export const EBOOK_SEND_OUTCOME_MESSAGES: Record<EbookSendOutcome, string> = {
 
 export function sendOutcomeMessage(outcome: EbookSendOutcome): string {
   return EBOOK_SEND_OUTCOME_MESSAGES[outcome];
+}
+
+/**
+ * The IN-SHEET success panel (UAT 2026-07-29: the outcome used to be a corner toast, and the
+ * first real end-to-end send looked like a dead click — eyes are in the modal, not the corner).
+ * On `sent` the action area is replaced with this persistent confirmation. Honesty rule intact:
+ * we sent it to Amazon; Amazon delivers.
+ */
+export const SENT_CONFIRMATION_HEADLINE = 'Sent to Amazon';
+export const SENT_CONFIRMATION_DETAIL = 'Allow a few minutes for Amazon to deliver it to your Kindle.';
+
+/**
+ * The inline failure line under the send button — `null` when there is nothing to show. Pure so
+ * the four-way branch (pending clears stale text · non-sent outcome · rejected request · idle)
+ * is unit-tested here instead of inflating the component past the complexity gate. Takes the raw
+ * mutation `error` so the ApiError narrowing lives here too, not at the call site.
+ */
+export function sendFailureText(state: {
+  isPending: boolean;
+  isError: boolean;
+  outcome: EbookSendOutcome | undefined;
+  error: unknown;
+}): string | null {
+  if (state.isPending) return null;
+  if (state.outcome !== undefined && state.outcome !== 'sent') return sendOutcomeMessage(state.outcome);
+  if (state.isError) return sendErrorMessage(state.error instanceof ApiError ? state.error.code : '');
+  return null;
 }
 
 /** Shown for every REJECTED send the code table below doesn't cover, including a network failure. */
