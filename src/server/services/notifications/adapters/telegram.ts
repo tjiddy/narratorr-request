@@ -31,6 +31,8 @@ export class TelegramChannel implements NotificationChannel {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ chat_id: this.cfg.chatId, text, parse_mode: 'HTML' }),
+      // Refuse redirects — see ntfy adapter.
+      redirect: 'error',
       // Bound the call — see ntfy adapter.
       signal: AbortSignal.timeout(10_000),
     });

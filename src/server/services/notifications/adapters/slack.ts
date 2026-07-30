@@ -29,6 +29,8 @@ export class SlackChannel implements NotificationChannel {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ text }),
+      // Refuse redirects — see ntfy adapter.
+      redirect: 'error',
       // Bound the call — see ntfy adapter.
       signal: AbortSignal.timeout(10_000),
     });
