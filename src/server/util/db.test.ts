@@ -242,8 +242,8 @@ describe('isUniqueViolation', () => {
   });
 
   it('does not reach a code buried past the depth cap', () => {
-    let err = Object.assign(new Error('l7'), { rawCode: SQLITE_CONSTRAINT_UNIQUE });
-    for (let i = 6; i >= 0; i -= 1) err = Object.assign(new Error(`l${i}`, { cause: err }), {});
+    let err: Error = Object.assign(new Error('l7'), { rawCode: SQLITE_CONSTRAINT_UNIQUE });
+    for (let i = 6; i >= 0; i -= 1) err = new Error(`l${i}`, { cause: err });
     expect(isUniqueViolation(err)).toBe(false);
   });
 });

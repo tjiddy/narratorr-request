@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { buildKindleSendHarness, emailRuntimeConfig } from '../test-support/kindle-send.js';
+import { drizzleConstraintError } from '../test-support/db.js';
 import {
   KINDLE_SEND_ATTEMPT_DEADLINE_MS,
   KINDLE_SEND_DAILY_WINDOW_MS,
@@ -237,26 +238,42 @@ describe('sendBudgetMs — clamped to the reservation’s remaining lease', () =
   });
 });
 
-describe('isActiveKindleSendCollision — target-specific, never the broad SQLITE_CONSTRAINT arm', () => {
+describe('isActiveKindleSendCollision — target-specific, and gated on the structural unique code', () => {
+  const COLLISION_MESSAGE = 'UNIQUE constraint failed: kindle_sends.user_id, kindle_sends.book_id';
+  /** The real drizzle/libSQL 3-level shape for a kindle_sends breach. */
+  const kindleError = (rawCode: number, code: string, driverMessage: string) =>
+    drizzleConstraintError({ rawCode, code, driverMessage, table: 'kindle_sends' });
+
   it('matches the active-reservation unique index', () => {
-    expect(
-      isActiveKindleSendCollision(
-        new Error('SQLITE_CONSTRAINT: UNIQUE constraint failed: kindle_sends.user_id, kindle_sends.book_id'),
-      ),
-    ).toBe(true);
+    expect(isActiveKindleSendCollision(kindleError(2067, 'SQLITE_CONSTRAINT_UNIQUE', COLLISION_MESSAGE))).toBe(true);
   });
 
   it.each([
-    ['a FOREIGN KEY breach', 'SQLITE_CONSTRAINT: FOREIGN KEY constraint failed'],
-    ['a CHECK breach', 'SQLITE_CONSTRAINT: CHECK constraint failed: kindle_sends_status_finalized'],
-    ['a NOT NULL breach', 'SQLITE_CONSTRAINT: NOT NULL constraint failed: kindle_sends.status'],
-    ['another table’s unique index', 'SQLITE_CONSTRAINT: UNIQUE constraint failed: requests.public_id'],
-  ])('does NOT match %s — those are genuine corruption, not "slow down"', (_label, message) => {
-    expect(isActiveKindleSendCollision(new Error(message))).toBe(false);
+    ['a FOREIGN KEY breach', 787, 'SQLITE_CONSTRAINT_FOREIGNKEY', 'FOREIGN KEY constraint failed'],
+    ['a CHECK breach', 275, 'SQLITE_CONSTRAINT_CHECK', 'CHECK constraint failed: kindle_sends_status_finalized'],
+    ['a NOT NULL breach', 1299, 'SQLITE_CONSTRAINT_NOTNULL', 'NOT NULL constraint failed: kindle_sends.status'],
+    // Carries the UNIQUE code too, so this row proves the REGEX rejects it — not the new gate.
+    ['another table’s unique index', 2067, 'SQLITE_CONSTRAINT_UNIQUE', 'UNIQUE constraint failed: requests.public_id'],
+  ] as const)('does NOT match %s — those are genuine corruption, not "slow down"', (_label, rawCode, code, message) => {
+    expect(isActiveKindleSendCollision(kindleError(rawCode, code, message))).toBe(false);
+  });
+
+  it('does NOT match the collision MESSAGE when no link of the chain carries the unique code', () => {
+    // The structural gate is unconditional: it is not a fallback that yields to the regex when
+    // `rawCode` happens to be absent. Message text alone — forgeable through drizzle's echoed
+    // `params:` line — never classifies as a collision.
+    const messageOnly = new Error('Failed query: insert into "kindle_sends" ...', {
+      cause: new Error(`SQLITE_CONSTRAINT: ${COLLISION_MESSAGE}`),
+    });
+    expect(isActiveKindleSendCollision(messageOnly)).toBe(false);
   });
 
   it('short-circuits a RangeError and tolerates a non-Error throw', () => {
-    const range = new RangeError('UNIQUE constraint failed: kindle_sends.user_id, kindle_sends.book_id');
+    // The cause satisfies BOTH other conjuncts (unique code AND the target index name), so the
+    // guard is the only thing making this false — deleting it turns this red.
+    const range = new RangeError('out of range', {
+      cause: kindleError(2067, 'SQLITE_CONSTRAINT_UNIQUE', COLLISION_MESSAGE),
+    });
     expect(isActiveKindleSendCollision(range)).toBe(false);
     expect(isActiveKindleSendCollision('nope')).toBe(false);
     expect(isActiveKindleSendCollision(undefined)).toBe(false);

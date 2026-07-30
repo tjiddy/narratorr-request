@@ -6,7 +6,8 @@ import { UserService } from './user.service.js';
 import type { Notifier, NotificationPayload } from './notifications/index.js';
 import type { NotifierLogger } from './notifications/types.js';
 import type { RequesterEmailArgs, RequesterEmailSender, RequesterEmailOutcome } from './notifications/requester-email.js';
-import { createTestDb, insertUser } from '../test-support/db.js';
+import { createTestDb, drizzleConstraintError, insertUser } from '../test-support/db.js';
+import { isUniqueViolation } from '../util/db.js';
 import { requests, users } from '../../db/schema.js';
 import type { NotifiableTransition } from '../../shared/schemas/user.js';
 import type { Db } from '../../db/client.js';
@@ -274,12 +275,18 @@ describe('insert-time unique-violation race', () => {
   it('re-throws the ORIGINAL error object when the catch re-query finds no duplicate (no silent null)', async () => {
     const user = await insertUser(db, { role: 'user' });
     // Both preflight and catch re-query miss; the unique violation must surface unchanged.
-    // Identity-checked with toBe against a drizzle-shaped sentinel: a re-wrap carrying the
-    // same message would pass a message-only assertion while dropping the driver's cause chain.
-    const original = new Error('Failed query: insert into "requests" (...) values (...) returning ...', {
-      cause: new Error('SQLITE_CONSTRAINT: UNIQUE constraint failed: requests.user_id, requests.asin'),
+    // Identity-checked with toBe against a drizzle-shaped sentinel from the shared factory: a
+    // re-wrap carrying the same message would pass a message-only assertion while dropping the
+    // driver's cause chain. The `rawCode: 2067` is what makes the sentinel actually MATCH the
+    // classifier — without it the test would assert a re-throw that never entered the catch.
+    const original = drizzleConstraintError({
+      rawCode: 2067,
+      code: 'SQLITE_CONSTRAINT_UNIQUE',
+      driverMessage: 'UNIQUE constraint failed: requests.user_id, requests.asin',
     });
-    vi.spyOn(db.query.requests, 'findFirst')
+    expect(isUniqueViolation(original)).toBe(true); // the sentinel really does enter the catch
+    const findFirst = vi
+      .spyOn(db.query.requests, 'findFirst')
       .mockResolvedValueOnce(undefined)
       .mockResolvedValueOnce(undefined);
     vi.spyOn(db, 'insert').mockImplementation(() => {
@@ -288,6 +295,30 @@ describe('insert-time unique-violation race', () => {
 
     const svc = new RequestService(db, client, policy());
     await expect(svc.create(user.id, body('B1'))).rejects.toBe(original);
+    // Preflight + the catch's re-query: the second call proves the fallthrough path ran.
+    expect(findFirst).toHaveBeenCalledTimes(2);
+  });
+
+  it('surfaces a NON-UNIQUE constraint breach directly — no catch re-query at all', async () => {
+    const user = await insertUser(db, { role: 'user' });
+    // A CHECK breach used to match the broad `SQLITE_CONSTRAINT` arm and route into the
+    // re-query path; it now surfaces at once.
+    const original = drizzleConstraintError({
+      rawCode: 275,
+      code: 'SQLITE_CONSTRAINT_CHECK',
+      driverMessage: 'CHECK constraint failed: requests_status',
+    });
+    // The read seam is SHARED between the mandatory preflight (create():263) and the catch
+    // re-query (insertRequest():342), so exactly ONE call means the preflight ran and the
+    // catch did not. The users lookup at :259 is a different query object and does not count.
+    const findFirst = vi.spyOn(db.query.requests, 'findFirst').mockResolvedValue(undefined);
+    vi.spyOn(db, 'insert').mockImplementation(() => {
+      throw original;
+    });
+
+    const svc = new RequestService(db, client, policy());
+    await expect(svc.create(user.id, body('B1'))).rejects.toBe(original);
+    expect(findFirst).toHaveBeenCalledTimes(1);
   });
 });
 
