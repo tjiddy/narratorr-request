@@ -328,7 +328,7 @@ How to check such a test is not vacuous: mutate the gate so it fails ONLY in the
 
 **source:** #148  
 **added:** 2026-07-29  
-**files:** src/server/services/kindle-send.policy.ts  
+**files:** src/server/util/db.ts, src/server/services/kindle-send.policy.ts  
 **tags:** drizzle, libsql, sqlite, error-handling, constraints
 
 ---
