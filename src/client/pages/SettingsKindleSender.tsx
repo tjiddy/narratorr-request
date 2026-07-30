@@ -67,7 +67,7 @@ export function KindleSenderCard({
       >
         <Field
           label="Kindle sender"
-          hint="Kindle delivery always sends from this one mailbox, so the address your household allowlists at Amazon never changes."
+          hint="Kindle delivery always sends from this one mailbox, so the address your users allowlist at Amazon never changes."
         >
           <select
             className={inputCls}
@@ -124,13 +124,14 @@ function KindleSenderStatusBlock({ saved, notifiers }: { saved: ResolvedKindleSe
   }
 
   if (saved.status === 'ok') {
+    // No green callout (UAT 2026-07-29): allowlisting is a USER-side action — each user adds the
+    // sender to their own Amazon approved list, and the app shows them the address during Kindle
+    // setup (account modal + ebook sheet). The admin just needs to know that's handled.
     return (
-      <div role="status" className="rounded-xl border border-success/40 bg-success/10 p-4 text-sm">
-        <p>
-          Add this address to Amazon’s Approved Personal Document E-mail List:{' '}
-          <strong className="font-mono">{saved.confirmedFrom}</strong>
-        </p>
-      </div>
+      <p role="status" className="text-xs text-muted-foreground/70">
+        Your users add this address to their own Amazon approved list — the app shows it to them
+        during Kindle setup.
+      </p>
     );
   }
 

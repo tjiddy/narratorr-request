@@ -229,11 +229,14 @@ describe('KindleSenderCard — the status matrix', () => {
     expect(screen.queryByText(/Kindle delivery is unavailable/i)).not.toBeInTheDocument();
   });
 
-  it('ok: shows the exact address to allowlist at Amazon, and no Save', () => {
+  it('ok: quiet status — the muted users-allowlist note, no green callout, no Save', () => {
+    // The allowlist instruction is USER-side education (account modal + ebook sheet name the
+    // sender via /api/features); the admin card only notes that it's handled (UAT 2026-07-29).
     renderCard({ notifiers: [emailRow('nf_1')], saved: saved('ok') });
 
-    expect(screen.getByText(/Approved Personal Document E-mail List/i)).toBeInTheDocument();
-    expect(screen.getByText('bot@ex.com')).toBeInTheDocument();
+    expect(screen.getByText(/your users add this address/i)).toBeInTheDocument();
+    expect(screen.queryByText(/Approved Personal Document E-mail List/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(saveButton()).not.toBeInTheDocument();
   });
 

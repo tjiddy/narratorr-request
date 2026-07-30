@@ -91,9 +91,8 @@ describe('SettingsPage → EbooksSection → KindleSenderCard wiring (#143/#193)
       }),
     );
 
-    // The card sees the saved baseline: the ok block names the address to allowlist…
-    expect(screen.getByText(/Approved Personal Document E-mail List/i)).toBeInTheDocument();
-    expect(screen.getByText('Bot@Ex.com')).toBeInTheDocument();
+    // The card sees the saved baseline: the ok block renders its quiet users-allowlist note…
+    expect(screen.getByText(/your users add this address/i)).toBeInTheDocument();
     // …the draft seeds to the saved id, so there is nothing to save…
     expect((screen.getByLabelText('Kindle sender') as HTMLSelectElement).value).toBe('nf_1');
     expect(screen.queryByRole('button', { name: /save|reconfirm/i })).not.toBeInTheDocument();
