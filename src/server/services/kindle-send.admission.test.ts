@@ -5,6 +5,7 @@ import {
   emailRuntimeConfig,
   type KindleSendHarness,
 } from '../test-support/kindle-send.js';
+import { drizzleConstraintError } from '../test-support/db.js';
 import { kindleSends, users } from '../../db/schema.js';
 import {
   KINDLE_SEND_AUDIT_RETENTION_MS,
@@ -644,8 +645,11 @@ describe('pre-reservation operational failures — the infrastructure exception'
             Promise.reject(
               // A CHECK breach is genuine corruption, not "slow down" — the broad
               // SQLITE_CONSTRAINT classifier would have mislabelled this `rate_limited`.
-              Object.assign(new Error('Failed query: insert into "kindle_sends"'), {
-                cause: new Error('SQLITE_CONSTRAINT: CHECK constraint failed: kindle_sends_status_finalized'),
+              drizzleConstraintError({
+                rawCode: 275,
+                code: 'SQLITE_CONSTRAINT_CHECK',
+                driverMessage: 'CHECK constraint failed: kindle_sends_status_finalized',
+                table: 'kindle_sends',
               }),
             ),
         }),
