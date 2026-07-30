@@ -29,6 +29,14 @@ const hoisted = vi.hoisted(() => ({
     updateConnectorSettings: vi.fn(),
     getFeatures: vi.fn(),
     sendEbookToKindle: vi.fn(),
+    requestBookFrom: vi.fn(),
+    decideRequest: vi.fn(),
+    updateUser: vi.fn(),
+    testConnector: vi.fn(),
+    createNotifier: vi.fn(),
+    updateNotifier: vi.fn(),
+    deleteNotifier: vi.fn(),
+    testNotifier: vi.fn(),
   },
   // A module-scoped slot backing the test-only `react` useState mock so a re-invoked
   // `useTheme()` observes the value a prior `toggleTheme()` wrote.
@@ -60,6 +68,14 @@ vi.mock('./api', async (importActual) => {
     updateConnectorSettings: hoisted.api.updateConnectorSettings,
     getFeatures: hoisted.api.getFeatures,
     sendEbookToKindle: hoisted.api.sendEbookToKindle,
+    requestBookFrom: hoisted.api.requestBookFrom,
+    decideRequest: hoisted.api.decideRequest,
+    updateUser: hoisted.api.updateUser,
+    testConnector: hoisted.api.testConnector,
+    createNotifier: hoisted.api.createNotifier,
+    updateNotifier: hoisted.api.updateNotifier,
+    deleteNotifier: hoisted.api.deleteNotifier,
+    testNotifier: hoisted.api.testNotifier,
   };
 });
 
@@ -420,6 +436,15 @@ describe('centralized read-site keys + prefix guards', () => {
 // modality structurally cannot express (no cache, no observer, no refetch — see the file header);
 // that is proven at the API boundary in `hooks.request-error-path.test.tsx`.
 describe('useRequestBook', () => {
+  // The dispatch row: driving only the settled callbacks would leave `mutationFn` free to drop
+  // or rewrite the search result with every test below still green.
+  it('dispatches requestBookFrom with the untouched search result', async () => {
+    const result = { asin: 'B01', title: 'Dune' } as never;
+    await mutFn(useRequestBook())(result);
+    expect(hoisted.api.requestBookFrom).toHaveBeenCalledTimes(1);
+    expect(hoisted.api.requestBookFrom).toHaveBeenCalledWith(result);
+  });
+
   it('toasts "already available" on an available result — and the toast alone, no invalidation', () => {
     cb(useRequestBook()).onSuccess(req({ status: 'available', title: 'Dune' }));
     expect(success).toHaveBeenCalledWith('“Dune” is already available!');
@@ -466,6 +491,16 @@ describe('useRequestBook', () => {
 });
 
 describe('useDecide', () => {
+  // The variables object is SPLIT into positional args on the wire — exactly the seam a
+  // callbacks-only test can't see (swapping id/action would keep every row below green).
+  it('dispatches decideRequest with id, action and note split into positional args', async () => {
+    await mutFn(useDecide())({ publicId: 'rq_1', action: 'approve', note: 'ok by me' });
+    expect(hoisted.api.decideRequest).toHaveBeenCalledWith('rq_1', 'approve', 'ok by me');
+
+    await mutFn(useDecide())({ publicId: 'rq_2', action: 'deny' });
+    expect(hoisted.api.decideRequest).toHaveBeenLastCalledWith('rq_2', 'deny', undefined);
+  });
+
   it('toasts Approved/Denied with curly quotes — and the toast alone, no invalidation', () => {
     const h = cb(useDecide());
     h.onSuccess(req({ title: 'Dune' }), { action: 'approve' });
@@ -503,6 +538,12 @@ describe('useDecide', () => {
 
 describe('useUpdateUser', () => {
   const user = { username: 'todd' } as UserDto;
+
+  it('dispatches updateUser with the target id and the exact patch, split positionally', async () => {
+    await mutFn(useUpdateUser())({ publicId: 'us_1', patch: { role: 'admin' } });
+    expect(hoisted.api.updateUser).toHaveBeenCalledTimes(1);
+    expect(hoisted.api.updateUser).toHaveBeenCalledWith('us_1', { role: 'admin' });
+  });
 
   it('toasts the saved username — and the toast alone, no invalidation', () => {
     cb(useUpdateUser()).onSuccess(user);
@@ -654,6 +695,15 @@ describe('useUpdateMe — account save with proportional feedback (#50, #134)', 
 
 describe('useUpdateConnectors', () => {
   const dto = { publicUrl: null } as ConnectorSettingsDto;
+
+  it('puts the submitted body on the wire through updateConnectorSettings, unmodified', async () => {
+    hoisted.api.updateConnectorSettings.mockResolvedValue(dto);
+    const body: UpdateConnectorSettingsBody = { publicUrl: 'https://app.example.com' };
+
+    await expect(mutFn(useUpdateConnectors())(body)).resolves.toBe(dto);
+    expect(hoisted.api.updateConnectorSettings).toHaveBeenCalledTimes(1);
+    expect(hoisted.api.updateConnectorSettings).toHaveBeenCalledWith({ publicUrl: 'https://app.example.com' });
+  });
 
   it('INVALIDATES the connectors cache (never setQueryData) and toasts "Settings saved"', () => {
     // It used to write `dto` wholesale. That is a lost-update race now that Public URL, quota,
@@ -839,6 +889,13 @@ describe('useUpdateKindleSender (#143)', () => {
 });
 
 describe('useTestConnector', () => {
+  it('dispatches testConnector with the exact probe body (unsaved form values ride along)', async () => {
+    const body = { channel: 'narratorr', narratorr: { url: 'http://n:3000', apiKey: 'k' } } as never;
+    await mutFn(useTestConnector())(body);
+    expect(hoisted.api.testConnector).toHaveBeenCalledTimes(1);
+    expect(hoisted.api.testConnector).toHaveBeenCalledWith(body);
+  });
+
   it('routes a success result to toast.success and a failure to toast.error', () => {
     const h = cb(useTestConnector());
     h.onSuccess({ success: true, message: 'Connected' } as TestConnectorResult);
@@ -861,6 +918,28 @@ describe('notifier mutation hooks — cache invalidation + toast contract', () =
   // invalidate that exact key (not setQueryData) to refetch the committed list + reset
   // freshly-masked secrets. All three assert the shared qk.connectors entry, so a drift
   // between the four connectors sites would fail here.
+
+  // Dispatch rows — the CRUD trio splits its variables differently on the wire (body verbatim /
+  // id+body positional / bare id), so each seam gets its own exact-args receipt.
+  it('useCreateNotifier dispatches createNotifier with the body verbatim', async () => {
+    const body = { name: 'ops', type: 'ntfy', events: ['request.created'], config: { topic: 't' } } as never;
+    await mutFn(useCreateNotifier())(body);
+    expect(hoisted.api.createNotifier).toHaveBeenCalledTimes(1);
+    expect(hoisted.api.createNotifier).toHaveBeenCalledWith(body);
+  });
+
+  it('useUpdateNotifier splits { id, body } into positional args', async () => {
+    const body = { name: 'ops', type: 'ntfy', events: ['request.created'], config: { topic: 't' } } as never;
+    await mutFn(useUpdateNotifier())({ id: 'nf_1', body });
+    expect(hoisted.api.updateNotifier).toHaveBeenCalledTimes(1);
+    expect(hoisted.api.updateNotifier).toHaveBeenCalledWith('nf_1', body);
+  });
+
+  it('useDeleteNotifier dispatches deleteNotifier with the bare id', async () => {
+    await mutFn(useDeleteNotifier())('nf_2');
+    expect(hoisted.api.deleteNotifier).toHaveBeenCalledTimes(1);
+    expect(hoisted.api.deleteNotifier).toHaveBeenCalledWith('nf_2');
+  });
 
   it('useCreateNotifier invalidates the connectors key and toasts "Notifier added"', () => {
     cb(useCreateNotifier()).onSettled();
@@ -955,6 +1034,13 @@ describe('notifier mutation hooks — cache invalidation + toast contract', () =
 });
 
 describe('useTestNotifier — routes the probe result to a toast', () => {
+  it('dispatches testNotifier with the exact candidate body (type/config/event, no save)', async () => {
+    const body = { type: 'webhook', config: { url: 'https://x' }, event: 'request.created' } as never;
+    await mutFn(useTestNotifier())(body);
+    expect(hoisted.api.testNotifier).toHaveBeenCalledTimes(1);
+    expect(hoisted.api.testNotifier).toHaveBeenCalledWith(body);
+  });
+
   it('routes a success result to toast.success and a failure to toast.error', () => {
     const h = cb(useTestNotifier());
     h.onSuccess({ success: true, message: 'Test notification sent.' } as TestConnectorResult);
