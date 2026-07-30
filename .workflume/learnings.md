@@ -323,3 +323,112 @@ async function settleFeaturesTo(client: QueryClient, response: Response, status:
 For a genuine loading case, assert `getQueryState(key)?.status === 'pending'` AND that the request was issued — otherwise "loading" is indistinguishable from "the query never started". Needs `retry: false` on the test `QueryClient` so a 5xx reaches `error` in one tick.
 
 How to check such a test is not vacuous: mutate the gate so it fails ONLY in the branch under test (e.g. `ebooksVisible` -> `state.isError === true || state.data?.ebooksEnabled === true`) and confirm exactly that case goes red. On #147 this exposed a MyRequestsPage error-state test that stayed green while the affordance was fully regressed.
+
+## drizzle-error-cause-chain
+
+**source:** #148  
+**added:** 2026-07-29  
+**files:** src/server/services/kindle-send.policy.ts  
+**tags:** drizzle, libsql, sqlite, error-handling, constraints
+
+---
+
+drizzle-orm wraps a rejected statement in its OWN error — `Failed query: insert into "…" (…)\nparams: …` — and hangs the driver error off `cause`. The outer message never names the constraint. So any classifier keyed on `err.message` (unique breach, FK breach, CHECK breach) returns false for every REAL failure while passing unit tests built from synthetic `new Error('UNIQUE constraint failed: …')` values, which have no cause chain.
+
+Walk the chain instead:
+
+    function causeChainMessages(err: unknown, depth = 0): string {
+      if (depth > 5) return '';
+      if (!(err instanceof Error)) return err == null ? '' : String(err);
+      return `${err.message}\n${causeChainMessages(err.cause, depth + 1)}`;
+    }
+
+With @libsql/client 0.17.3 the nested error is `LibsqlError: SQLITE_CONSTRAINT: UNIQUE constraint failed: <table>.<col>, <table>.<col>` carrying `code: 'SQLITE_CONSTRAINT'` and `rawCode: 2067` (`SQLITE_CONSTRAINT_UNIQUE`). Reference implementation: `isActiveKindleSendCollision()` in `src/server/services/kindle-send.policy.ts`.
+
+Corollary for tests: a synthetic-error unit test CANNOT validate one of these classifiers. Drive at least one case through a real in-memory libSQL insert (`src/server/services/kindle-send.admission.test.ts` does). Known exception still outstanding: `isUniqueViolation()` in `src/server/util/db.ts` has the message-only form, so its race-resolution consumer in `user.service.ts` never fires.
+
+## nodemailer-destroy-attachment-with-error
+
+**source:** #148  
+**added:** 2026-07-29  
+**files:** src/server/services/kindle-send.service.ts  
+**tags:** nodemailer, node-streams, smtp, timeouts, backpressure
+
+---
+
+When a Node `Readable` is handed to nodemailer as an attachment (`attachments: [{ content: stream }]`), `stream.destroy()` with NO argument closes it without emitting `error`, and nodemailer's `MimeNode` reader just waits — `transport.sendMail()` never settles. A deadline that tears the stream down this way selects an outcome but does not actually abort anything, and the awaiting code hangs.
+
+Always `stream.destroy(new Error(...))`. Erroring the attachment is what makes nodemailer abort before the `\r\n.\r\n` terminator, which is what makes the receiving server discard the partial message — i.e. it is the mechanism behind "a truncated file can never arrive as a successful email", not an implementation detail. Attach a no-op `stream.on('error', () => {})` at construction so the teardown cannot surface as an UNCAUGHT error in the window between nodemailer removing its handlers and the stream being destroyed; on a stream that already reached `end` the destroy is a harmless no-op (autoDestroy has already run).
+
+Related, same file: `SMTPTransport.close()` is cleanup, NOT cancellation (nodemailer 9.0.1, `lib/smtp-transport/index.js:420-425` — it only removes OAuth listeners and emits `'close'`; the live connection is a local inside `send()` and never listens for it). So once the attachment reaches `end` there is no cancellation seam on a non-pooled transport at all, and any claim of an absolute bound on the post-DATA window is false.
+
+Testing rule this came from: a deadline test must assert the work TERMINATES (the receiving server recorded no completed message; the call returned within a bound), not merely that the deadline produced a decision. `destroy()` vs `destroy(err)` is invisible to the latter and fails only the former — see `src/server/services/kindle-send.stream.test.ts`.
+
+## keyed-siblings-on-conditional-reorder
+
+**source:** #149  
+**added:** 2026-07-29  
+**files:** src/client/components/EbookSheet.tsx  
+**tags:** react, reconciliation, jsdom, testing-library
+
+---
+
+Two sibling elements whose ORDER flips on a state change must carry stable `key`s. React reconciles positional children by index, so `{cond ? <A/> : <B/>}{cond ? <B/> : <A/>}` keeps both DOM nodes in place on a flip and just rewrites their props — element identity, focus, hover and in-flight host state all transplant onto the wrong control.
+
+Found in `src/client/components/EbookSheet.tsx` (#149), where Send and Download swap position across the three hierarchy states. `MyRequestsPage.test.tsx`'s 'keeps the sheet mounted through a rerender while the download is still PENDING' captured the Download element, the features query then settled and moved the sheet State C -> State A, and the captured node had silently become Send — the test failed with 'unable to find a button named /downloading/i' while a Download button was plainly on screen.
+
+The fix is a keyed array, not a fragment pair: `const download = <Button key="download" …/>; const sendControl = <Button key="send" …/>;` then `{sendPrimary ? [sendControl, download] : [download, sendControl]}`.
+
+This is invisible to any test that renders one state and never transitions — which is most component tests. It only surfaces once a test drives the transition, or once live queries settle mid-interaction. So when a component reorders controls based on query state, add a transition case deliberately; related to [[synchronize-dependent-query-before-absence-assert]], which is about the same class of query-settles-mid-test timing.
+
+## react-query-observer-lags-cache-on-refetch-error
+
+**source:** #149  
+**added:** 2026-07-29  
+**files:** src/client/components/EbookSheet.test.tsx  
+**tags:** react-query, vitest, jsdom, testing-library, test-assertions
+
+---
+
+In TanStack Query v5, the CACHE and the mounted OBSERVER reach a refetch error at different times, and only the observer drives rendering.
+
+On a refetch failure with retained data the reducer sets `status: 'error'` without clearing `data`. So immediately after `await act(async () => { await client.refetchQueries({queryKey}) })`:
+
+- `client.getQueryState(key)` → `{status: 'error', errorUpdateCount: 1, data: <retained>}` — already correct.
+- the component's observer result → still `{status: 'success', isError: false, error: null, errorUpdateCount: 0}` — the pre-error snapshot.
+- `await act(async () => {})` does NOT flush it (measured render count unchanged). The notification lands later; `waitFor` on a DOM effect is required.
+
+This REFINES [[synchronize-dependent-query-before-absence-assert]], whose recipe is `waitFor(getQueryState(...).status)` then `act(async () => {})` then assert synchronously. That recipe is right for a query settling for the FIRST time; it is insufficient for a refetch-error transition, where it produces a test that reads the pre-error UI and fails as if the production gate were broken. Distinguishing the two costs an afternoon if you assume the library is reporting no error at all — which is what the stale observer snapshot looks like.
+
+The shape (`src/client/components/EbookSheet.test.tsx`):
+
+```ts
+await act(async () => { await client.refetchQueries({ queryKey: qk.features }) })
+// premise, asserted not assumed: errored AND payload retained
+expect(client.getQueryState(qk.features)?.status).toBe('error')
+expect(client.getQueryState(qk.features)?.data).toEqual(FEATURES_A)
+// the observer lags — wait for the POSITIVE effect before any synchronous absence assertion
+await waitFor(() => expect(sendButton()).toBeDisabled())
+expectStateC()
+```
+
+Why it matters beyond tests: retained-data-plus-error is the ONLY reachable state where `ebooksVisible`'s `!state.isError` term differs from a bare `state.data?.x === true`. Every other state has `data === undefined`, so without this case the fail-safe gate is untested — PR #186 F1 showed the entire suite staying green with the gate deleted.
+
+## verify-the-mutation-applied
+
+**source:** #150  
+**added:** 2026-07-29  
+**tags:** mutation-testing, genuine-red, vitest, test-verification
+
+---
+
+A genuine-red mutation that leaves the test GREEN is not evidence the test is vacuous until you have proved the mutation actually landed. `git diff --stat` is not that proof — it reports a changed line even when the replacement text was mangled (e.g. `perl -0pi -e "s/…/…\${x}…/"` in a double-quoted bash string: bash eats the backslash, perl interprets `${x}` itself, and something other than the intended code is written). Encountered in #150 while verifying the AC21 log-sweep assertion; the mangled mutation read as "the raw-line log assertion is not discriminating", and re-running it correctly turned the test red at once.
+
+Working pattern for the repo's mandated genuine-red step:
+
+1. apply the edit with a heredoc'd `python3` script that asserts the exact original string exists before replacing it (a silent no-match is the other half of this trap);
+2. `grep -n` the mutated line and read it;
+3. run only the named test (`pnpm exec vitest run --project=node <file> -t "<name>"`);
+4. `git checkout -- .` (commit new files first — checkout does not revert untracked ones).
+
+The cost of skipping step 2 is asymmetric: a false "still green" invites deleting or weakening a good assertion, which is precisely the vacuous-test outcome the genuine-red bar exists to prevent.
