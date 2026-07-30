@@ -507,9 +507,15 @@ describe('admin decisions + handoff', () => {
     expect(row?.status).toBe('failed');
   });
 
-  it('leaves a request `approved` on a TRANSIENT handoff error (5xx) for the poller to retry', async () => {
+  // Terminality is keyed on `upstreamStatus` (400/409/422), never on the code — so #213's new
+  // status-0 `TIMEOUT` stays transient exactly like the 5xx and the status-0 NETWORK it split from.
+  it.each([
+    ['5xx', () => new NarratorrError(502, 'UPSTREAM', 'down')],
+    ['status-0 NETWORK', () => new NarratorrError(0, 'NETWORK', 'unreachable')],
+    ['status-0 TIMEOUT', () => new NarratorrError(0, 'TIMEOUT', 'timed out')],
+  ])('leaves a request `approved` on a TRANSIENT handoff error (%s) for the poller to retry', async (_label, err) => {
     const admin = await insertUser(db, { role: 'admin' });
-    client.throwOnAdd = new NarratorrError(502, 'UPSTREAM', 'down');
+    client.throwOnAdd = err();
     const svc = new RequestService(db, client, policy());
     await expect(svc.create(admin.id, body('B1'))).rejects.toBeInstanceOf(NarratorrError);
     const [row] = await db.select().from(requests).where(eq(requests.asin, 'B1'));

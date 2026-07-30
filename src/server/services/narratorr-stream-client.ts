@@ -1,4 +1,4 @@
-import { classifyErrorBody, NarratorrError } from './narratorr-client.js';
+import { classifyErrorBody, classifyTransportFailure, NarratorrError } from './narratorr-client.js';
 
 /**
  * Header-acquisition deadline. Covers ONLY the response headers — see
@@ -138,8 +138,14 @@ export class NarratorrStreamClient {
       // dead" are the same AbortError here but very different log lines. The caller's signal
       // wins — a composed abort we did not schedule is theirs.
       if (opts.signal?.aborted) throw abortedError(path);
-      const reason = headerTimedOut && err instanceof Error && err.name === 'AbortError' ? 'timed out' : 'unreachable';
-      throw new NarratorrError(0, 'NETWORK', `Narratorr GET ${path} ${reason}`);
+      // Our OWN header timer fired the abort, and it surfaces as an `AbortError` — this predicate
+      // is the only part of the classification specific to THIS client (the JSON client has no
+      // caller signal to disambiguate, so its predicate is the `headerTimedOut`-free version).
+      // What the boolean MEANS is the SHARED decision `NarratorrClient` applies too (#173).
+      throw classifyTransportFailure(
+        `Narratorr GET ${path}`,
+        headerTimedOut && err instanceof Error && err.name === 'AbortError',
+      );
     } finally {
       // Cleared on BOTH paths — a leaked timer is an open handle aimed at nothing.
       clearTimeout(timer);
