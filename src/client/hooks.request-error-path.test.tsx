@@ -514,20 +514,22 @@ describe('useLocalAuth — a corrected retry cannot be stranded by the failed at
     await waitFor(() => expect(server.reads).toHaveLength(1));
     expect(server.reads[0]!.signedInAtIssue).toBe(false); // issued before any session exists
 
-    // 2. PROVE the hazard is armed: the query is fetching with NO data, which is exactly the state
-    //    in which a later invalidation cannot supersede. Issuing one here adds no request — it
-    //    rides read #1 — so a retry dispatched now would be answered by that pre-cookie read.
+    // 2. PIN THE RAW LIBRARY BEHAVIOUR the reconciler has to defeat: the query is fetching with NO
+    //    data, and a BARE `invalidateQueries` in that state issues no request at all — it adopts
+    //    read #1's promise, so a settlement reconciled that way would be answered by this pre-cookie
+    //    read. This is the precondition failure `reconcileMeWrite` cancels around (#201 F2); the row
+    //    below proves the reconciler itself is not subject to it.
     expect(client.getQueryState(qk.me)?.fetchStatus).toBe('fetching');
     expect(client.getQueryState(qk.me)?.data).toBeUndefined();
     const readsBefore = server.state.meGets;
     void client.invalidateQueries({ queryKey: qk.me });
     await act(async () => {});
-    expect(server.state.meGets).toBe(readsBefore); // no new GET — the supersession path is unavailable
+    expect(server.state.meGets).toBe(readsBefore); // no new GET — the supersession arm is unavailable
     expect(server.reads).toHaveLength(1);
 
-    // 3. THE GUARD: the mutation has not settled, so `LoginPage`'s submit stays disabled and the
-    //    retry cannot be dispatched into that window. This is the assertion that fails if
-    //    `onSettled` fires the reconciliation and forgets it.
+    // 3. The pending boundary: the mutation has not settled, so `LoginPage`'s submit and mode switch
+    //    stay disabled and the form runs one attempt at a time. This is ordering hygiene, not the
+    //    correctness guarantee — the row below removes it deliberately and still converges.
     expect(result.current.auth.isPending).toBe(true);
     expect(result.current.auth.isError).toBe(false);
 
@@ -546,6 +548,56 @@ describe('useLocalAuth — a corrected retry cannot be stranded by the failed at
     server.reads[1]!.release();
     await waitFor(() => expect(result.current.me.data?.publicId).toBe('us_1'));
     expect(result.current.auth.isPending).toBe(false);
+  });
+
+  /**
+   * THE ROOT-FIX ROW (#201 F2). The row above keeps the submit lock intact; this one takes it away
+   * on purpose and requires the same outcome, because a lock the UI holds is not where a cache-layer
+   * guarantee belongs.
+   *
+   * `auth.reset()` is exactly what `LoginPage`'s mode switch calls, and it detaches the observer from
+   * the STILL-RUNNING mutation (`MutationObserver.reset` → `mutation.removeObserver(this)` →
+   * `#updateResult()` on a now-undefined mutation), so `isPending` drops to false while the
+   * data-less reconciliation read is still open. Calling it here reproduces the bypass directly,
+   * without depending on any particular consumer's markup — so this row keeps holding even if the
+   * form's guard is later removed, refactored, or reintroduced somewhere new.
+   */
+  it('converges even when the submit lock is bypassed mid-read by auth.reset() (the mode-switch shape)', async () => {
+    const server = fakeServer();
+    const client = newClient();
+    const { result } = renderHook(() => ({ me: useMe(), auth: useLocalAuth('login') }), { wrapper: wrapper(client) });
+    await waitFor(() => expect(result.current.me.isError).toBe(true));
+    server.openReadGate();
+
+    // 1. A bad attempt, whose data-less reconciliation read we hold open.
+    result.current.auth.mutate({ email: 'a@b.c', password: 'wrong' });
+    await waitFor(() => expect(server.reads).toHaveLength(1));
+    expect(server.reads[0]!.signedInAtIssue).toBe(false);
+    expect(result.current.auth.isPending).toBe(true);
+
+    // 2. FORCE THE BYPASS: detach the observer exactly as the mode switch does. The lock is gone…
+    act(() => result.current.auth.reset());
+    await waitFor(() => expect(result.current.auth.isPending).toBe(false));
+    // …while read #1 is demonstrably still in flight and the key still holds no data — the precise
+    // state in which a bare invalidation would have adopted that pre-cookie read.
+    expect(server.reads).toHaveLength(1);
+    expect(client.getQueryState(qk.me)?.fetchStatus).toBe('fetching');
+    expect(client.getQueryState(qk.me)?.data).toBeUndefined();
+
+    // 3. The corrected retry goes out INTO that open window and mints a session.
+    result.current.auth.mutate({ email: 'a@b.c', password: 'correct' });
+
+    // 4. Its settlement cancels the stale read and issues a FRESH one — taken after the cookie.
+    await waitFor(() => expect(server.reads).toHaveLength(2));
+    expect(server.reads[1]!.signedInAtIssue).toBe(true);
+
+    // 5. Deliver the fresh read first, then the stale pre-cookie one, which must not win.
+    server.reads[1]!.release();
+    await waitFor(() => expect(result.current.me.data?.publicId).toBe('us_1'));
+    server.reads[0]!.release();
+    await act(async () => {});
+    expect(result.current.me.data?.publicId).toBe('us_1');
+    expect(client.getQueryState(qk.me)?.data).toMatchObject({ publicId: 'us_1' });
   });
 });
 
