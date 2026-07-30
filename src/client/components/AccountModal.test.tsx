@@ -3,7 +3,7 @@ import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { MeDto } from '@shared/schemas/user';
-import { useMe } from '../hooks';
+import { qk, useMe } from '../hooks';
 import { KINDLE_EMAIL_HELP } from '../pages/notify-prefs';
 import { AccountModal } from './AccountModal';
 import {
@@ -61,6 +61,13 @@ let patchBodies: PatchBody[];
 let serverMe: MeDto;
 /** Per-test override for how a PATCH resolves. Default: apply it the way the server would. */
 let patchResponder: (body: PatchBody) => Promise<Response>;
+/**
+ * Per-test override for how a `GET /api/me` resolves, given the row AS IT STOOD when the request was
+ * issued. Default: answer that snapshot immediately. The snapshot is taken at ISSUE time on purpose —
+ * a reconciliation read that a later invalidation supersedes must be releasable with the state it
+ * would genuinely have carried (#168 F10).
+ */
+let getResponder: (snapshot: MeDto) => Promise<Response>;
 /** The /api/features payload — the eBooks group is gated on `ebooksEnabled` (#193 follow-up),
  *  so the default keeps it visible and the existing Kindle-row tests meaningful. */
 let featuresRes: { ebooksEnabled: boolean; kindleDeliveryAvailable: boolean; kindleSenderEmail: string | null };
@@ -90,7 +97,7 @@ function installFetchStub(): void {
           patchBodies.push(body);
           return patchResponder(body);
         }
-        return Promise.resolve(jsonRes(200, serverMe));
+        return getResponder({ ...serverMe });
       }
       throw new Error(`unstubbed fetch: ${url}`);
     }),
@@ -114,6 +121,7 @@ async function renderModal(me: Partial<MeDto> = {}) {
     </QueryClientProvider>,
   );
   await screen.findByLabelText('Kindle address');
+  return client;
 }
 
 const kindleInput = () => screen.getByLabelText('Kindle address') as HTMLInputElement;
@@ -124,6 +132,7 @@ const emailSave = () => screen.getByRole('button', { name: 'Save email' });
 beforeEach(() => {
   patchBodies = [];
   patchResponder = applyPatch;
+  getResponder = (snapshot) => Promise.resolve(jsonRes(200, snapshot));
   featuresRes = { ebooksEnabled: true, kindleDeliveryAvailable: false, kindleSenderEmail: null };
   installFetchStub();
 });
@@ -326,6 +335,11 @@ describe('AccountModal — overlapping row saves settle race-safely (#142 F1)', 
         release['email' in body ? 'contact' : 'kindle'] = () => resolve(jsonRes(200, snapshot));
       });
     await renderModal({ email: 'todd@example.com', kindleEmail: null });
+    // Hold the settlement reconciliation reads (#168) so these two rows keep asserting the MERGE in
+    // ISOLATION: whether a stale read can later undo it is a different claim, gated step-by-step in
+    // the F10 describe below. Letting an authoritative GET land here would repair the cache
+    // regardless of how the two responses folded, making these rows vacuous.
+    getResponder = () => new Promise<Response>(() => {});
 
     await user.clear(emailInput());
     await user.type(emailInput(), 'new@contact.com');
@@ -365,6 +379,208 @@ describe('AccountModal — overlapping row saves settle race-safely (#142 F1)', 
     expect(emailInput().value).toBe('new@contact.com');
     expect(emailSave()).toBeDisabled();
     expect(kindleSave()).toBeDisabled();
+  });
+});
+
+// --- Committed-then-failed saves reconcile from settlement (#168 AC4/AC7) -----
+
+/** A promise the test resolves by hand. */
+function deferred() {
+  let resolve!: (res: Response) => void;
+  const promise = new Promise<Response>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+describe('AccountModal — a save that COMMITS and then fails still reconciles (#168 AC4/AC7)', () => {
+  it('reconciles the normalized address without leaving Save falsely dirty, and keeps the typed text', async () => {
+    const user = userEvent.setup();
+    // `PATCH /api/me` writes the field and only then builds its DTO through the fallible shared tail
+    // (`buildMeDto`), so this is a durable write behind a 500 — not a rejected one.
+    patchResponder = (body) => {
+      serverMe = { ...serverMe, email: normalize(body['email']) }; // COMMIT
+      return Promise.resolve(jsonRes(500, { error: { code: 'INTERNAL', message: 'quota lookup blew up' } }));
+    };
+    const client = await renderModal({ email: null });
+
+    await user.type(emailInput(), 'Foo@Ex.COM');
+    await user.click(emailSave());
+
+    // The row surfaces the failure — the user's signal that something went wrong is unchanged.
+    await screen.findByText('quota lookup blew up');
+    // …and the settlement refetch lands the committed, server-normalized value.
+    await waitFor(() => expect(client.getQueryState(qk.me)?.data).toMatchObject({ email: 'foo@ex.com' }));
+
+    // The draft is NEVER rewritten on the error path (the client cannot tell a committed failure
+    // from an uncommitted one), so the typed text stands…
+    expect(emailInput().value).toBe('Foo@Ex.COM');
+    // …and the case-insensitive dirty compare is what stops it reading as a pending change.
+    await waitFor(() => expect(emailSave()).toBeDisabled());
+  });
+
+  it('leaves Save ENABLED when the value genuinely differs from what the server stored', async () => {
+    const user = userEvent.setup();
+    // The non-vacuous companion to the row above: an uncommitted (or differently-committed) failure
+    // must keep the retry affordance. Only a case-only difference goes at rest.
+    patchResponder = () =>
+      Promise.resolve(jsonRes(400, { error: { code: 'FST_ERR_VALIDATION', message: 'enter a valid email address' } }));
+    await renderModal({ email: 'todd@example.com' });
+
+    await user.clear(emailInput());
+    await user.type(emailInput(), 'nope@elsewhere.com');
+    await user.click(emailSave());
+
+    await screen.findByText('enter a valid email address');
+    expect(emailSave()).toBeEnabled();
+  });
+});
+
+/**
+ * F10: the overlap case AC4's settlement policy exists for. The two rows own independent mutation
+ * instances, so their PATCHes — and therefore their reconciliation GETs — interleave. The hazard is a
+ * reconciliation READ that was issued BEFORE a sibling's commit and delivered AFTER it: if that stale
+ * snapshot were allowed to land, it would replace the whole `me` entry and roll the sibling back, the
+ * exact #142 shape the merge exists to prevent.
+ *
+ * Every step is separately gated — the two COMMITS, the two mutation RESPONSES, and each GET's
+ * snapshot and delivery — because a fake that commits both fields before the first GET is issued
+ * would pass without any cancellation happening at all.
+ */
+describe('AccountModal — a stale reconciliation read cannot overwrite a newer sibling save (#168 F10)', () => {
+  interface Gates {
+    commit: Record<'contact' | 'kindle', () => void>;
+    respond: Record<'contact' | 'kindle', () => void>;
+    reads: { snapshot: MeDto; release: () => void }[];
+  }
+
+  /** Dispatch both row saves without letting either commit or answer yet. */
+  async function dispatchBothSaves(): Promise<{ gates: Gates; client: QueryClient }> {
+    const user = userEvent.setup();
+    const responses: Record<string, ReturnType<typeof deferred>> = {};
+    const reads: Gates['reads'] = [];
+    const gates: Gates = {
+      commit: {
+        // The contact save COMMITS its (normalized) value and then fails in the DTO tail.
+        contact: () => {
+          serverMe = { ...serverMe, email: 'foo@ex.com' };
+        },
+        kindle: () => {
+          serverMe = { ...serverMe, kindleEmail: 'device@kindle.com' };
+        },
+      },
+      respond: {
+        contact: () =>
+          responses['contact']?.resolve(
+            jsonRes(500, { error: { code: 'INTERNAL', message: 'quota lookup blew up' } }),
+          ),
+        // The Kindle save succeeds, echoing the row as the server reads it AT RESPONSE TIME.
+        kindle: () => responses['kindle']?.resolve(jsonRes(200, { ...serverMe })),
+      },
+      reads,
+    };
+
+    // The initial load runs through the default responders; only from here on is every step gated.
+    const client = await renderModal({ email: null, kindleEmail: null });
+
+    patchResponder = (body) => {
+      const which = 'email' in body ? 'contact' : 'kindle';
+      responses[which] = deferred();
+      return responses[which].promise;
+    };
+    getResponder = (snapshot) => {
+      const gate = deferred();
+      reads.push({ snapshot, release: () => gate.resolve(jsonRes(200, snapshot)) });
+      return gate.promise;
+    };
+    expect(reads).toHaveLength(0);
+
+    await user.type(emailInput(), 'Foo@Ex.COM');
+    await user.type(kindleInput(), 'device@kindle.com');
+    await user.click(emailSave());
+    await user.click(kindleSave());
+    await waitFor(() => expect(patchBodies).toHaveLength(2));
+
+    return { gates, client };
+  }
+
+  /** Let React flush the effects a gate release schedules. */
+  const settle = async () => {
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+  };
+
+  async function expectBothCommittedValuesSurvive(client: QueryClient) {
+    await waitFor(() =>
+      expect(client.getQueryState(qk.me)?.data).toMatchObject({
+        email: 'foo@ex.com',
+        kindleEmail: 'device@kindle.com',
+      }),
+    );
+    // The user-visible consequence: neither row reads as a pending change. The contact draft keeps
+    // its typed casing (its save failed, so it is never reconciled) and goes clean on the
+    // case-insensitive compare; the Kindle draft was reconciled by its own success handler.
+    expect(emailInput().value).toBe('Foo@Ex.COM');
+    expect(kindleInput().value).toBe('device@kindle.com');
+    await waitFor(() => expect(emailSave()).toBeDisabled());
+    expect(kindleSave()).toBeDisabled();
+  }
+
+  it('when the contact error settles FIRST, its in-flight read is superseded by the Kindle settlement', async () => {
+    const { gates, client } = await dispatchBothSaves();
+
+    // 1. The contact write commits and its response fails — the settlement issues read #1.
+    gates.commit.contact();
+    gates.respond.contact();
+    await screen.findByText('quota lookup blew up');
+    await waitFor(() => expect(gates.reads).toHaveLength(1));
+
+    // 2. PROVE the hazard is armed: read #1 captured PRE-Kindle state and is still in flight. This
+    //    is what a fake that commits everything up front would fail to establish.
+    expect(gates.reads[0]!.snapshot).toMatchObject({ email: 'foo@ex.com', kindleEmail: null });
+    expect(client.getQueryState(qk.me)?.fetchStatus).toBe('fetching');
+
+    // 3. The Kindle write commits and succeeds; its settlement issues read #2, which supersedes the
+    //    still-pending read #1 (`invalidateQueries` refetches with `cancelRefetch`).
+    gates.commit.kindle();
+    gates.respond.kindle();
+    await waitFor(() => expect(gates.reads).toHaveLength(2));
+    expect(gates.reads[1]!.snapshot).toMatchObject({ email: 'foo@ex.com', kindleEmail: 'device@kindle.com' });
+
+    // 4. Deliver the authoritative read, then the STALE one — the harshest order.
+    gates.reads[1]!.release();
+    await settle();
+    gates.reads[0]!.release();
+    await settle();
+
+    await expectBothCommittedValuesSurvive(client);
+  });
+
+  it('mirrored: when the Kindle success settles FIRST, the trailing contact settlement has the last read', async () => {
+    const { gates, client } = await dispatchBothSaves();
+
+    // 1. The Kindle write commits and succeeds first — merge, then read #1 (pre-contact-commit).
+    gates.commit.kindle();
+    gates.respond.kindle();
+    await waitFor(() => expect(gates.reads).toHaveLength(1));
+    expect(gates.reads[0]!.snapshot).toMatchObject({ email: null, kindleEmail: 'device@kindle.com' });
+    expect(client.getQueryState(qk.me)?.fetchStatus).toBe('fetching');
+
+    // 2. Now the contact write commits and fails; its settlement issues read #2, superseding read #1.
+    gates.commit.contact();
+    gates.respond.contact();
+    await screen.findByText('quota lookup blew up');
+    await waitFor(() => expect(gates.reads).toHaveLength(2));
+    expect(gates.reads[1]!.snapshot).toMatchObject({ email: 'foo@ex.com', kindleEmail: 'device@kindle.com' });
+
+    // 3. Same delivery order: authoritative first, stale last.
+    gates.reads[1]!.release();
+    await settle();
+    gates.reads[0]!.release();
+    await settle();
+
+    await expectBothCommittedValuesSurvive(client);
   });
 });
 

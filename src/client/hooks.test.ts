@@ -405,20 +405,45 @@ describe('centralized read-site keys + prefix guards', () => {
   });
 });
 
+// SCOPE OF THE INVALIDATION ROWS BELOW (#168): they prove only that each settlement REQUESTS the
+// right keys. That mounted observers then converge on the committed row is a consequence this mocked
+// modality structurally cannot express (no cache, no observer, no refetch — see the file header);
+// that is proven at the API boundary in `hooks.request-error-path.test.tsx`.
 describe('useRequestBook', () => {
-  it('toasts "already available" and invalidates myRequests + me on an available result', () => {
+  it('toasts "already available" on an available result — and the toast alone, no invalidation', () => {
     cb(useRequestBook()).onSuccess(req({ status: 'available', title: 'Dune' }));
     expect(success).toHaveBeenCalledWith('“Dune” is already available!');
-    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.myRequests });
-    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.me });
-    // Keys must equal the qk definitions verbatim (no drift).
-    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['requests', 'mine'] });
-    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['me'] });
+    // Reconciliation moved to onSettled; a leftover copy here would double every invalidation.
+    expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalled();
   });
 
   it('toasts "Requested" for a non-available result', () => {
     cb(useRequestBook()).onSuccess(req({ status: 'pending', title: 'Dune' }));
     expect(success).toHaveBeenCalledWith('Requested “Dune”');
+  });
+
+  // `POST /api/requests` INSERTS the row and only then runs the fallible auto-approve `handoff()`,
+  // which rethrows over a row that is already durable (`failed` terminal, or still `approved` on a
+  // transient upstream failure). So a non-2xx is not evidence that nothing was written.
+  it.each([
+    ['a rejected create (committed, then 502)', undefined, new ApiError(502, 'UPSTREAM', 'narratorr blew up')],
+    ['a successful create', req({ status: 'pending' }), null],
+  ])('invalidates BOTH myRequests and me on %s', (_label, data, err) => {
+    cb(useRequestBook()).onSettled(data, err, {});
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.myRequests });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.me });
+    // Keys must equal the qk definitions verbatim (no drift).
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['requests', 'mine'] });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['me'] });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledTimes(2);
+  });
+
+  // `qk.me` is the load-bearing half: the request lists poll at 4s and self-heal, `useMe` does not
+  // (no refetchInterval, 60s staleTime), and an `approved` row occupies a quota slot — so a
+  // transient handoff failure would leave QuotaMeter under-reporting with nothing to repair it.
+  it('refetches the quota-bearing me key even though the request lists poll', () => {
+    cb(useRequestBook()).onSettled(undefined, new ApiError(502, 'UPSTREAM', 'boom'), {});
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.me });
   });
 
   it('surfaces an ApiError message, else the generic fallback, on error', () => {
@@ -431,15 +456,28 @@ describe('useRequestBook', () => {
 });
 
 describe('useDecide', () => {
-  it('toasts Approved/Denied with curly quotes and invalidates the admin-requests prefix', () => {
+  it('toasts Approved/Denied with curly quotes — and the toast alone, no invalidation', () => {
     const h = cb(useDecide());
     h.onSuccess(req({ title: 'Dune' }), { action: 'approve' });
     expect(success).toHaveBeenCalledWith('Approved “Dune”');
     h.onSuccess(req({ title: 'Dune' }), { action: 'deny' });
     expect(success).toHaveBeenCalledWith('Denied “Dune”');
+    // Reconciliation moved to onSettled (#168); a leftover copy here would double it.
+    expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalled();
+  });
+
+  // `decide()` ATOMICALLY CLAIMS the status and only then emits the decision email and hands off,
+  // either of which can throw over an already-committed decision (and the route can still 404 on a
+  // missing requester row).
+  it.each([
+    ['a rejected decision (claimed, then 502)', undefined, new ApiError(502, 'UPSTREAM', 'handoff failed')],
+    ['a successful decision', req({ status: 'approved' }), null],
+  ])('invalidates the admin-requests prefix on %s', (_label, data, err) => {
+    cb(useDecide()).onSettled(data, err, { action: 'approve' });
     // DRY-1 guard: the invalidation keys on qk.adminRequests, which stays a prefix of
     // both admin-queue key variants so every loaded queue page still refetches.
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.adminRequests });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledTimes(1);
     expect(qk.adminQueue(undefined).slice(0, qk.adminRequests.length)).toEqual(qk.adminRequests);
     expect(qk.adminQueuePaged('pending', 100).slice(0, qk.adminRequests.length)).toEqual(qk.adminRequests);
   });
@@ -456,10 +494,24 @@ describe('useDecide', () => {
 describe('useUpdateUser', () => {
   const user = { username: 'todd' } as UserDto;
 
-  it('toasts the saved username and invalidates admin/users', () => {
+  it('toasts the saved username — and the toast alone, no invalidation', () => {
     cb(useUpdateUser()).onSuccess(user);
     expect(success).toHaveBeenCalledWith('Saved changes to todd');
+    // Reconciliation moved to onSettled (#168); a leftover copy here would double it.
+    expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalled();
+  });
+
+  // The route's UPDATE is atomic, so the commit-then-fail shape here is the generic one: the write
+  // lands and the client still rejects because the RESPONSE was lost or unparseable. Nothing polls
+  // `qk.users`, so a success-only reconciliation strands the table on the pre-write row.
+  it.each([
+    ['a rejected update (committed, response lost)', undefined, new ApiError(500, 'NON_JSON', 'Unexpected non-JSON response (500)')],
+    ['a successful update', { username: 'todd' } as UserDto, null],
+  ])('invalidates the admin-users prefix on %s', (_label, data, err) => {
+    cb(useUpdateUser()).onSettled(data, err, { publicId: 'us_1', patch: {} });
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.users });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['admin', 'users'] });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledTimes(1);
   });
 
   it('surfaces ApiError message, else "Failed to update user", on error', () => {
@@ -497,7 +549,7 @@ describe('useUpdateMe — account save with proportional feedback (#50, #134)', 
     return updater(prev);
   };
 
-  it('folds the returned DTO into the me cache directly (not invalidate) for every payload shape', () => {
+  it('folds the returned DTO into the me cache field-wise (a merge, never a wholesale replace) for every payload shape', () => {
     const cached = { email: 'old@x.com', kindleEmail: 'old@kindle.com', notifyOn: [] } as unknown as MeDto;
     const response = {
       email: 'new@x.com',
@@ -521,7 +573,32 @@ describe('useUpdateMe — account save with proportional feedback (#50, #134)', 
     });
 
     expect(hoisted.qc.setQueryData).toHaveBeenCalledTimes(2);
+    // The merge is the SUCCESS path's whole cache job — the settlement refetch is a separate
+    // callback (below), so driving onSuccess alone must issue no invalidation.
     expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalled();
+  });
+
+  // `PATCH /api/me` applies email / kindleEmail / notifyOn as THREE independent writes and only then
+  // re-reads through the fallible `buildMeDto()` tail, so a save can PARTIALLY commit and a
+  // fully-committed save can still 500. The merge never runs on those paths — the settlement refetch
+  // is what recovers them.
+  it.each([
+    ['a rejected save (partially committed, then 500)', undefined, new ApiError(500, 'E', 'quota lookup blew up')],
+    ['a successful save', { notifyOn: [] } as unknown as MeDto, null],
+  ])('invalidates qk.me on %s', (_label, data, err) => {
+    cb(useUpdateMe()).onSettled(data, err, { email: 'new@x.com' });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.me });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['me'] });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledTimes(1);
+  });
+
+  // Unconditional on purpose. Reconciling only the ERROR path would let an error-triggered GET
+  // issued before a sibling's commit settle after that sibling's merge and replace the whole entry —
+  // the exact #142 rollback `mergeMeCache` exists to prevent. Every settlement ending in an
+  // invalidation is what makes the LAST settler's read the last word.
+  it('reconciles a notifyOn-only save too — no body-keyed exemption', () => {
+    cb(useUpdateMe()).onSettled({ notifyOn: ['available'] } as unknown as MeDto, null, { notifyOn: ['available'] });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.me });
   });
 
   // Positive case FIRST — this must pass before the absence assertion below is trusted (non-vacuous).
@@ -907,10 +984,22 @@ describe('useLocalAuth', () => {
     expect(hoisted.api.localLogin).not.toHaveBeenCalled();
   });
 
-  it('invalidates the me query on success (exact ["me"] key)', () => {
-    mut(useLocalAuth('login')).onSuccess();
+  // Both routes call `setSessionCookie()` BEFORE the response body is produced, and the client can
+  // still reject while reading/parsing it — so a rejected signup/login can leave a VALID SESSION
+  // behind the login screen. Reconciling on settlement is what recovers into the app; nothing else
+  // refetches `qk.me` on that screen. Errors keep surfacing on the form (no toast).
+  it.each([
+    ['login', 'a rejected attempt (cookie set, body unparseable)', undefined, new ApiError(200, 'NON_JSON', 'Unexpected non-JSON response (200)')],
+    ['login', 'a successful attempt', { ok: true }, null],
+    ['signup', 'a rejected attempt (cookie set, body unparseable)', undefined, new ApiError(200, 'NON_JSON', 'Unexpected non-JSON response (200)')],
+    ['signup', 'a successful attempt', { ok: true }, null],
+  ] as const)('mode=%s invalidates the me query on %s (exact ["me"] key)', (mode, _label, data, err) => {
+    cb(useLocalAuth(mode)).onSettled(data, err, { email: 'a@b.c', password: 'pw' });
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.me });
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['me'] });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledTimes(1);
+    expect(success).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
   });
 });
 

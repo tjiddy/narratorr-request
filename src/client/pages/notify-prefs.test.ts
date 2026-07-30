@@ -95,6 +95,22 @@ describe('isEmailFieldDirty — email Save enablement (#131)', () => {
     expect(isEmailFieldDirty('todd@x.com', 'other@x.com')).toBe(true);
     expect(isEmailFieldDirty('todd@x.com', '')).toBe(true); // clearing the field
   });
+
+  // #168 AC7. The stored value is trim+lowercased before it is stored (`contactEmailSchema`), so a
+  // case-only difference can never be a pending change — saving it would store the identical value.
+  // This is what stops a save that COMMITTED and then failed in the route's DTO tail reading as
+  // dirty once the settlement refetch lands the normalized address under the untouched draft.
+  it('ignores case — a case-only difference is never a pending change', () => {
+    expect(isEmailFieldDirty('foo@ex.com', 'Foo@Ex.COM')).toBe(false);
+    expect(isEmailFieldDirty('foo@ex.com', '  FOO@EX.COM  ')).toBe(false);
+    // …and the stored side too, so an unnormalized legacy row doesn't read as permanently dirty.
+    expect(isEmailFieldDirty('Foo@Ex.COM', 'foo@ex.com')).toBe(false);
+  });
+
+  it('still reports a genuine value change under the case-insensitive compare', () => {
+    expect(isEmailFieldDirty('foo@ex.com', 'Bar@Ex.COM')).toBe(true);
+    expect(isEmailFieldDirty('foo@ex.com', 'foo@ex.co')).toBe(true);
+  });
 });
 
 describe('emailFieldPatchValue — PATCH body email from the draft (#131)', () => {
@@ -145,6 +161,12 @@ describe('the Kindle-address row reuses the same field helpers (#142)', () => {
       expect(isEmailFieldDirty('device@kindle.com', 'other@kindle.com')).toBe(true);
       expect(isEmailFieldDirty(null, 'device@kindle.com')).toBe(true);
       expect(isEmailFieldDirty('device@kindle.com', '')).toBe(true);
+    });
+    // #168 AC7 on the second row: `kindleEmailSchema` DERIVES from `contactEmailSchema`, so it
+    // trim+lowercases identically and the same case-only rule applies.
+    it('is clean for a case-only difference, and still dirty for a genuine one', () => {
+      expect(isEmailFieldDirty('device@kindle.com', 'Device@KINDLE.COM')).toBe(false);
+      expect(isEmailFieldDirty('device@kindle.com', 'Other@KINDLE.COM')).toBe(true);
     });
   });
 
