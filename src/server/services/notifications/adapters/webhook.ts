@@ -38,6 +38,8 @@ export class WebhookChannel implements NotificationChannel {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ content, event: payload.event, ...structured, url: message.url }),
+      // Refuse redirects — see ntfy adapter.
+      redirect: 'error',
       // Bound the call — see ntfy adapter: a hung endpoint must not leak sockets.
       signal: AbortSignal.timeout(10_000),
     });

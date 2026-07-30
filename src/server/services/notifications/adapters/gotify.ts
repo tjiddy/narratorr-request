@@ -31,6 +31,10 @@ export class GotifyChannel implements NotificationChannel {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'X-Gotify-Key': this.cfg.appToken },
       body: JSON.stringify(body),
+      // A redirect must fail rather than replay the app token at the host the destination
+      // chose: the WHATWG cross-origin stripping rule covers `Authorization`, not our custom
+      // `X-Gotify-Key`. There is no error classifier here — see ntfy adapter.
+      redirect: 'error',
       // Bound the call — see ntfy adapter.
       signal: AbortSignal.timeout(10_000),
     });

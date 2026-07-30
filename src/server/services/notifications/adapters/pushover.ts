@@ -36,6 +36,9 @@ export class PushoverChannel implements NotificationChannel {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
+      // Refuse redirects — see ntfy adapter. A 307/308 would replay this body, token and
+      // user key included, at whatever host the response named.
+      redirect: 'error',
       // Bound the call — see ntfy adapter.
       signal: AbortSignal.timeout(10_000),
     });

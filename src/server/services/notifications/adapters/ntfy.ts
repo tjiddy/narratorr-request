@@ -40,6 +40,11 @@ export class NtfyChannel implements NotificationChannel {
       method: 'POST',
       headers,
       body: message.body,
+      // Never re-issue the request at a host the destination named — a followed 30x can hand
+      // a credential (header or replayed body) to a party the admin never configured. Unlike
+      // the narratorr client there is no error taxonomy to map into, so the raw fetch
+      // rejection surfaces to the dispatcher/Test sink like any other network failure.
+      redirect: 'error',
       // Bound the call — notify() fires per request, so a black-holing endpoint
       // must not accumulate hung sockets/promises over the app's lifetime.
       signal: AbortSignal.timeout(10_000),
