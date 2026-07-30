@@ -343,7 +343,7 @@ Walk the chain instead:
       return `${err.message}\n${causeChainMessages(err.cause, depth + 1)}`;
     }
 
-With @libsql/client 0.17.3 the nested error is `LibsqlError: SQLITE_CONSTRAINT: UNIQUE constraint failed: <table>.<col>, <table>.<col>` carrying `code: 'SQLITE_CONSTRAINT'` and `rawCode: 2067` (`SQLITE_CONSTRAINT_UNIQUE`). Canonical helpers, both in `src/server/util/db.ts` (#183 moved them there): `causeChainMessages()` (the message walk) and, since #195, `hasSqliteRawCode()` (the STRUCTURAL walk — same chain, reads `rawCode` off each link). Prefer the structural walk when the constraint CLASS is the question: `isUniqueViolation()` (same file) is now `rawCode === 2067` only, because drizzle's wrapper message echoes the statement's `params:` line — user-supplied values — so a message regex for `UNIQUE constraint failed` was forgeable by input. Message matching remains necessary only when the classifier must name WHICH index: `isActiveKindleSendCollision()` (`src/server/services/kindle-send.policy.ts`) gates on the structural code first, then matches the index columns in `causeChainMessages()` output.
+With @libsql/client 0.17.3 the nested error is `LibsqlError: SQLITE_CONSTRAINT: UNIQUE constraint failed: <table>.<col>, <table>.<col>` carrying `code: 'SQLITE_CONSTRAINT'` and `rawCode: 2067` (`SQLITE_CONSTRAINT_UNIQUE`). Canonical helpers, both in `src/server/util/db.ts` (#183 moved them there): `causeChainMessages()` (the message walk) and, since #195, `hasSqliteRawCode()` (the STRUCTURAL walk — same chain, reads `rawCode` off each link). Prefer the structural walk when the constraint CLASS is the question: `isUniqueViolation()` (same file) is now `rawCode === 2067` only, because drizzle's wrapper message echoes the statement's `params:` line — user-supplied values — so a message regex for `UNIQUE constraint failed` was forgeable by input. Message matching remains necessary only when the classifier must name WHICH index: `isActiveKindleSendCollision()` (`src/server/services/kindle-send.policy.ts`) gates on the structural code first, then matches the index columns in `causeChainMessages()` output. (Full forgeability story + the synthetic-error factory corollary: `drizzle-params-echo-forges-constraint-text`.)
 
 Corollary for tests: a synthetic-error unit test CANNOT validate one of these classifiers. Drive at least one case through a real in-memory libSQL insert (`src/server/services/kindle-send.admission.test.ts` and `src/server/util/db.test.ts` both do). (The once-outstanding exception is fixed: #183 rewired `isUniqueViolation()` over the chain, so both race-resolution consumers — `user.service.ts` and `request.service.ts` — are live, each covered by a real-violation test.)
 
@@ -484,3 +484,50 @@ Remedy: CANCEL before invalidating — in the reconciler, not the UI:
 A UI pending-lock is NOT the correctness mechanism (PR #201 F2 disproved the first-draft remedy): returning the invalidation promise from `onSettled` does keep the mutation `pending` across the read (`mutation.js:137,181` await it on both paths), but the pending state only holds while the mutation observer stays attached — `MutationObserver.reset()` (which `LoginPage`'s login/signup mode switch calls) does `removeObserver(this)` on the still-running mutation and republishes an idle result, so `isPending` drops and any `disabled={isPending}` affordance re-enables while the data-less read is still open. A UI-layer lock cannot defend a cache-layer invariant. Keep the returned promise where double-submit ordering is nice to have (`useLocalAuth` returns it; `useUpdateMe` voids it — `qk.me` is populated by construction behind the authenticated shell, and each row's Save gates on its own `isPending`), but state it as hygiene, not the guarantee.
 
 Testing notes, earned the hard way: (1) making the reconciler async means a mocked `useQueryClient` must stub `cancelQueries`, and settlement assertions must flush a microtask (the reconciler awaits the cancel before invalidating — this broke the node project on first push); (2) a convergence test must FORCE the lock bypass (`auth.reset()` mid-read) rather than rely on the lock, or it only proves the lock works. Exemplars: `src/client/hooks.request-error-path.test.tsx` — 'holds the submit lock across the data-less reconciliation read' and 'converges even when the submit lock is bypassed mid-read by auth.reset() (the mode-switch shape)'; the cancel-then-invalidate ORDER is pinned in `hooks.test.ts` via `invocationCallOrder`.
+
+## fetch-redirect-error-invariant
+
+**source:** #199  
+**added:** 2026-07-30  
+**files:** src/server/services/notifications/adapters/*.ts, src/server/services/narratorr-client.ts, src/server/services/narratorr-stream-client.ts, src/server/services/notifications/adapters.test.ts  
+**tags:** fetch, redirect, undici, credential-exposure, notifications, real-socket-test
+
+---
+
+Every production `fetch` call site under `src/server` sets `redirect: 'error'` (#171, #145, #199) — the 7 notification adapters plus the 2 narratorr clients. A new outbound call site must set it too. `adapters/email.ts` and `kindle-sender.ts` are SMTP; `oidc.service.ts` uses openid-client's own HTTP.
+
+What actually replays across a cross-origin redirect, measured on Node 24 with two ephemeral `node:http` servers on different ports:
+
+| Redirect status | Custom header (`X-Gotify-Key`, `X-Api-Key`) | `Authorization: Bearer` | POST body | Original request path |
+|---|---|---|---|---|
+| 301/302/303 | replayed | stripped | dropped (method → GET) | not copied |
+| 307/308 | replayed | stripped | replayed verbatim | not copied |
+
+So: a CUSTOM auth header is the real exposure (the WHATWG cross-origin stripping rule covers only `Authorization`); body-borne credentials leak only on 307/308; and a secret in the URL path (telegram bot token, Discord/Slack/webhook capability URL) has no automatic replay vector at all, because fetch resolves the response `Location` into the new request URL and never copies the original path. Scope a redirect-hardening fix from this table, not from intuition.
+
+Non-redirect 3xx (`300`/`304`/`305`/`306`) are unaffected — never followed, before or after, and still reach the ordinary `if (!res.ok)` path with their real status. Do not add a "reject all 3xx" guard; `adapters.test.ts` has a contract-lock test (a `300` carrying a `Location`) pinning that.
+
+The rejection: `redirect: 'error'` rejects the fetch BEFORE any `!res.ok` check. Assert the `TypeError` TYPE only — fetch specifies a network error as a `TypeError` and says nothing about the message, and this repo floats on `node:24-slim` with `>=24.10.0` supported, so `"fetch failed"` / `cause: "unexpected redirect"` can change on any supported upgrade. Whether to map it is a per-boundary call: `NarratorrClient` maps to its existing `NETWORK` taxonomy because a raw `TypeError` would escape it; the notification adapters deliberately do NOT, because they have no taxonomy and every other network failure already surfaces the same way to the dispatcher and the Settings Test route.
+
+Testing: `vi.stubGlobal('fetch', ...)` and MSW cannot exercise this — in-process interception gives the credential no second host to leak to, so correct and broken code behave identically (see `msw-cannot-test-body-read-abort`). Use two `node:http` servers on `127.0.0.1:0`: a `redirector` answering the status with a `location` pointing at a recording `target`. Assert four things — `TypeError` type only, the target recorded ZERO requests, no recorded target request carries the credential header (state it over the requests, not just the count), and the redirector recorded exactly one request as a vacuity guard, without which the test also passes if nothing was ever sent. Harness hygiene, each a real failure mode: swallow `req/res.on('error')` (a client walking away mid-response emits EPIPE/ECONNRESET; an unhandled `'error'` takes the whole vitest worker down), call `server.closeAllConnections()` before `close()` (undici keep-alive otherwise hangs it), and close in a `finally` so a failed assertion cannot leak a listening port. `narratorr-client.test.ts:262-291` needs the MSW close/re-arm dance; `adapters.test.ts` uses no MSW, so it just leaves fetch unstubbed.
+
+For notifier types the option has ONE exhaustive owner rather than seven scattered assertions: a `Record<Exclude<NotifierType, 'email'>, NotificationChannel>` table in `adapters.test.ts`, so a new entry in `NOTIFIER_TYPES` fails `tsc` until its adapter gets a redirect assertion. Verified by deleting an entry and observing the type error — worth re-checking if that block is ever refactored, since an exhaustiveness guard that no longer guards looks exactly like one that does.
+
+## drizzle-params-echo-forges-constraint-text
+
+**source:** #195  
+**added:** 2026-07-30  
+**files:** src/server/util/db.ts, src/server/services/kindle-send.policy.ts, src/server/test-support/db.ts  
+**tags:** drizzle, libsql, sqlite, constraints, error-classification
+
+---
+
+drizzle-orm's `DrizzleQueryError` message is `Failed query: <sql>\nparams: <every bound value>`. The params line makes the wrapper message partly USER-CONTROLLED, so any classifier deciding over `causeChainMessages()` is forgeable: a `requests` insert whose `title` is literally `UNIQUE constraint failed: kindle_sends.user_id, kindle_sends.book_id` makes a real FOREIGN KEY breach classify as a unique collision. `params` is a single line, so `[^\n]*` anchoring does not save a target-specific regex either.
+
+Decide constraint CLASS structurally instead. With @libsql/client 0.17.3 the chain is DrizzleQueryError (no code) → LibsqlError (`code: 'SQLITE_CONSTRAINT'`, `rawCode`) → SqliteError (extended `code`, same `rawCode`); `rawCode` is the SQLite EXTENDED result code — 2067 UNIQUE, 787 FOREIGNKEY, 275 CHECK, 1299 NOTNULL, 1555 PRIMARYKEY. Keying on `rawCode` rather than the `code` string also avoids accepting both the generic and extended spellings. `hasSqliteRawCode()` (`src/server/util/db.ts`) is the depth-5-bounded walker; `isUniqueViolation()` is `!RangeError && hasSqliteRawCode(err, 2067)`.
+
+Exception, and why the message walk survives: a classifier that must distinguish WHICH unique index fired still needs the table/column names, which only the text carries. `isActiveKindleSendCollision()` therefore keeps `ACTIVE_COLLISION_RE` but gates it on the structural code first — text can narrow a match, never grant one.
+
+Corollary for tests: build synthetic constraint errors through `drizzleConstraintError()` (`src/server/test-support/db.ts`), not by hand. A hand-rolled `new Error('UNIQUE constraint failed: …')` now classifies FALSE, which silently turns any test staging one into a vacuous assertion — this is exactly what happened to both `re-throws the ORIGINAL … error object` tests (#195).
+
+Sibling entry: `drizzle-error-cause-chain` — why the chain must be walked at all (drizzle's wrapper never names the constraint; the driver error hangs off `cause`).
