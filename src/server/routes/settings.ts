@@ -22,6 +22,7 @@ import {
   buildNotifierChannel,
   render,
   redact,
+  describeSendFailure,
   type NotificationEvent,
   type NotificationPayload,
   type SendContext,
@@ -30,7 +31,10 @@ import { NOTIFIER_REGISTRY, type NotifierType } from '../../shared/notifier-regi
 
 function describeNarratorrError(err: unknown): string {
   if (err instanceof NarratorrError) {
-    if (err.upstreamStatus === 0) return 'Could not reach narratorr — check the URL.';
+    // Same admin-facing gap as the notifier Test (#207): NarratorrClient folds a `redirect:
+    // 'error'` rejection (#171) into this same status-0 NETWORK branch, so an `http://` base
+    // behind a proxy that 301s lands here indistinguishable from a dead host. Name both.
+    if (err.upstreamStatus === 0) return 'Could not reach narratorr — check the URL, including whether it redirects.';
     if (err.upstreamStatus === 401 || err.upstreamStatus === 403) return 'Authentication failed — check the API key.';
     return `narratorr responded ${err.upstreamStatus}.`;
   }
@@ -74,8 +78,9 @@ function testContext(event: NotificationEvent, publicUrl: string | null): SendCo
 
 /**
  * The resolved (plaintext) secret values in a candidate notifier config — passed to
- * redact() so a Test error embedding a token/key/capability-URL never reaches the admin
- * raw. Walks the registry's secret metadata, so it covers every type without a per-type branch.
+ * describeSendFailure() (and through it to redact()) so a Test error embedding a
+ * token/key/capability-URL never reaches the admin raw on the fallback path. Walks the
+ * registry's secret metadata, so it covers every type without a per-type branch.
  */
 function candidateSecrets(candidate: { type: NotifierType; config: Record<string, unknown> }): string[] {
   return NOTIFIER_REGISTRY[candidate.type].secretFields
@@ -230,9 +235,12 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: AppDeps): voi
         await channel.send(testContext(body.event, body.publicUrl ?? null));
         return { success: true, message: 'Test notification sent.' };
       } catch (err: unknown) {
-        // redact() before returning: a fetch/network error can embed the capability webhook
-        // URL or a token — scrub both the resolved candidate secrets and URL-path secrets.
-        return { success: false, message: redact(err, candidateSecrets(candidate)) };
+        // The network class (a fetch rejection / a fired timeout) maps to static, actionable
+        // copy — the raw runtime text says `fetch failed` for a dead host, a bad DNS name, a
+        // TLS failure AND a destination that answers a redirect alike (#207). Everything else
+        // still goes through redact(), which scrubs the resolved candidate secrets by value and
+        // URL-embedded secrets (capability webhooks, the Telegram token) by pattern.
+        return { success: false, message: describeSendFailure(err, candidateSecrets(candidate)) };
       }
     },
   );

@@ -11,6 +11,8 @@ const { sendMail, createTransport } = vi.hoisted(() => {
 });
 vi.mock('nodemailer', () => ({ default: { createTransport } }));
 
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { eq } from 'drizzle-orm';
 import { createTestDb } from '../test-support/db.js';
 import { appSettings } from '../../db/schema.js';
@@ -109,6 +111,9 @@ const asAdmin = { 'x-test-role': 'admin' };
 const asUser = { 'x-test-role': 'user' };
 const CONNECTORS_URL = '/api/admin/settings/connectors';
 const NOTIFIERS_URL = '/api/admin/settings/notifiers';
+
+/** The #207 network-class Test copy — pinned here so the route cases assert the exact string. */
+const UNREACHABLE_COPY = 'Could not reach the destination — check the URL, including whether it redirects.';
 
 const ntfyCreate = (over: Partial<CreateNotifierBody> = {}): CreateNotifierBody => ({
   name: 'Phone',
@@ -575,9 +580,112 @@ describe('settings routes — notifier test (always 200)', () => {
     expect(body.success).toBe(false);
     expect(body.message).not.toContain(appToken);
   });
+
+  // --- #207: the SEND catch maps the network class to actionable copy (the two tests above
+  // now pin the FALLBACK path, which stays `redact(err, candidateSecrets(candidate))`).
+  it('a fetch network rejection (TypeError) becomes the redirect-aware copy, not the runtime text', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('fetch failed')));
+    const res = await test({ type: 'ntfy', config: { url: 'https://ntfy.sh', topic: 'reqs' } });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body).toEqual({ success: false, message: UNREACHABLE_COPY });
+    expect(body.message).not.toContain('fetch failed');
+  });
+
+  it('a fired AbortSignal.timeout (TimeoutError) becomes the timeout copy', async () => {
+    const timeout = new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(timeout));
+    const res = await test({ type: 'ntfy', config: { url: 'https://ntfy.sh', topic: 'reqs' } });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ success: false, message: 'The destination did not respond in time.' });
+  });
+
+  it('the CANDIDATE-BUILD catch is NOT the send mapper — it keeps redact(err) (AC6)', async () => {
+    // Pins the boundary: a config-resolution failure must never be reported as "could not reach
+    // the destination". A TypeError is used deliberately — it is exactly what the send mapper
+    // remaps, so routing this catch through describeSendFailure() would flip this assertion.
+    vi.spyOn(connectorSettings, 'buildCandidateNotifier').mockRejectedValue(new TypeError('candidate resolution exploded'));
+    const res = await test({ type: 'ntfy', config: { url: 'https://ntfy.sh', topic: 'reqs' } });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ success: false, message: 'candidate resolution exploded' });
+  });
+});
+
+// A real redirect cannot be produced by an in-process fetch stub — `redirect: 'error'` is only
+// meaningful to a real HTTP client over a real socket, so correct and broken code behave
+// identically under a stub/MSW (learnings `fetch-redirect-error-invariant`, #199, and
+// `msw-cannot-test-body-read-abort`, #95). This is the filed case from #207 end to end: the
+// admin's base URL 301s, the send rejects, and the Test envelope must say so actionably.
+// This file uses no MSW, so the close/re-arm dance narratorr-client.test.ts needs does not apply.
+describe('settings routes — notifier test over a REAL redirecting socket (#207)', () => {
+  // Defensive: an earlier describe's stubbed fetch must never bleed in and fake this.
+  beforeEach(() => vi.unstubAllGlobals());
+
+  interface RecordingServer {
+    baseUrl: string;
+    requests: string[];
+    close(): Promise<void>;
+  }
+
+  async function startRecordingServer(handler: (req: IncomingMessage, res: ServerResponse) => void): Promise<RecordingServer> {
+    const requests: string[] = [];
+    const s = createServer((req, res) => {
+      requests.push(req.url ?? '');
+      // A client that walks away mid-response makes the socket error (EPIPE/ECONNRESET) — an
+      // unhandled 'error' would take the whole vitest worker down.
+      res.on('error', () => {});
+      req.on('error', () => {});
+      handler(req, res);
+    });
+    await new Promise<void>((resolve) => s.listen(0, '127.0.0.1', () => resolve()));
+    const { port } = s.address() as AddressInfo;
+    return {
+      baseUrl: `http://127.0.0.1:${port}`,
+      requests,
+      close: async () => {
+        s.closeAllConnections(); // undici pools keep-alive sockets; without this `close` hangs
+        await new Promise<void>((resolve) => s.close(() => resolve()));
+      },
+    };
+  }
+
+  it('a 301 from the configured base surfaces the redirect-aware copy (still 200), and never reaches the target', async () => {
+    const target = await startRecordingServer((_req, res) => res.writeHead(200).end());
+    const redirector = await startRecordingServer((req, res) => {
+      res.writeHead(301, { location: `${target.baseUrl}${req.url ?? '/'}` }).end();
+    });
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: `${NOTIFIERS_URL}/test`,
+        headers: asAdmin,
+        payload: { type: 'ntfy', config: { url: redirector.baseUrl, topic: 'reqs' } },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.message).toBe(UNREACHABLE_COPY);
+      // Vacuity guards — without these the test also passes if nothing was ever sent.
+      expect(redirector.requests).toEqual(['/reqs']);
+      expect(target.requests).toEqual([]);
+      expect(body.message).not.toContain('fetch failed');
+    } finally {
+      await redirector.close();
+      await target.close();
+    }
+  });
 });
 
 describe('settings routes — narratorr test endpoint (unchanged)', () => {
+  it('an unreachable narratorr (NarratorrError status 0 / NETWORK) gets the redirect-aware copy (#207 AC8)', async () => {
+    // NarratorrClient maps a fetch rejection — including the `redirect: 'error'` one (#171) —
+    // into NarratorrError(0, 'NETWORK', …), which is the branch whose copy changed.
+    await connectorSettings.update({ narratorr: { url: 'https://n.example.com:443', apiKey: 'k' } });
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('fetch failed')));
+    const res = await app.inject({ method: 'POST', url: `${CONNECTORS_URL}/test`, headers: asAdmin, payload: { channel: 'narratorr', narratorr: { url: 'https://n.example.com:443' } } });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ success: false, message: 'Could not reach narratorr — check the URL, including whether it redirects.' });
+  });
+
   it('reports not-configured without throwing (always 200)', async () => {
     const res = await app.inject({ method: 'POST', url: `${CONNECTORS_URL}/test`, headers: asAdmin, payload: { channel: 'narratorr', narratorr: { url: 'https://n:3000' } } });
     expect(res.statusCode).toBe(200);
