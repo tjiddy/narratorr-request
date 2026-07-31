@@ -36,6 +36,9 @@ export const AMAZON_APPROVED_LIST_DISCLOSURE_LABEL = 'Approve the sender at Amaz
 /**
  * The full click path, in order. Rendered inside the disclosure panel; the last step is the one
  * that matters (the address to approve is the SENDER mailbox, not the reader's own Kindle address).
+ * When the caller knows the sender, `KindleAllowlistHelp` renders the FINAL step with the actual
+ * mailbox and a copy button instead of this generic text — the user shouldn't have to re-type an
+ * address the app already knows (UAT 2026-07-31). This array stays the 8-step contract either way.
  */
 export const AMAZON_APPROVED_LIST_STEPS = [
   'Amazon',

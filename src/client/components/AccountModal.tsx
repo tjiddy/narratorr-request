@@ -196,7 +196,7 @@ function AccountModalContent({ me, headingId }: { me: MeDto; headingId: string }
             opt-ins are ONE concern — where and when request updates reach you. Grouping them under
             a named header stops the notify checkboxes reading as ebook config (the UAT misread
             when they trailed the Kindle block). */}
-        <div className="border-t border-border/50 pt-5">
+        <div className="border-t border-border pt-5">
           <GroupHeader icon={HeadphonesIcon} label="Audiobooks" />
           <div className="flex flex-col gap-4">
             <EmailFieldRow
@@ -245,15 +245,20 @@ function AccountModalContent({ me, headingId }: { me: MeDto; headingId: string }
           </div>
         </div>
 
-        {/* ---- eBooks group: the Kindle address + the allowlist education, only when the feature
+        {/* ---- eBooks group: the Kindle address + the Amazon-setup block, only when the feature
             is actually on (ebooksVisible is fail-safe: loading/error/pending-user all hide it).
-            The education is a SIBLING of the row, deliberately NOT routed through `help`: that
-            prop renders only while the row's inline `error` is null, so education passed through
-            it would vanish exactly when a save has just failed — the moment the user most needs
-            it. It renders whether or not an address is saved yet, and names the SENDER mailbox
-            when the app knows it — the address Amazon must approve is never the user's own. */}
+            TWO labeled errands (UAT 2026-07-31): "Kindle address" (where books arrive) and
+            "Amazon setup" (letting the sender through) are completely different actions, and
+            without the second label the education read as part of the address field. The
+            Required line names the consequence up front — collapsed, the old caret alone didn't
+            say the user MUST act before delivery works. The education is a SIBLING of the row,
+            deliberately NOT routed through `help`: that prop renders only while the row's inline
+            `error` is null, so education passed through it would vanish exactly when a save has
+            just failed — the moment the user most needs it. It renders whether or not an address
+            is saved yet, and names the SENDER mailbox when the app knows it — the address Amazon
+            must approve is never the user's own. */}
         {ebooksVisible(features) && (
-          <div className="border-t border-border/50 pt-5">
+          <div className="border-t border-border pt-5">
             <GroupHeader icon={BookIcon} label="eBooks" />
             <div className="flex flex-col gap-2">
               <EmailFieldRow
@@ -271,7 +276,17 @@ function AccountModalContent({ me, headingId }: { me: MeDto; headingId: string }
                 pending={saveKindle.isPending}
                 error={kindleError}
               />
-              <KindleAllowlistHelp senderEmail={features.data?.kindleSenderEmail ?? null} />
+              <div className="mt-3">
+                <p className="mb-1.5 text-sm font-medium">Amazon setup</p>
+                <p className="mb-1.5 text-xs">
+                  <span className="text-primary">Required:</span>{' '}
+                  <span className="text-muted-foreground">
+                    Kindle delivery won’t work until you approve the sender in your Amazon account — a
+                    one-time step.
+                  </span>
+                </p>
+                <KindleAllowlistHelp senderEmail={features.data?.kindleSenderEmail ?? null} />
+              </div>
             </div>
           </div>
         )}

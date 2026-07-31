@@ -783,29 +783,92 @@ describe('AccountModal — sectioned groups + features gating (#193)', () => {
     expect(screen.getByText('Email me when my request is')).toBeInTheDocument();
   });
 
-  it('names the SENDER mailbox inside the expanded education when features carry it', async () => {
+  it('names the SENDER mailbox inside the expanded education when features carry it — in the intro line AND the final step', async () => {
     const user = userEvent.setup();
     featuresRes = { ebooksEnabled: true, kindleDeliveryAvailable: true, kindleSenderEmail: 'bot@household.dev' };
     await renderModal();
     await user.click(screen.getByRole('button', { name: AMAZON_APPROVED_LIST_DISCLOSURE_LABEL }));
 
-    // The named-sender line: the address Amazon approves is the system's From…
-    const sender = await screen.findByText('bot@household.dev');
-    expect(sender.tagName).toBe('STRONG');
-    expect(screen.getByText(/Amazon must allow mail from/)).toBeInTheDocument();
+    // The named-sender sites: the intro line ("Allow mail from …") and step 8 ("Enter …") both
+    // print the system's From, mono-strong, so the user never re-types it from memory.
+    const senders = await screen.findAllByText('bot@household.dev');
+    expect(senders).toHaveLength(2);
+    for (const s of senders) expect(s.tagName).toBe('STRONG');
+    // The USER is the actor ("Allow mail from … in your Amazon account"), never "Amazon must
+    // allow" (UAT 2026-07-31 — that read as Amazon holding the pen).
+    expect(screen.getByText(/Allow mail from/)).toBeInTheDocument();
+    expect(screen.queryByText(/Amazon must allow/)).not.toBeInTheDocument();
+    // The generic final step is REPLACED by the named one, not duplicated.
+    expect(screen.queryByText('Enter the sender mailbox')).not.toBeInTheDocument();
     // …and the link label says "sender address", never "that address" (which read as the
     // user's own kindle.com address sitting right under the Kindle input).
     expect(screen.getByRole('link', { name: AMAZON_APPROVED_LIST_LINK_LABEL })).toBeInTheDocument();
     expect(AMAZON_APPROVED_LIST_LINK_LABEL).not.toMatch(/that address/);
   });
 
-  it('omits the named-sender line when no sender is configured, keeping the generic label', async () => {
+  it('omits the named-sender line when no sender is configured, keeping the generic label and final step', async () => {
     const user = userEvent.setup();
     featuresRes = { ebooksEnabled: true, kindleDeliveryAvailable: false, kindleSenderEmail: null };
     await renderModal();
     await user.click(screen.getByRole('button', { name: AMAZON_APPROVED_LIST_DISCLOSURE_LABEL }));
 
-    expect(screen.queryByText(/Amazon must allow mail from/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Allow mail from/)).not.toBeInTheDocument();
+    expect(screen.getByText('Enter the sender mailbox')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Copy sender address' })).not.toBeInTheDocument();
     expect(screen.getByRole('link', { name: AMAZON_APPROVED_LIST_LINK_LABEL })).toBeInTheDocument();
+  });
+});
+
+/**
+ * The Amazon-setup block (UAT 2026-07-31): the approval errand gets its own field-weight label +
+ * an always-visible Required line, so collapsed users still learn they MUST act before Kindle
+ * delivery works — and the block reads as a separate errand from the Kindle-address field.
+ */
+describe('AccountModal — Amazon setup block + copy-sender button', () => {
+  it('renders the "Amazon setup" label and the Required line whenever the eBooks group shows', async () => {
+    await renderModal();
+
+    expect(screen.getByText('Amazon setup')).toBeInTheDocument();
+    expect(screen.getByText('Required:')).toBeInTheDocument();
+    expect(screen.getByText(/Kindle delivery won’t work until you approve the sender/)).toBeInTheDocument();
+    // Visible at REST — the whole point is warning users who never expand the caret.
+    expect(screen.getByRole('button', { name: AMAZON_APPROVED_LIST_DISCLOSURE_LABEL })).toHaveAttribute(
+      'aria-expanded',
+      'false',
+    );
+  });
+
+  it('copies the sender address on click and shows a transient copied state', async () => {
+    const user = userEvent.setup();
+    featuresRes = { ebooksEnabled: true, kindleDeliveryAvailable: true, kindleSenderEmail: 'bot@household.dev' };
+    await renderModal();
+    await user.click(screen.getByRole('button', { name: AMAZON_APPROVED_LIST_DISCLOSURE_LABEL }));
+
+    await user.click(screen.getByRole('button', { name: 'Copy sender address' }));
+
+    // userEvent installs a real clipboard stub — read back what the button wrote.
+    await expect(window.navigator.clipboard.readText()).resolves.toBe('bot@household.dev');
+    // The copied state is announced through the accessible name.
+    expect(await screen.findByRole('button', { name: 'Copied' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Copy sender address' })).not.toBeInTheDocument();
+  });
+
+  it('stays quietly uncopied when the clipboard write fails', async () => {
+    const user = userEvent.setup();
+    featuresRes = { ebooksEnabled: true, kindleDeliveryAvailable: true, kindleSenderEmail: 'bot@household.dev' };
+    await renderModal();
+    await user.click(screen.getByRole('button', { name: AMAZON_APPROVED_LIST_DISCLOSURE_LABEL }));
+
+    const write = vi.spyOn(navigator.clipboard, 'writeText').mockRejectedValue(new Error('denied'));
+    try {
+      await user.click(screen.getByRole('button', { name: 'Copy sender address' }));
+
+      expect(write).toHaveBeenCalledWith('bot@household.dev');
+      // No copied state, no crash — the address is printed right beside the button.
+      expect(screen.getByRole('button', { name: 'Copy sender address' })).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'Copied' })).not.toBeInTheDocument();
+    } finally {
+      write.mockRestore();
+    }
   });
 });
