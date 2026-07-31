@@ -33,7 +33,7 @@ Everything else below is belt-and-braces on a green `pnpm verify`.
 2. Enter the narratorr **Server URL** and **API key**, save, then hit **Test**.
    - ✅ The test succeeds. (It pings a bogus book id and treats the structured `404` as proof the
      URL is reachable *and* the key authenticated.)
-3. Turn **Companion ebooks** on.
+3. Turn **Enable ebook support** on (Settings → **eBooks**).
 
 ## 2. Confirm `/api/features` flips
 
