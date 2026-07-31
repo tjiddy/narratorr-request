@@ -1,4 +1,4 @@
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router';
 import { useQueryClient } from '@tanstack/react-query';
 import { useMe, useInstanceBadge } from './hooks';
 import { logout } from './api';

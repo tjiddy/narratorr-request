@@ -1,4 +1,4 @@
-import { Link } from 'react-router-dom';
+import { Link } from 'react-router';
 import type { UserDto } from '@shared/schemas/user';
 import { useMe, useUsers, useUpdateUser } from '../hooks';
 import { Badge } from '../components/Badge';

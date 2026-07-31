@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import type { RequestDto } from '@shared/schemas/request';
 import { DEFAULT_LIMIT } from '@shared/schemas/v1/common';
 import { isNarratorrBookId } from '@shared/schemas/book-id';
