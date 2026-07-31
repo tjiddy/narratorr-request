@@ -266,10 +266,7 @@ describe('bookId grammar (AC9)', () => {
 describe('framework-refused shapes: containment, not enumeration (AC35)', () => {
   // These never reach the handler, so the property under test is "content-free and no upstream
   // call" — deliberately NOT an `EBOOK_UNAVAILABLE` envelope, and deliberately not exhaustive.
-  const routerMisses = [
-    ['an unencoded slash inside the segment', '/api/ebooks/a/b/download'],
-    ['a segment past Fastify maxParamLength (100)', `/api/ebooks/${'a'.repeat(101)}/download`],
-  ] as const;
+  const routerMisses = [['an unencoded slash inside the segment', '/api/ebooks/a/b/download']] as const;
   const badUrls = [
     ['a bare percent', '/api/ebooks/%/download'],
     ['a malformed escape', '/api/ebooks/%ZZ/download'],
@@ -286,7 +283,7 @@ describe('framework-refused shapes: containment, not enumeration (AC35)', () => 
     }
   });
 
-  it.each(badUrls)('leaves Fastify FST_ERR_BAD_URL alone for %s (the one documented non-envelope)', async (_label, url) => {
+  it.each(badUrls)('leaves Fastify FST_ERR_BAD_URL alone for %s (a documented non-envelope)', async (_label, url) => {
     await build();
     for (const cookies of [undefined, await cookiesFor('active')]) {
       const res = await h.app.inject({ method: 'GET', url, ...(cookies ? { cookies } : {}) });
@@ -294,6 +291,21 @@ describe('framework-refused shapes: containment, not enumeration (AC35)', () => 
       expect(res.json().code).toBe('FST_ERR_BAD_URL');
       expect(h.ebookStream.opened).toEqual([]);
       expectNoLeaks(res, `bad url ${url}`);
+    }
+  });
+
+  it('leaves Fastify FST_ERR_MAX_PARAM_LENGTH alone for a segment past maxParamLength (100) — the other documented non-envelope', async () => {
+    // Since fastify 5.11 / find-my-way 9.7 an over-long param is refused BEFORE routing as an
+    // explicit 414 (it used to fall through to our 404 envelope). Like FST_ERR_BAD_URL, the body
+    // interpolates only the caller's own URL — content-free, no upstream call.
+    await build();
+    const url = `/api/ebooks/${'a'.repeat(101)}/download`;
+    for (const cookies of [undefined, await cookiesFor('active')]) {
+      const res = await h.app.inject({ method: 'GET', url, ...(cookies ? { cookies } : {}) });
+      expect(res.statusCode).toBe(414);
+      expect(res.json().code).toBe('FST_ERR_MAX_PARAM_LENGTH');
+      expect(h.ebookStream.opened).toEqual([]);
+      expectNoLeaks(res, `over-long param ${url}`);
     }
   });
 

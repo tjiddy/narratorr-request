@@ -126,7 +126,7 @@ describe('isNarratorrBookId — the shared admission gate (AC26)', () => {
     expect(isNarratorrBookId(idOf(65))).toBe(false);
   });
 
-  it('refuses the lengths Fastify’s maxParamLength would silently 404', () => {
+  it('refuses the lengths Fastify’s maxParamLength would router-refuse', () => {
     // The gate is what makes "renders an affordance" and "reaches the handler" one set: a
     // `prefixedId('bk')`-only check is unbounded, so a 100/101-character id would render a
     // button the router then refuses before the handler ever runs.
