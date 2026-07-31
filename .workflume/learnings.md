@@ -531,3 +531,25 @@ Exception, and why the message walk survives: a classifier that must distinguish
 Corollary for tests: build synthetic constraint errors through `drizzleConstraintError()` (`src/server/test-support/db.ts`), not by hand. A hand-rolled `new Error('UNIQUE constraint failed: …')` now classifies FALSE, which silently turns any test staging one into a vacuous assertion — this is exactly what happened to both `re-throws the ORIGINAL … error object` tests (#195).
 
 Sibling entry: `drizzle-error-cause-chain` — why the chain must be walked at all (drizzle's wrapper never names the constraint; the driver error hangs off `cause`).
+
+## narratorr-upstream-code-provenance
+
+**source:** #213  
+**added:** 2026-07-30  
+**files:** src/server/services/narratorr-client.ts, src/server/services/narratorr-stream-client.ts, src/server/routes/settings.ts, src/server/routes/ebooks.ts  
+**tags:** narratorr-client, error-classification, zod, input-forgery, http-status
+
+---
+
+`NarratorrError.upstreamCode` is a deliberately unrestricted `string` carrying codes from TWO provenances, and only one of them is trustworthy.
+
+- **Locally authored** (always `upstreamStatus === 0`): `NETWORK` and `TIMEOUT` from the transport catches (`narratorr-client.ts:222-236`, `narratorr-stream-client.ts:136-155`), `ABORTED` from the stream client's caller-disconnect path. Plus the response-shape codes `NON_JSON` / `CONTRACT_MISMATCH` / `NO_BODY` / `HTTP_<status>`, which carry a REAL status.
+- **Upstream-supplied**: `classifyErrorBody()` (`narratorr-client.ts:55-76`) parses the v1 error envelope, whose `error.code` is a plain `z.string()` (`src/shared/schemas/v1/common.ts:71-77`), and passes the code through VERBATIM with the real HTTP status. So a broken or hostile narratorr can answer `401` with `{"error":{"code":"TIMEOUT"}}` — or `NOT_CONFIGURED`, or `ABORTED`, or anything else we branch on.
+
+**Rule: never branch on a code value alone. Pair it with `upstreamStatus === 0` whenever the code is one WE author.** Status 0 is the discriminator because `classifyErrorBody` is only ever reached from a `!res.ok` branch, so an upstream-sourced code always carries a non-zero status. Prior art: `mapUpstreamFailure` (`src/server/routes/ebooks.ts:43-54`) for `NOT_CONFIGURED`; `describeNarratorrError` (`src/server/routes/settings.ts:38-46`) for `TIMEOUT` (#213).
+
+**Branch ORDER is part of the rule.** A locally-authored code is also status 0, so a specific `status === 0 && code === X` test must sit BEFORE any generic `status === 0` branch, which would otherwise swallow it.
+
+**Test the guard through the real classifier**, not a hand-built `new NarratorrError(401, 'TIMEOUT', …)`: resolve an actual `Response` carrying the forged envelope so production `classifyErrorBody` constructs the error end to end. See `settings.route.test.ts` 'a forged HTTP %i + upstream code "TIMEOUT" keeps its status copy' and `ebooks.route.test.ts:498-516`. Do NOT pick `404` as the forgery status for a Settings-Test case — `ping()` (`narratorr-client.ts:166-173`) treats 404 as SUCCESS and the test would assert nothing.
+
+Deliberately no enum/union for these codes (#213 AC9): the field must stay open to upstream drift. That means there is no type-level reminder — the provenance guard is a convention each new code-keyed consumer has to re-apply.
