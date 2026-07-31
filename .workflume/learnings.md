@@ -17,22 +17,24 @@ to, so the relevant lesson can be surfaced when that area is next touched.
 Frontend regression risk lives in **payload / decision logic** (mutation request bodies,
 parse-and-guard, sort/format, conditional defaults) — not in rendering. Extract that logic
 into pure functions with co-located `.test.ts` coverage. This repo already follows the
-pattern: `build*` / `init*` payload helpers in `src/client/pages/settings-channels.ts` and
-`settings-narratorr.ts`, mutation lifecycle in `hooks.test.ts`.
+pattern: `build*` / `init*` payload helpers in `src/client/pages/settings-narratorr.ts`,
+`settings-fields.ts`, `settings-notifiers.ts`, `settings-default-quota.ts`, mutation
+lifecycle in `hooks.test.ts`.
 
-The repo deliberately has **no** jsdom / `@testing-library/react` / `user-event` modality
-(vitest is a single node project, `.test.ts`-only glob). That is the **intended
-architecture**, not a coverage gap. A typed mutation payload is already guarded by typecheck
-+ the server's Zod validation (a malformed body 400s, it doesn't silently corrupt), so a
+(Updated 2026-07-30 — the original "the repo deliberately has no jsdom modality, single node
+project" claim is obsolete: vitest now runs TWO projects, `node` (`.test.ts`) and a jsdom
+`client` project (`.test.tsx`, RTL + jest-dom, explicit cleanup in `src/client/test/setup.ts`).)
+The division of labor survived the modality and is now doctrine (CLAUDE.md Testing): jsdom is
+for genuine **DOM-only** behavior — conditional rendering, focus/keyboard, multi-step
+side-effect orchestration, cache-state convergence ([[react-query-mock-hides-cache-convergence]])
+— and is NOT a license to test payload/parse/decision logic through the DOM. That logic still
+belongs in extracted pure helpers: a typed mutation payload is already guarded by typecheck +
+the server's Zod validation (a malformed body 400s, it doesn't silently corrupt), so a
 behavior-preserving extraction can't silently drop a payload past those gates.
 
-Reach for jsdom only when a feature has genuine **DOM-only** logic that can't be a pure
-function: complex conditional rendering, focus/keyboard handling, or multi-step side-effect
-orchestration (e.g. a logout flow chaining clear → navigate → reload with an error path).
-When an auto-filed finding says "no component-test modality," first triage what decision
-logic is **already pure-testable / pure-tested** — usually the high-value part is covered and
-standing up the whole harness is belt-and-suspenders. Prefer extracting one more pure helper
-over adding a test modality.
+When an auto-filed finding proposes a component test, first triage what decision logic is
+**already pure-testable / pure-tested** — usually the high-value part is covered. Prefer
+extracting one more pure helper over routing logic assertions through the jsdom project.
 
 ## triage-autofiled-debt-by-proportionality
 
@@ -152,7 +154,7 @@ Corollary: don't reach for `.strict()` on a response schema to close this. The s
 
 **source:** #142  
 **added:** 2026-07-28  
-**files:** src/client/hooks.ts  
+**files:** src/client/pages/notify-prefs.ts, src/client/hooks.ts  
 **tags:** react-query, tanstack-query, setQueryData, concurrency, optimistic-cache
 
 ---
@@ -177,7 +179,9 @@ Fix by folding field-wise on the request body rather than replacing. A response 
 
 Carry any DERIVED field with its source (`emailNotifyAvailable` moves with `email`). Key on the KEY's presence, not its value, so an explicit `null` clear stays an authoritative write. Fields the endpoint doesn't write (quota, identity) can still take the fresher response. This keeps the direct cache write — no `invalidateQueries` refetch round-trip — and lets the mutations stay independent.
 
-Test it at both layers: a pure order-convergence property (applying both responses in either order yields the same cache) and a component test that freezes response snapshots at dispatch time and releases them in reverse. Seen in #142 (`useUpdateMe` / AccountModal's contact + Kindle rows). Wholesale replacement remains fine where only ONE mutation instance can ever write the key — e.g. `useUpdateConnectors`.
+Test it at both layers: a pure order-convergence property (applying both responses in either order yields the same cache) and a component test that freezes response snapshots at dispatch time and releases them in reverse. Seen in #142 (`useUpdateMe` / AccountModal's contact + Kindle rows); `mergeMeCache` lives in `src/client/pages/notify-prefs.ts`.
+
+(Updated 2026-07-30 — the original closing example of a safe wholesale writer, `useUpdateConnectors`, is retired: six mutations now share `qk.connectors` and every one INVALIDATES instead (#160/#168; `hooks.ts` documents the retraction inline). Wholesale replacement is fine only while the single-writer condition genuinely holds — and the moment a second writer appears it silently stops holding, which is exactly how this entry's bug is born. The `qk.me` merge is the repo's one surviving `setQueryData`, now paired with settlement invalidation — see [[settlement-invalidate-both-outcomes]].)
 
 ## addressparser-splits-not-validates
 
@@ -208,7 +212,7 @@ Reference implementation + case table: `parseSingleMailbox` in `src/server/servi
 
 `INarratorrClient` in `src/server/services/narratorr-client.ts` is a broad `Pick<NarratorrClient, ...>`. Adding a method to it structurally breaks every hand-rolled test double that declares `implements INarratorrClient` or types an object literal as it — even doubles that never call the new method. Adding `getCapabilities` (issue #144) broke six test files, ~100 call sites in `request.service.test.ts` alone.
 
-Prefer PER-CONSUMER slices: each service depends only on the calls it makes, so widening the full interface costs nothing downstream. Established slices: `IMetadataSearchClient` (SearchService), `IBookHandoffClient` (RequestService), `IBookStatusClient` (StatusPoller), `ICapabilityClient` (FeatureService). `NarratorrClientHolder` implements the full interface, so production wiring is unchanged and only genuine full-client consumers (`route-harness.ts`'s FakeNarratorrClient, `requests.route.test.ts`, `system.route.test.ts`, `narratorr-client-holder.test.ts`) must grow a new member.
+Prefer PER-CONSUMER slices: each service depends only on the calls it makes, so widening the full interface costs nothing downstream. Established slices: `IMetadataSearchClient` (SearchService), `IBookHandoffClient` (RequestService), `IBookStatusClient` (StatusPoller), `ICapabilityClient` (FeatureService), and — since #145 — `IEbookStreamClient` (`narratorr-stream-client.ts`), deliberately its own interface on the separate streaming class rather than a member of `INarratorrClient`, so the ebook-stream consumer (`kindle-send.service.ts`) and its fakes never feel JSON-client widening either. `NarratorrClientHolder` implements the full set (`INarratorrClient` + `IEbookStreamClient`), so production wiring is unchanged and only genuine full-client consumers (`route-harness.ts`'s FakeNarratorrClient, `requests.route.test.ts`, `system.route.test.ts`, `narratorr-client-holder.test.ts`) must grow a new member.
 
 When adding a method (e.g. #145's raw streaming client): add it to `NarratorrClient` and `INarratorrClient`, forward it on the holder, add a slice for its consumer, and update only the full-client doubles. Check the blast radius with `pnpm typecheck` — vitest does not typecheck, so this class of break is invisible to a green test run.
 
@@ -221,7 +225,7 @@ When adding a method (e.g. #145's raw streaming client): add it to `NarratorrCli
 
 ---
 
-`src/client/hooks.test.ts` mocks `@tanstack/react-query` wholesale — `useQueryClient()` returns `{invalidateQueries: vi.fn(), setQueryData: vi.fn()}`, `useQuery`/`useMutation` return their options object. This is the right modality for asserting a hook's shape (query key, `queryFn`, `enabled`, which cache operation a mutation requests, toast text) and it is structurally INCAPABLE of asserting what the cache converges on: there is no QueryCache, no observer, no refetch.
+`src/client/hooks.test.ts` mocks `@tanstack/react-query` wholesale — `useQueryClient()` returns `{invalidateQueries: vi.fn(), setQueryData: vi.fn(), cancelQueries: vi.fn()}`, `useQuery`/`useMutation` return their options object. This is the right modality for asserting a hook's shape (query key, `queryFn`, `enabled`, which cache operation a mutation requests, toast text) and it is structurally INCAPABLE of asserting what the cache converges on: there is no QueryCache, no observer, no refetch.
 
 So a reverse-settlement / lost-update regression test written in this file is vacuous — it passes whether or not the defect exists. This is not hypothetical: #144 F1 (PR #165) was blocked for precisely this, a test asserting `invalidateQueries` was called while `useUpdateConnectors` still did `setQueryData(qk.connectors, dto)` and could clobber a sibling's committed field.
 
@@ -249,7 +253,7 @@ So client cache reconciliation for these endpoints belongs on `onSettled`, never
 
 Pattern: `src/client/hooks.ts` exposes `reconcileConnectorWrite(qc, retiresCapability)`, called from `onSettled` by all six settings/notifier mutations; toasts stay on `onSuccess`/`onError`. `onSettled` receives `(data, error, variables)`, so a body-keyed trigger like `body.narratorr !== undefined` (mirroring the server's own `reconfigure(narratorrChanged)`) still works on the error path. Refetching after a genuine 400 costs one GET returning the unchanged row; a client cannot reliably infer from a status code which failures committed, so always reconcile.
 
-Known related instances NOT yet converted: `useRequestBook` / `useDecide` (`RequestService.create()` inserts then runs a fallible auto-approve `handoff()`, so the route 502s post-commit). Distinct from [[react-query-mock-hides-cache-convergence]] (a test-modality blind spot) and from learning #160 (`setQueryData` vs `invalidate` on a shared entry) — this is a third axis: WHEN to reconcile, not how or with what.
+(The once-open instances are converted: #168 moved `useRequestBook`, `useDecide`, and `useUpdateUser` onto `onSettled` reconciliation too — kept inline rather than routed through `reconcileConnectorWrite`, with doc comments in `hooks.ts` explaining the commit-before-fallible-tail shape each one guards.) Distinct from [[react-query-mock-hides-cache-convergence]] (a test-modality blind spot) and from learning #160 (`setQueryData` vs `invalidate` on a shared entry) — this is a third axis: WHEN to reconcile, not how or with what.
 
 ## fastify-hijack-for-no-response
 
@@ -302,7 +306,7 @@ Worked example: the `rate limiting, per user (AC29-AC31)` describe in `src/serve
 
 A synchronous `queryBy*` absence assertion is only meaningful once you have PROVEN the app is in the state you think it is. Awaiting an element fetched by a DIFFERENT query does not establish that — it is a race you usually win, not a synchronization point.
 
-This is the complement to the existing `vi.waitFor cannot assert an absence` learning (#176): that one says make the negative assertion synchronous; this one says you must first prove the terminal state, or the synchronous assertion just observes `pending`.
+This is the complement to the `vi.waitFor cannot assert an absence` rule (issue #176 — applied here, never separately curated): that one says make the negative assertion synchronous; this one says you must first prove the terminal state, or the synchronous assertion just observes `pending`.
 
 Concretely, `useFeatures(me)` is gated on `/api/me` resolving, while `useSearch` / `useMyRequestsPaged` fire independently — and `ebooksVisible()` returns false for BOTH `pending` and `error`, so a test that awaits a row and then asserts no affordance passes whether or not the feature request ever settled.
 
@@ -509,7 +513,7 @@ Non-redirect 3xx (`300`/`304`/`305`/`306`) are unaffected — never followed, be
 
 The rejection: `redirect: 'error'` rejects the fetch BEFORE any `!res.ok` check. Assert the `TypeError` TYPE only — fetch specifies a network error as a `TypeError` and says nothing about the message, and this repo floats on `node:24-slim` with `>=24.10.0` supported, so `"fetch failed"` / `cause: "unexpected redirect"` can change on any supported upgrade. Whether to map it is a per-boundary call: `NarratorrClient` maps to its existing `NETWORK` taxonomy because a raw `TypeError` would escape it; the notification adapters deliberately do NOT, because they have no taxonomy and every other network failure already surfaces the same way to the dispatcher and the Settings Test route.
 
-Testing: `vi.stubGlobal('fetch', ...)` and MSW cannot exercise this — in-process interception gives the credential no second host to leak to, so correct and broken code behave identically (see `msw-cannot-test-body-read-abort`). Use two `node:http` servers on `127.0.0.1:0`: a `redirector` answering the status with a `location` pointing at a recording `target`. Assert four things — `TypeError` type only, the target recorded ZERO requests, no recorded target request carries the credential header (state it over the requests, not just the count), and the redirector recorded exactly one request as a vacuity guard, without which the test also passes if nothing was ever sent. Harness hygiene, each a real failure mode: swallow `req/res.on('error')` (a client walking away mid-response emits EPIPE/ECONNRESET; an unhandled `'error'` takes the whole vitest worker down), call `server.closeAllConnections()` before `close()` (undici keep-alive otherwise hangs it), and close in a `finally` so a failed assertion cannot leak a listening port. `narratorr-client.test.ts:262-291` needs the MSW close/re-arm dance; `adapters.test.ts` uses no MSW, so it just leaves fetch unstubbed.
+Testing: `vi.stubGlobal('fetch', ...)` and MSW cannot exercise this — in-process interception gives the credential no second host to leak to, so correct and broken code behave identically (see `msw-cannot-test-body-read-abort`). Use two `node:http` servers on `127.0.0.1:0`: a `redirector` answering the status with a `location` pointing at a recording `target`. Assert four things — `TypeError` type only, the target recorded ZERO requests, no recorded target request carries the credential header (state it over the requests, not just the count), and the redirector recorded exactly one request as a vacuity guard, without which the test also passes if nothing was ever sent. Harness hygiene, each a real failure mode: swallow `req/res.on('error')` (a client walking away mid-response emits EPIPE/ECONNRESET; an unhandled `'error'` takes the whole vitest worker down), call `server.closeAllConnections()` before `close()` (undici keep-alive otherwise hangs it), and close in a `finally` so a failed assertion cannot leak a listening port. `narratorr-client.test.ts:317-376` needs the MSW close/re-arm dance; `adapters.test.ts` uses no MSW, so it just leaves fetch unstubbed.
 
 For notifier types the option has ONE exhaustive owner rather than seven scattered assertions: a `Record<Exclude<NotifierType, 'email'>, NotificationChannel>` table in `adapters.test.ts`, so a new entry in `NOTIFIER_TYPES` fails `tsc` until its adapter gets a redirect assertion. Verified by deleting an entry and observing the type error — worth re-checking if that block is ever refactored, since an exhaustiveness guard that no longer guards looks exactly like one that does.
 
@@ -543,13 +547,13 @@ Sibling entry: `drizzle-error-cause-chain` — why the chain must be walked at a
 
 `NarratorrError.upstreamCode` is a deliberately unrestricted `string` carrying codes from TWO provenances, and only one of them is trustworthy.
 
-- **Locally authored** (always `upstreamStatus === 0`): `NETWORK` and `TIMEOUT` from the transport catches (`narratorr-client.ts:222-236`, `narratorr-stream-client.ts:136-155`), `ABORTED` from the stream client's caller-disconnect path. Plus the response-shape codes `NON_JSON` / `CONTRACT_MISMATCH` / `NO_BODY` / `HTTP_<status>`, which carry a REAL status.
+- **Locally authored** (always `upstreamStatus === 0`): `NETWORK` and `TIMEOUT` from the transport catches (`narratorr-client.ts`, `narratorr-stream-client.ts`), `ABORTED` from the stream client's caller-disconnect path. Plus the response-shape codes `NON_JSON` / `CONTRACT_MISMATCH` / `NO_BODY` / `HTTP_<status>`, which carry a REAL status.
 - **Upstream-supplied**: `classifyErrorBody()` (`narratorr-client.ts:55-76`) parses the v1 error envelope, whose `error.code` is a plain `z.string()` (`src/shared/schemas/v1/common.ts:71-77`), and passes the code through VERBATIM with the real HTTP status. So a broken or hostile narratorr can answer `401` with `{"error":{"code":"TIMEOUT"}}` — or `NOT_CONFIGURED`, or `ABORTED`, or anything else we branch on.
 
 **Rule: never branch on a code value alone. Pair it with `upstreamStatus === 0` whenever the code is one WE author.** Status 0 is the discriminator because `classifyErrorBody` is only ever reached from a `!res.ok` branch, so an upstream-sourced code always carries a non-zero status. Prior art: `mapUpstreamFailure` (`src/server/routes/ebooks.ts:43-54`) for `NOT_CONFIGURED`; `describeNarratorrError` (`src/server/routes/settings.ts:38-46`) for `TIMEOUT` (#213).
 
 **Branch ORDER is part of the rule.** A locally-authored code is also status 0, so a specific `status === 0 && code === X` test must sit BEFORE any generic `status === 0` branch, which would otherwise swallow it.
 
-**Test the guard through the real classifier**, not a hand-built `new NarratorrError(401, 'TIMEOUT', …)`: resolve an actual `Response` carrying the forged envelope so production `classifyErrorBody` constructs the error end to end. See `settings.route.test.ts` 'a forged HTTP %i + upstream code "TIMEOUT" keeps its status copy' and `ebooks.route.test.ts:498-516`. Do NOT pick `404` as the forgery status for a Settings-Test case — `ping()` (`narratorr-client.ts:166-173`) treats 404 as SUCCESS and the test would assert nothing.
+**Test the guard through the real classifier**, not a hand-built `new NarratorrError(401, 'TIMEOUT', …)`: resolve an actual `Response` carrying the forged envelope so production `classifyErrorBody` constructs the error end to end. See `settings.route.test.ts` 'a forged HTTP %i + upstream code "TIMEOUT" keeps its status copy' and `ebooks.route.test.ts:498-516`. Do NOT pick `404` as the forgery status for a Settings-Test case — `ping()` (`narratorr-client.ts`) treats a structured 404 as SUCCESS and the test would assert nothing.
 
 Deliberately no enum/union for these codes (#213 AC9): the field must stay open to upstream drift. That means there is no type-level reminder — the provenance guard is a convention each new code-keyed consumer has to re-apply.
