@@ -97,7 +97,7 @@ export class OidcService<P> {
         expectedState: state,
         expectedNonce: pending.nonce,
       });
-    } catch (err) {
+    } catch (err: unknown) {
       throw badGateway('OIDC_EXCHANGE', `${this.cfg.label} OIDC token exchange failed: ${describe(err)}`);
     }
 

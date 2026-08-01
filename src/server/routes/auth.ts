@@ -61,7 +61,15 @@ export function registerAuthRoutes(app: FastifyInstance, deps: AppDeps): void {
     const quota = await deps.requests.quotaUsage(row.id, deps.requests.resolveQuota(row));
     const emailNotifyAvailable =
       hasDeliverableContact(row.email) && selectEmailSource(await deps.connectorSettings.getNotificationsConfig()) !== null;
-    return { ...deps.users.toDto(row), quota, notifyOn: sanitizeNotifyOn(row.notifyOn), emailNotifyAvailable };
+    // `kindleEmail` is added HERE, not in `deps.users.toDto` — `toDto` is the ADMIN mapper and must
+    // stay free of self-scoped PII (issue #142). This is the only surface that ever reads it out.
+    return {
+      ...deps.users.toDto(row),
+      quota,
+      notifyOn: sanitizeNotifyOn(row.notifyOn),
+      emailNotifyAvailable,
+      kindleEmail: row.kindleEmail,
+    };
   };
 
   // Current user + rolling quota usage + own opt-in set.
@@ -73,17 +81,23 @@ export function registerAuthRoutes(app: FastifyInstance, deps: AppDeps): void {
   });
 
   // Update the caller's own account preferences: requester-notification opt-in set AND/OR contact
-  // email (issue #131). Self-scoped — no target id, cannot mutate another user (requireUser gates it;
-  // the manifest test asserts the guard). Both fields are INDEPENDENT and OPTIONAL. `notifyOn`:
-  // storage-permissive — a value outside NOTIFIABLE_TRANSITIONS is a 400 (Zod), but enabling without
-  // a usable email/SMTP is NOT a 403 (delivery gates at send time). `email`: omitted = no change,
-  // `null` clears the contact, a non-empty value is normalized + deliverability-validated by
-  // `contactEmailSchema` (invalid / "" → 400). The write touches only `notify_on` / `email`, never
-  // the login `authSubject`. Apply each provided field, then re-read for a consistent DTO echo.
+  // email (issue #131) AND/OR Send-to-Kindle device address (issue #142). Self-scoped — no target id,
+  // cannot mutate another user (requireUser gates it; the manifest test asserts the guard). All three
+  // fields are INDEPENDENT and OPTIONAL. `notifyOn`: storage-permissive — a value outside
+  // NOTIFIABLE_TRANSITIONS is a 400 (Zod), but enabling without a usable email/SMTP is NOT a 403
+  // (delivery gates at send time). `email`: omitted = no change, `null` clears the contact, a
+  // non-empty value is normalized + deliverability-validated by `contactEmailSchema` (invalid / "" →
+  // 400). `kindleEmail`: same set/clear/omit semantics via `kindleEmailSchema` (exact `@kindle.com`).
+  // Each field is branched on `!== undefined`, NOT truthiness — `exactOptionalPropertyTypes` aside, a
+  // truthiness test would turn an explicit `null` clear into a silent no-op. The write touches only
+  // `notify_on` / `email` / `kindle_email`, never the login `authSubject`. Neither address is ever
+  // logged or echoed into an error message — the value only travels body → column → MeDto.
+  // Apply each provided field, then re-read for a consistent DTO echo.
   a.patch('/api/me', { schema: { body: updateMeBodySchema, response: { 200: meDtoSchema } } }, async (request) => {
     const user = requireUser(request);
-    const { notifyOn, email } = request.body;
+    const { notifyOn, email, kindleEmail } = request.body;
     if (email !== undefined) await deps.users.setContactEmail(user.id, email);
+    if (kindleEmail !== undefined) await deps.users.setKindleEmail(user.id, kindleEmail);
     if (notifyOn !== undefined) await deps.users.setNotifyOn(user.id, notifyOn);
     const row = await deps.users.getById(user.id);
     if (!row) throw badRequest('NO_USER', 'session user no longer exists');
@@ -167,7 +181,7 @@ export function registerAuthRoutes(app: FastifyInstance, deps: AppDeps): void {
       setSessionCookie(reply, deps.config, result.user);
       notifyIfPending(result);
       return await reply.redirect(postLoginRedirect);
-    } catch (err) {
+    } catch (err: unknown) {
       // This is a top-level browser navigation — a raw JSON error page is a dead end.
       // Log the detail and bounce back to the login screen with a generic error flag.
       request.log.warn({ err, provider }, 'OIDC callback failed');

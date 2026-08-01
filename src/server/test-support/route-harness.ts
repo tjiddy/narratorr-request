@@ -10,19 +10,27 @@ import { ConnectorSettingsService } from '../services/connector-settings.service
 import { RequestService, type RequestPolicy } from '../services/request.service.js';
 import { SearchService } from '../services/search.service.js';
 import { NarratorrClientHolder } from '../services/narratorr-client-holder.js';
+import { FeatureService } from '../services/feature.service.js';
+import { CompanionEbookService } from '../services/companion-ebook.service.js';
+import { KindleSendService } from '../services/kindle-send.service.js';
+import { FakeKindleTransports } from './kindle-send.js';
 import { Notifier } from '../services/notifications/notifier.service.js';
 import type { NotifierLogger } from '../services/notifications/types.js';
 import { SecretCodec, deriveSettingsKey } from '../util/secret-codec.js';
 import { errorHandlerPlugin } from '../plugins/error-handler.js';
 import { authRateLimitOptions } from '../plugins/rate-limit.js';
 import { authPlugin, SESSION_COOKIE } from '../plugins/auth.js';
+import { registerNotFoundHandler } from '../routes/not-found.js';
 import { createSessionToken } from '../util/session.js';
 import type { Db } from '../../db/client.js';
 import type { AppConfig } from '../config.js';
 import type { AppDeps } from '../services/deps.js';
 import type { INarratorrClient } from '../services/narratorr-client.js';
+import type { IEbookStreamClient, NarratorrEbookStream } from '../services/narratorr-stream-client.js';
 import type { V1Book } from '../../shared/schemas/v1/books.js';
 import type { V1System } from '../../shared/schemas/v1/system.js';
+import type { V1Capabilities } from '../../shared/schemas/v1/capabilities.js';
+import type { V1CompanionEbook } from '../../shared/schemas/v1/companion-ebook.js';
 import type { BookStatus } from '../../shared/schemas/book.js';
 import type { AuthUser } from '../types.js';
 
@@ -56,6 +64,18 @@ export const TEST_USER: AuthUser = { id: 9002, publicId: 'us_user', username: 'u
 export class FakeNarratorrClient implements INarratorrClient {
   status: BookStatus = 'searching';
   added: string[] = [];
+  /** What the companion-ebook capability probe reports (issue #144) — flip per test. */
+  companionEpub = true;
+  /** How many times the capability probe was called — asserts the `/api/features` short-circuit. */
+  capabilityCalls = 0;
+  /**
+   * Companion ebooks `getBook()` reports, keyed by book id (issue #147). An id that is ABSENT
+   * from this map yields a book with NO `companionEbook` key at all — a pre-#1961 narratorr —
+   * which the consumer must treat identically to an explicit `null`.
+   */
+  companions = new Map<string, V1CompanionEbook | null>();
+  /** Every `getBook()` id, in order — asserts the enrichment fan-out and its cache. */
+  bookCalls: string[] = [];
   private seq = 0;
 
   async searchMetadata(): Promise<[]> {
@@ -67,10 +87,84 @@ export class FakeNarratorrClient implements INarratorrClient {
     return { id: `bk_${this.seq}`, title: 'A Book', authors: [], narrators: [], status: this.status };
   }
   async getBook(id: string): Promise<V1Book> {
-    return { id, title: 'A Book', authors: [], narrators: [], status: this.status };
+    this.bookCalls.push(id);
+    return {
+      id,
+      title: 'A Book',
+      authors: [],
+      narrators: [],
+      status: this.status,
+      ...(this.companions.has(id) && { companionEbook: this.companions.get(id) ?? null }),
+    };
   }
   async getSystem(): Promise<V1System> {
     return { version: 'v1.0.0' };
+  }
+  async getCapabilities(): Promise<V1Capabilities> {
+    this.capabilityCalls += 1;
+    return { companionEpub: { enabled: this.companionEpub } };
+  }
+}
+
+/**
+ * The raw-stream half of a fake narratorr connection (issue #145). A connection is installed as a
+ * PAIR, so the harness always wires one of these alongside {@link FakeNarratorrClient} — an
+ * unconfigured holder then surfaces NOT_CONFIGURED through the stream just like every JSON call.
+ */
+export class FakeEbookStreamClient implements IEbookStreamClient {
+  /** Every publicId opened, in order. */
+  opened: string[] = [];
+  contentType: string | null = 'application/epub+zip';
+  /** The bytes the returned stream yields — set to size the fake companion per test. */
+  bytes: Uint8Array = new Uint8Array([1, 2, 3]);
+  /**
+   * Split {@link bytes} across this many chunks (default: one). The proxy route reads the FIRST
+   * chunk before committing any header, so a multi-chunk body is what distinguishes "streamed"
+   * from "buffered whole and re-emitted".
+   */
+  chunks = 1;
+  /**
+   * Override the advertised content-length. `undefined` means "the real byte length"; `null`
+   * means the header was absent upstream (chunked). Set `0` for the zero-length companion.
+   */
+  contentLength: number | null | undefined = undefined;
+  /** Reject `openCompanionEpub()` itself — the header-phase failure. */
+  openError: unknown = null;
+  /** Reject the FIRST `read()`, before any header can be committed (AC25). */
+  firstReadError: unknown = null;
+  /** Reject AFTER the first chunk has been handed over (AC24's mid-body failure). */
+  midStreamError: unknown = null;
+  /** The `opts.signal` of the most recent open, so a test can observe the abort wiring. */
+  lastSignal: AbortSignal | undefined = undefined;
+  /** Awaited before the open resolves — lets a test park the handler mid-header-phase. */
+  beforeOpen: (() => Promise<void>) | null = null;
+
+  async openCompanionEpub(publicId: string, opts: { signal?: AbortSignal } = {}): Promise<NarratorrEbookStream> {
+    this.lastSignal = opts.signal;
+    if (this.beforeOpen) await this.beforeOpen();
+    this.opened.push(publicId);
+    if (this.openError) throw this.openError;
+    const { bytes, chunks, firstReadError, midStreamError } = this;
+    const size = Math.max(1, Math.ceil(bytes.byteLength / Math.max(1, chunks)));
+    let offset = 0;
+    let served = 0;
+    return {
+      contentType: this.contentType,
+      contentLength: this.contentLength === undefined ? bytes.byteLength : this.contentLength,
+      body: new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (served === 0 && firstReadError) throw firstReadError;
+          if (served > 0 && midStreamError) throw midStreamError;
+          if (offset >= bytes.byteLength) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(bytes.subarray(offset, offset + size));
+          offset += size;
+          served += 1;
+        },
+      }),
+    };
   }
 }
 
@@ -84,6 +178,8 @@ export interface RouteHarness {
   notify: ReturnType<typeof vi.fn>;
   /** The successful fake Narratorr client (mutate `.status`, inspect `.added`). */
   narratorr: FakeNarratorrClient;
+  /** The fake companion-ebook stream half of the same connection (inspect `.opened`). */
+  ebookStream: FakeEbookStreamClient;
   /**
    * The swappable holder wrapping {@link narratorr} — this is what `deps.narratorr` points at
    * (the health route reads `deps.narratorr.configured`; only the holder exposes that getter).
@@ -91,6 +187,14 @@ export interface RouteHarness {
    * with `narratorrConfigured: false` to start unconfigured.
    */
   narratorrHolder: NarratorrClientHolder;
+  /** The real capability resolver wired into `deps.features` — drive `nowMs`, swap to retire it. */
+  features: FeatureService;
+  /** The real connector-settings service behind `deps.connectorSettings` — write the admin flags. */
+  connectorSettings: ConnectorSettingsService;
+  /** The real `KindleSendService` behind `deps.kindleSends`, wired to {@link kindleTransports}. */
+  kindleSends: KindleSendService;
+  /** The recording Kindle transport — inspect `.messages` / override `.reply` per test. */
+  kindleTransports: FakeKindleTransports;
   /** The real `SearchService` wired against {@link narratorrHolder} — spy on `.search` to force errors. */
   search: SearchService;
   config: AppConfig;
@@ -117,6 +221,8 @@ export interface BuildRouteAppOpts {
   config?: Partial<AppConfig>;
   /** Override the default successful fake Narratorr client. */
   narratorr?: INarratorrClient;
+  /** Override the default fake companion-ebook stream client. */
+  ebookStream?: IEbookStreamClient;
   /**
    * Start with narratorr unconfigured (holder wraps `null`) so `deps.narratorr.configured` is
    * `false` and any search/handoff surfaces `NOT_CONFIGURED`. Defaults to `true` (configured).
@@ -149,11 +255,40 @@ export async function buildRouteApp(opts: BuildRouteAppOpts): Promise<RouteHarne
   const connectorSettings = new ConnectorSettingsService(db, codec);
   const users = new UserService(db, {});
   const narratorr = opts.narratorr ?? new FakeNarratorrClient();
-  // Mirror production wiring (src/server/index.ts): a single swappable holder is shared by
-  // RequestService and SearchService, so an unconfigured holder surfaces NOT_CONFIGURED
-  // through both paths, and the health route can read `deps.narratorr.configured`.
-  const narratorrHolder = new NarratorrClientHolder((opts.narratorrConfigured ?? true) ? narratorr : null);
+  const ebookStream = opts.ebookStream ?? new FakeEbookStreamClient();
+  // Mirror production wiring (src/server/index.ts): a single swappable holder owns the WHOLE
+  // connection (JSON + raw stream) and is shared by RequestService and SearchService, so an
+  // unconfigured holder surfaces NOT_CONFIGURED through every path — the stream included — and
+  // the health route can read `deps.narratorr.configured`.
+  const narratorrHolder = new NarratorrClientHolder(
+    (opts.narratorrConfigured ?? true) ? { json: narratorr, stream: ebookStream } : null,
+  );
   const search = new SearchService(narratorrHolder);
+  // Mirrors production wiring: the resolver reads the same swappable holder for BOTH the probe
+  // and its cache generation, so a route test can flip `narratorr.companionEpub` (or `.set(null)`,
+  // which retires the cache) and observe it through `/api/features`.
+  const features = new FeatureService(narratorrHolder, narratorrHolder);
+  // Mirrors production wiring (issue #147): the same holder for lookups AND cache generation, and
+  // the same feature inputs `/api/features` resolves through — so a route test flips
+  // `connectorSettings.ebooksEnabled` / `narratorr.companionEpub` and observes enrichment change.
+  const companionEbooks = new CompanionEbookService(
+    narratorrHolder,
+    narratorrHolder,
+    { connectorSettings, features },
+    { warn() {} },
+  );
+  // Mirrors production wiring (issue #148): the same holder for the raw EPUB stream and the SAME
+  // companion accessor the enrichment path uses, so a route test drives one cache. Only the SMTP
+  // transport is faked — a real socket is the stream file's job, not the route surface's.
+  const kindleTransports = new FakeKindleTransports();
+  const kindleSends = new KindleSendService({
+    db,
+    narratorr: narratorrHolder,
+    companions: companionEbooks,
+    settings: connectorSettings,
+    transport: kindleTransports.factory,
+    logger: { info() {}, warn() {}, error() {} },
+  });
   // A real Notifier (no channels → inert) with its `notify` swapped for a spy, so route tests
   // can assert dispatch without a structural cast. Building the genuine type means a new required
   // AppDeps field surfaces as a compile error here instead of a silent runtime `undefined`.
@@ -203,6 +338,9 @@ export async function buildRouteApp(opts: BuildRouteAppOpts): Promise<RouteHarne
     search,
     connectorSettings,
     narratorr: narratorrHolder,
+    features,
+    companionEbooks,
+    kindleSends,
     notifier,
     oidc: new Map(),
   };
@@ -231,6 +369,11 @@ export async function buildRouteApp(opts: BuildRouteAppOpts): Promise<RouteHarne
     });
   }
   opts.register(app, deps);
+  // Production's 404, via the SHARED registrar (issue #146 AC35). Without it a route test would
+  // assert Fastify's default not-found body, which no client of this app ever receives — and the
+  // router-miss shapes for `/api/ebooks/:bookId/download` are precisely the ones that answer here
+  // rather than in a handler. `serveClient: false` matches the API-only boot branch.
+  registerNotFoundHandler(app, { serveClient: false });
   await app.ready();
 
   return {
@@ -240,7 +383,12 @@ export async function buildRouteApp(opts: BuildRouteAppOpts): Promise<RouteHarne
     requests,
     notify,
     narratorr: narratorr as FakeNarratorrClient,
+    ebookStream: ebookStream as FakeEbookStreamClient,
     narratorrHolder,
+    features,
+    connectorSettings,
+    kindleSends,
+    kindleTransports,
     search,
     config,
     roleUsers,

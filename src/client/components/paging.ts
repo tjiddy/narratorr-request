@@ -3,8 +3,8 @@ import { DEFAULT_LIMIT, MAX_LIMIT } from '@shared/schemas/v1/common';
 // Pure paging decision logic for the request list views (My Requests, Admin Queue,
 // per-user history). The lists use a bounded growing-limit fetch: each view holds a
 // `limit` (starting at DEFAULT_LIMIT) and "load more" grows it by one page, capped at
-// MAX_LIMIT. Extracted here so the has-more / next-limit decisions are unit-tested
-// without a DOM render (this repo has no jsdom modality by design).
+// MAX_LIMIT. Extracted here so the has-more / next-limit decisions are unit-tested as pure
+// functions in the node project rather than through a DOM render.
 
 /**
  * Whether the server reports more rows than we've loaded. Drives the "Showing X of N"

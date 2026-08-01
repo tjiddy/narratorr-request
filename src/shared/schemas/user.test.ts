@@ -10,8 +10,13 @@ import {
   hasNotifyOn,
   updateMeBodySchema,
   contactEmailSchema,
+  kindleEmailSchema,
   normalizeContactEmail,
   hasDeliverableContact,
+  isApprovedUser,
+  unapprovedStatus,
+  USER_ROLES,
+  USER_STATUSES,
 } from './user.js';
 
 describe('requestQuotaSchema — four-mode discriminated union', () => {
@@ -189,6 +194,67 @@ describe('contactEmailSchema / normalizeContactEmail / hasDeliverableContact (is
   });
 });
 
+describe('kindleEmailSchema — Send-to-Kindle device address (#142)', () => {
+  describe('accepts + normalizes a real kindle.com address', () => {
+    it('trims and lowercases before the domain check runs (post-normalization refinement)', () => {
+      expect(kindleEmailSchema.parse('  USER@KINDLE.COM ')).toBe('user@kindle.com');
+      expect(kindleEmailSchema.parse('User@Kindle.Com')).toBe('user@kindle.com');
+    });
+    it('accepts the dot/plus local-part forms Amazon issues', () => {
+      expect(kindleEmailSchema.parse('a.b+tag@kindle.com')).toBe('a.b+tag@kindle.com');
+    });
+  });
+
+  // Each rejection is asserted individually so a broadened matcher (a bare `.endsWith` or
+  // `.includes`) fails loudly on the exact case it would let through.
+  describe('rejects anything whose domain is not exactly kindle.com', () => {
+    it('rejects a subdomain (a@sub.kindle.com)', () => {
+      expect(kindleEmailSchema.safeParse('a@sub.kindle.com').success).toBe(false);
+    });
+    it('rejects a suffix-match lookalike (a@notkindle.com)', () => {
+      expect(kindleEmailSchema.safeParse('a@notkindle.com').success).toBe(false);
+    });
+    it('rejects a suffix-match lookalike (a@evilkindle.com)', () => {
+      expect(kindleEmailSchema.safeParse('a@evilkindle.com').success).toBe(false);
+    });
+    it('rejects a contains-match lookalike (a@kindle.com.evil.io)', () => {
+      expect(kindleEmailSchema.safeParse('a@kindle.com.evil.io').success).toBe(false);
+    });
+    it('rejects a near-miss TLD (a@kindle.co)', () => {
+      expect(kindleEmailSchema.safeParse('a@kindle.co').success).toBe(false);
+    });
+    it('rejects an ordinary contact domain (a@example.com)', () => {
+      expect(kindleEmailSchema.safeParse('a@example.com').success).toBe(false);
+    });
+    // Amazon's Wi-Fi-only free-delivery domain is deliberately NOT accepted (spec Open Question):
+    // widening the domain set is a product decision, not something to broaden silently.
+    it('rejects the free-delivery domain (a@free.kindle.com) — deliberately out of scope', () => {
+      expect(kindleEmailSchema.safeParse('a@free.kindle.com').success).toBe(false);
+    });
+  });
+
+  describe('inherits the shared mailbox contract from contactEmailSchema', () => {
+    it('rejects a structurally invalid address', () => {
+      expect(kindleEmailSchema.safeParse('not-an-email').success).toBe(false);
+      expect(kindleEmailSchema.safeParse('kindle.com').success).toBe(false);
+    });
+    it('rejects "" and whitespace-only (clearing is kindleEmail: null only)', () => {
+      expect(kindleEmailSchema.safeParse('').success).toBe(false);
+      expect(kindleEmailSchema.safeParse('   ').success).toBe(false);
+    });
+    it('rejects an over-254 address', () => {
+      expect(kindleEmailSchema.safeParse(`${'a'.repeat(250)}@kindle.com`).success).toBe(false);
+    });
+  });
+
+  it('does NOT leak its domain constraint back into the shared contactEmailSchema', () => {
+    // kindleEmailSchema is DERIVED from contactEmailSchema; a refinement applied to the shared
+    // schema in place (rather than to a derived copy) would break every contact-email caller.
+    expect(contactEmailSchema.parse('a@example.com')).toBe('a@example.com');
+    expect(contactEmailSchema.parse('  Todd@Example.COM ')).toBe('todd@example.com');
+  });
+});
+
 describe('NOTIFIABLE_TRANSITIONS — requester opt-in (#50/#131)', () => {
   it('ships approved/denied/available in lifecycle order — each has a live emit site', () => {
     expect(NOTIFIABLE_TRANSITIONS).toEqual(['approved', 'denied', 'available']);
@@ -272,5 +338,83 @@ describe('updateMeBodySchema (PATCH /api/me)', () => {
       expect(updateMeBodySchema.safeParse({ email: '   ' }).success).toBe(false);
       expect(updateMeBodySchema.safeParse({ email: `${'a'.repeat(250)}@example.com` }).success).toBe(false);
     });
+  });
+
+  describe('kindleEmail — set / clear / omit contract (#142)', () => {
+    it('a valid Kindle address is normalized by the shared kindleEmailSchema', () => {
+      const parsed = updateMeBodySchema.safeParse({ kindleEmail: '  Todd@KINDLE.com ' });
+      expect(parsed.success).toBe(true);
+      if (parsed.success) expect(parsed.data.kindleEmail).toBe('todd@kindle.com');
+    });
+    it('kindleEmail null is valid — the clear sentinel', () => {
+      const parsed = updateMeBodySchema.safeParse({ kindleEmail: null });
+      expect(parsed.success).toBe(true);
+      if (parsed.success) expect(parsed.data.kindleEmail).toBeNull();
+    });
+    it('omitting kindleEmail is valid — no change (an empty body stays a no-op)', () => {
+      expect(updateMeBodySchema.safeParse({}).success).toBe(true);
+      expect(updateMeBodySchema.safeParse({ notifyOn: ['available'] }).success).toBe(true);
+    });
+    it('kindleEmail "" is a 400 (NOT a clear) — same semantics as email', () => {
+      expect(updateMeBodySchema.safeParse({ kindleEmail: '' }).success).toBe(false);
+      expect(updateMeBodySchema.safeParse({ kindleEmail: '   ' }).success).toBe(false);
+    });
+    it('rejects a non-kindle.com domain (→ 400)', () => {
+      expect(updateMeBodySchema.safeParse({ kindleEmail: 'a@example.com' }).success).toBe(false);
+      expect(updateMeBodySchema.safeParse({ kindleEmail: 'a@evilkindle.com' }).success).toBe(false);
+    });
+
+    // The three self-scoped fields are mutually independent: every subset must parse.
+    it('parses every subset of { notifyOn, email, kindleEmail }', () => {
+      const subsets: Record<string, unknown>[] = [
+        {},
+        { notifyOn: ['approved'] },
+        { email: 'a@b.com' },
+        { kindleEmail: 'a@kindle.com' },
+        { notifyOn: ['approved'], email: 'a@b.com' },
+        { notifyOn: ['approved'], kindleEmail: 'a@kindle.com' },
+        { email: 'a@b.com', kindleEmail: 'a@kindle.com' },
+        { notifyOn: ['approved'], email: 'a@b.com', kindleEmail: 'a@kindle.com' },
+        { email: null, kindleEmail: null },
+      ];
+      for (const body of subsets) expect(updateMeBodySchema.safeParse(body).success).toBe(true);
+    });
+    it('stays strict — a stray key alongside kindleEmail is rejected', () => {
+      expect(updateMeBodySchema.safeParse({ kindleEmail: 'a@kindle.com', role: 'admin' }).success).toBe(false);
+    });
+  });
+});
+
+describe('isApprovedUser / unapprovedStatus — the shared approval-queue policy (#144)', () => {
+  const MATRIX = USER_ROLES.flatMap((role) => USER_STATUSES.map((status) => ({ role, status })));
+
+  it('admits an active user and ANY admin — the queue can never lock an admin out', () => {
+    expect(isApprovedUser({ role: 'user', status: 'active' })).toBe(true);
+    // An admin is approved at every status: role is orthogonal to the queue, and the person who
+    // grants approvals must not be able to lock themselves out of the app that grants them.
+    for (const status of USER_STATUSES) {
+      expect(isApprovedUser({ role: 'admin', status }), status).toBe(true);
+    }
+  });
+
+  it('rejects a non-admin who is not active', () => {
+    expect(isApprovedUser({ role: 'user', status: 'pending' })).toBe(false);
+    expect(isApprovedUser({ role: 'user', status: 'rejected' })).toBe(false);
+  });
+
+  it('unapprovedStatus is the exact negation, carrying the state to render', () => {
+    // The two must agree on every input or `App.tsx`'s shell choice and the query/authorization
+    // gates would answer differently for the same account.
+    for (const user of MATRIX) {
+      const unapproved = unapprovedStatus(user);
+      expect(unapproved === null, JSON.stringify(user)).toBe(isApprovedUser(user));
+      // …and when it does report a state, it is the account's own — never `active`.
+      if (unapproved !== null) expect(unapproved).toBe(user.status);
+    }
+  });
+
+  it('names both unapproved states for a non-admin', () => {
+    expect(unapprovedStatus({ role: 'user', status: 'pending' })).toBe('pending');
+    expect(unapprovedStatus({ role: 'user', status: 'rejected' })).toBe('rejected');
   });
 });

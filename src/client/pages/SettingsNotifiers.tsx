@@ -1,4 +1,5 @@
 import { useState, useId } from 'react';
+import { isKnownNotifierDto } from '@shared/schemas/connectors';
 import type { NotifierDto, KnownNotifierDto } from '@shared/schemas/connectors';
 import { NOTIFIER_REGISTRY, NOTIFIER_TYPES, type NotifierType, type NotifierField } from '@shared/notifier-registry';
 import { NOTIFICATION_EVENTS } from '@shared/notification-events';
@@ -19,11 +20,6 @@ import {
   secretFieldHint,
   type NotifierFormState,
 } from './settings-notifiers';
-
-/** Discriminate the masked notifier DTO: a known type carries `config`; unknown carries `unknown`. */
-function isKnownNotifier(n: NotifierDto): n is KnownNotifierDto {
-  return !('unknown' in n && n.unknown);
-}
 
 export function NotifiersSection({
   notifiers,
@@ -84,7 +80,7 @@ export function NotifiersSection({
               key={n.id}
               notifier={n}
               delay={`${60 + i * 50}ms`}
-              {...(isKnownNotifier(n) && {
+              {...(isKnownNotifierDto(n) && {
                 onEdit: () => setEditing(formFromDto(n)),
                 // No event selected → nothing to sample → hide Test (the modal requires ≥1
                 // event, but a leniently-stored notifier can have none).
@@ -122,7 +118,7 @@ function NotifierCard({
   testing: boolean;
   deleting: boolean;
 }) {
-  const known = isKnownNotifier(notifier);
+  const known = isKnownNotifierDto(notifier);
   const typeLabel = known ? NOTIFIER_REGISTRY[notifier.type as NotifierType].label : notifier.type;
   const eventLabels = notifier.events.map((e) => NOTIFICATION_EVENTS.find((ev) => ev.key === e)?.label ?? e).join(', ');
 

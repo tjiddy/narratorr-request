@@ -1,6 +1,7 @@
-// Pure favicon/title decisions for the instance badge (issue #135). Kept as pure functions with
-// co-located `.test.ts` coverage per the repo's node-only client-test convention (no jsdom); the
-// DOM wiring (`useInstanceBadge()` in hooks.ts) is a thin, untested-by-convention shim.
+// Pure favicon/title decisions for the instance badge (issue #135). These are decisions, not
+// rendering, so they stay pure functions with co-located `.test.ts` coverage in the node project
+// rather than being asserted through a jsdom render; the DOM wiring (`useInstanceBadge()` in
+// hooks.ts) is a thin, untested-by-convention shim.
 //
 // The badge distinguishes a dev instance from prod when many squeezed tabs show only a favicon:
 // color encodes ENVIRONMENT across the narratorr family (violet = dev), while the glyph/title keep

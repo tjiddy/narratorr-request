@@ -1,22 +1,24 @@
 import { useState } from 'react';
 import type { ElementType } from 'react';
 import { useConnectorSettings } from '../hooks';
-import { SlidersIcon, ServerIcon, BellIcon, ActivityIcon } from '../components/icons';
+import { SlidersIcon, ServerIcon, BookIcon, BellIcon, ActivityIcon } from '../components/icons';
 import { GeneralSection, NarratorrSection } from './SettingsConnection';
+import { EbooksSection } from './SettingsEbooks';
 import { NotifiersSection } from './SettingsNotifiers';
 import { SystemSection } from './SettingsSystem';
 
-// Settings shell: a narratorr-style left-nav sidebar over four sections (General /
-// Narratorr / Notifications / System). Sections are switched in local state rather than
-// routed — the page lives under one `/settings` route and sub-routes would buy no visual
+// Settings shell: a narratorr-style left-nav sidebar over five sections (General /
+// Narratorr / eBooks / Notifications / System). Sections are switched in local state rather
+// than routed — the page lives under one `/settings` route and sub-routes would buy no visual
 // gain. Each section owns its own form state + per-card save; only the active one is
 // mounted. (System is read-only and fetches its own data.)
 
-type SectionKey = 'general' | 'narratorr' | 'notifications' | 'system';
+type SectionKey = 'general' | 'narratorr' | 'ebooks' | 'notifications' | 'system';
 
 const NAV: { key: SectionKey; label: string; icon: ElementType }[] = [
   { key: 'general', label: 'General', icon: SlidersIcon },
   { key: 'narratorr', label: 'Narratorr', icon: ServerIcon },
+  { key: 'ebooks', label: 'eBooks', icon: BookIcon },
   { key: 'notifications', label: 'Notifications', icon: BellIcon },
   { key: 'system', label: 'System', icon: ActivityIcon },
 ];
@@ -63,8 +65,17 @@ export function SettingsPage() {
           </nav>
 
           <div className="min-w-0 flex-1 animate-fade-in-up stagger-2">
-            {active === 'general' && <GeneralSection publicUrl={data.publicUrl} defaultQuota={data.defaultQuota} />}
+            {active === 'general' && (
+              <GeneralSection publicUrl={data.publicUrl} defaultQuota={data.defaultQuota} />
+            )}
             {active === 'narratorr' && <NarratorrSection key={JSON.stringify(data.narratorr)} saved={data.narratorr} />}
+            {active === 'ebooks' && (
+              <EbooksSection
+                ebooksEnabled={data.ebooksEnabled}
+                notifiers={data.notifiers}
+                kindleSender={data.kindleSender}
+              />
+            )}
             {active === 'notifications' && (
               <NotifiersSection
                 notifiers={data.notifiers}

@@ -56,6 +56,8 @@ export class DiscordChannel implements NotificationChannel {
       headers: { 'content-type': 'application/json' },
       // allowed_mentions:{parse:[]} — a book titled "@everyone"/"@here" must never ping the server.
       body: JSON.stringify({ embeds: [embed], allowed_mentions: { parse: [] } }),
+      // Refuse redirects — see ntfy adapter.
+      redirect: 'error',
       // Bound the call — see ntfy adapter: a hung endpoint must not leak sockets.
       signal: AbortSignal.timeout(10_000),
     });

@@ -1,0 +1,79 @@
+import { describe, it, expect, vi } from 'vitest';
+import { buildRouteApp } from './route-harness.js';
+import { registerHealthRoutes } from '../routes/health.js';
+import type { NarratorrEbookStream } from '../services/narratorr-stream-client.js';
+
+// The harness's narratorr wiring is shared by every route-test file, so the "configured" and
+// "unconfigured" states it hands out are asserted here once rather than re-derived per suite.
+// Since #145 a connection is a PAIR (JSON + raw stream) installed together, so `narratorrConfigured`
+// must arm or disarm BOTH halves — a harness that only wired the JSON half would let a future
+// proxy-route test see a working stream against an unconfigured narratorr.
+
+const NOT_CONFIGURED = { statusCode: 502, upstreamCode: 'NOT_CONFIGURED' };
+// `require()` throws synchronously; every real caller observes it as a rejection because it awaits.
+const awaited = (fn: () => unknown) => Promise.resolve().then(fn);
+
+describe('route harness — narratorr connection wiring', () => {
+  it('arms both halves when configured: JSON and the companion stream reach their fakes', async () => {
+    const h = await buildRouteApp({ register: registerHealthRoutes });
+    try {
+      expect(h.narratorrHolder.configured).toBe(true);
+      await expect(h.narratorrHolder.getBook('bk_1')).resolves.toMatchObject({ id: 'bk_1' });
+
+      const stream = await h.narratorrHolder.openCompanionEpub('bk_1');
+      expect(h.ebookStream.opened).toEqual(['bk_1']);
+      expect(stream.contentType).toBe('application/epub+zip');
+      expect(stream.contentLength).toBe(h.ebookStream.bytes.byteLength);
+    } finally {
+      await h.app.close();
+    }
+  });
+
+  it('installs a caller-provided ebookStream override as THE stream reached through the holder', async () => {
+    // Without this, a harness that ignored `opts.ebookStream` and always built its own fake would
+    // leave the option silently inert — and every future proxy-route test asserting on an injected
+    // stream boundary would be asserting against a double the route never touched.
+    const bytes = new Uint8Array([9, 9, 9, 9, 9]);
+    const openCompanionEpub = vi.fn(
+      async (_publicId: string, _opts?: { signal?: AbortSignal }): Promise<NarratorrEbookStream> => ({
+        contentType: 'application/x-custom-double',
+        contentLength: bytes.byteLength,
+        body: new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(bytes);
+            c.close();
+          },
+        }),
+      }),
+    );
+    const override = { openCompanionEpub };
+    const h = await buildRouteApp({ register: registerHealthRoutes, ebookStream: override });
+    try {
+      const ac = new AbortController();
+      const stream = await h.narratorrHolder.openCompanionEpub('bk_custom', { signal: ac.signal });
+
+      // Reached through the holder the routes actually hold — with BOTH arguments intact.
+      expect(openCompanionEpub).toHaveBeenCalledWith('bk_custom', { signal: ac.signal });
+      expect(stream.contentType).toBe('application/x-custom-double');
+      expect(stream.contentLength).toBe(bytes.byteLength);
+      // …and the harness surfaces the same double, so a test can drive it after building.
+      // (`ebookStream` is declared as the default fake's type, the way `narratorr` already is.)
+      expect(h.ebookStream as unknown).toBe(override);
+    } finally {
+      await h.app.close();
+    }
+  });
+
+  it('disarms both halves with narratorrConfigured: false', async () => {
+    const h = await buildRouteApp({ register: registerHealthRoutes, narratorrConfigured: false });
+    try {
+      expect(h.narratorrHolder.configured).toBe(false);
+      await expect(awaited(() => h.narratorrHolder.searchMetadata('q'))).rejects.toMatchObject(NOT_CONFIGURED);
+      await expect(awaited(() => h.narratorrHolder.getCapabilities())).rejects.toMatchObject(NOT_CONFIGURED);
+      await expect(awaited(() => h.narratorrHolder.openCompanionEpub('bk_1'))).rejects.toMatchObject(NOT_CONFIGURED);
+      expect(h.ebookStream.opened).toEqual([]);
+    } finally {
+      await h.app.close();
+    }
+  });
+});

@@ -65,6 +65,23 @@ Authentication (who you are) is **pluggable**; authorization (who may request) i
 
 > Single-instance note: OIDC login state and the auth rate-limiter are in-memory, so running
 > multiple replicas needs sticky sessions (a shared store is a future enhancement).
+>
+> **Send-to-Kindle is ONE-REPLICA-ONLY, which is stricter than sticky sessions.** Its admission
+> guarantees — the 3-starts-per-user-per-minute cap, the 60-second replay suppression, the daily
+> accepted quota and max-concurrency-1 per user — rest on an in-memory keyed mutex and start deque,
+> one copy per Node process. Sticky sessions are *not* sufficient: the session cookie is a stateless
+> per-login token, so one person signed in on a phone and a laptop holds two different cookie values
+> that ordinary cookie affinity routes to two replicas, splitting the very mutex and deque those
+> guarantees rest on. Two processes sharing the database can each admit their own three starts a
+> minute, can both pass the replay lookup before either terminal row exists, and can both count
+> `daily − 1` before either reservation exists.
+>
+> What survives regardless of topology is durable, because the audit table *is* the admission
+> mechanism: at most one active reservation per (user, book), no send without an observed durable
+> reservation, and the honesty of every recorded terminal status. A cross-process race can
+> over-admit; it can never produce a `sent` with no audit row. Lifting the restriction would need a
+> load-balancer affinity key stable per USER across every login session, or shared DB admission —
+> neither is built.
 
 ## Settings (in-app)
 
@@ -131,6 +148,10 @@ the job succeeds. Requires repo secrets **`DOCKERHUB_USERNAME`** and **`DOCKERHU
 ```bash
 pnpm verify   # lint + test + typecheck + build
 ```
+
+Companion ebooks (Get eBook + Send to Kindle) also have a manual two-app checklist for release
+verification against a real narratorr, a real relay and a real browser —
+[docs/companion-ebook-smoke.md](docs/companion-ebook-smoke.md).
 
 ## Contributing
 

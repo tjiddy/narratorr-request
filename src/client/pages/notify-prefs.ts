@@ -1,10 +1,15 @@
-import { NOTIFIABLE_TRANSITIONS, type NotifiableTransition, type UpdateMeBody } from '@shared/schemas/user';
+import { NOTIFIABLE_TRANSITIONS, type MeDto, type NotifiableTransition, type UpdateMeBody } from '@shared/schemas/user';
 
 // Pure logic for the account modal (issue #131): the requester-notification opt-in checkboxes, the
-// contact-email save row, and the identity provider line. Extracted from the React component so
-// it's unit-testable without a jsdom harness (frontend-logic-extract-not-jsdom): the component
-// wires these to inputs, these decide state. The PATCH /api/me body is
-// `{ notifyOn?: NotifiableTransition[]; email?: string | null }` (both fields independent/optional).
+// contact-email save row, the Send-to-Kindle address save row (#142), and the identity provider
+// line. Extracted from the React component so it's unit-testable without a jsdom harness
+// (frontend-logic-extract-not-jsdom): the component wires these to inputs, these decide state. The
+// PATCH /api/me body is `{ notifyOn?, email?, kindleEmail? }` — all three independent and optional.
+//
+// The three email-field helpers below (`isEmailFieldDirty` / `emailFieldPatchValue` /
+// `reconciledEmailFieldDraft`) are FIELD-GENERIC on purpose: the contact row and the Kindle row
+// share them rather than each owning a copy. Cloning them per row is how the case-normalization
+// false-dirty bug `reconciledEmailFieldDraft` exists to fix creeps back in on the second row.
 
 /**
  * Short label per transition, for the notifications row. Keyed to `NOTIFIABLE_TRANSITIONS`. These
@@ -61,50 +66,95 @@ export function providerLabel(
 }
 
 /**
- * Whether the email Save button is active (dirty): true when the trimmed draft differs from the
- * stored contact (null reads as the empty string). Save is spatially scoped to the email row — it
- * commits ONLY email — so this drives its at-rest-vs-amber state independent of the notify toggles.
+ * Whether an email-field Save button is active (dirty): true when the trimmed draft differs from the
+ * stored value, CASE-INSENSITIVELY (null reads as the empty string). Each Save is spatially scoped to
+ * its own row — it commits ONLY that field — so this drives its at-rest-vs-amber state independent of
+ * the other row and of the notify toggles. Shared by the contact-email row and the Kindle-address row
+ * (#142).
+ *
+ * The comparison ignores case because both stored addresses are trim+lowercased BEFORE storage
+ * (`contactEmailSchema`; `kindleEmailSchema` derives from it), so a case-only difference can never
+ * represent a pending change — saving it would store the identical value. That matters on the error
+ * path (#168 AC7): a save that COMMITTED `Foo@Ex.COM` and then failed in the route's DTO tail leaves
+ * the typed draft untouched (drafts are only reconciled on success, deliberately — the client cannot
+ * tell a committed failure from an uncompleted one, and rewriting the field would discard input after
+ * an ordinary validation 400), so once the settlement refetch lands the normalized `foo@ex.com` the
+ * row must read CLEAN rather than falsely amber.
  */
-export function isEmailDirty(stored: string | null, draft: string): boolean {
-  return draft.trim() !== (stored ?? '');
+export function isEmailFieldDirty(stored: string | null, draft: string): boolean {
+  return draft.trim().toLowerCase() !== (stored ?? '').toLowerCase();
 }
 
 /**
- * The `email` value for the PATCH body from the draft field: an empty (or whitespace-only) field
- * clears the contact (`null`), any other value is sent trimmed for the server's `contactEmailSchema`
- * to normalize + validate (an invalid address 400s and surfaces inline). Clearing is `email: null`;
- * the empty string is never sent (it would 400 — the server rejects `""` as a non-clear).
+ * The PATCH-body value for an email field from its draft: an empty (or whitespace-only) field clears
+ * it (`null`), any other value is sent trimmed for the server's schema to normalize + validate (an
+ * invalid address 400s and surfaces inline). Clearing is always `null`; the empty string is never
+ * sent (it would 400 — the server rejects `""` as a non-clear, for both `email` and `kindleEmail`).
  */
-export function emailPatchValue(draft: string): string | null {
+export function emailFieldPatchValue(draft: string): string | null {
   const trimmed = draft.trim();
   return trimmed === '' ? null : trimmed;
 }
 
 /**
- * The email draft to adopt after a SUCCESSFUL save, reconciled to the server's returned contact
- * (`MeDto.email`, already normalized: trimmed + lowercased, or `null` when cleared). Without this,
- * a save of e.g. `New@Contact.COM` normalizes server-side to `new@contact.com` while the input keeps
- * the pre-normalized draft, so {@link isEmailDirty} — a case-sensitive compare — would leave Save
+ * The draft to adopt after a SUCCESSFUL save, reconciled to the server's returned value (already
+ * normalized: trimmed + lowercased, or `null` when cleared). Without this, a save of e.g.
+ * `New@Contact.COM` normalizes server-side to `new@contact.com` while the input keeps the
+ * pre-normalized draft, so {@link isEmailFieldDirty} — a case-sensitive compare — would leave Save
  * falsely amber. Resetting the draft to the returned value makes the row clean again. Composing this
- * with `isEmailDirty(saved, reconciledEmailDraft(saved))` is always `false` — the tested invariant.
+ * with `isEmailFieldDirty(saved, reconciledEmailFieldDraft(saved))` is always `false` — the tested
+ * invariant. Applies to BOTH rows: `MeDto.email` and `MeDto.kindleEmail` (#142).
  */
-export function reconciledEmailDraft(saved: string | null): string {
+export function reconciledEmailFieldDraft(saved: string | null): string {
   return saved ?? '';
 }
 
+/** Where to find the device address, for the Kindle row's helper copy (#142). */
+export const KINDLE_EMAIL_HELP = 'Find it in Amazon: Devices > your Kindle > Email.';
+
 /**
  * The success toast for a `useUpdateMe` mutation, or `null` for none — feedback proportional to the
- * action (#134). The account modal routes two shapes through one hook: an explicit email Save and
- * instant-apply notification checkboxes.
- *   • Any body carrying `email` (set OR `null`-clear) → "Email saved". An explicit commit button
- *     deserves an acknowledgment, and the field looks identical before/after, so nothing else
- *     confirms it. When BOTH fields ride one body the explicit-commit action wins.
- *   • A `notifyOn`-only body → `null` (silent). The persisted checkbox is the confirmation (the
- *     platform convention for instant-apply toggles), which also avoids toast-stacking when several
- *     boxes are toggled.
- * Keyed on the presence of the `email` KEY, not its value, so a `email: null` clear still toasts.
+ * action (#134). The account modal routes three shapes through the hook: an explicit contact-email
+ * Save, an explicit Kindle-address Save (#142), and instant-apply notification checkboxes.
+ *   • Any body carrying `email` (set OR `null`-clear) → "Email saved".
+ *   • Any body carrying `kindleEmail` → "Kindle address saved". BOTH explicit Saves must toast: the
+ *     field looks identical before and after, so without an ack the button applies silently.
+ *   • A `notifyOn`-only (or empty) body → `null` (silent). The persisted checkbox is the confirmation
+ *     (the platform convention for instant-apply toggles), which also avoids toast-stacking when
+ *     several boxes are toggled.
+ * Precedence is DETERMINISTIC and `email`-first. The modal's Saves are row-scoped, so a body carrying
+ * both never arises from the UI; a caller that hand-builds one gets one toast, not two.
+ * Keyed on the presence of the KEY, not its value, so a `null` clear on either field still toasts.
  * Errors are handled separately in the hook and always toast, regardless of shape.
  */
 export function meSuccessToast(body: UpdateMeBody): string | null {
-  return 'email' in body ? 'Email saved' : null;
+  if ('email' in body) return 'Email saved';
+  if ('kindleEmail' in body) return 'Kindle address saved';
+  return null;
+}
+
+/**
+ * Fold a `PATCH /api/me` response into the cached `MeDto` — the RACE-SAFE cache write for
+ * `useUpdateMe` (#142 F1). Each row of the account modal owns an independent mutation instance, so
+ * a contact save and a Kindle save can be in flight at once. Every response is a snapshot of the row
+ * as the server read it, which means a request that STARTED earlier carries the sibling field's
+ * PRE-write value; blindly replacing the whole cache entry with the last response to arrive would
+ * roll the newer sibling save back, leaving that row falsely dirty (its draft holds the saved value
+ * while `me` reports the old one).
+ *
+ * The rule: a response is authoritative ONLY for the self-scoped fields its request actually wrote.
+ * For each of the three (`email` — with its derived `emailNotifyAvailable` — `kindleEmail`, and
+ * `notifyOn`), keep the cached value whenever this body didn't carry that key. Everything else on the
+ * DTO (quota, identity, role) isn't written by this endpoint, so the fresher response wins. Keyed on
+ * the presence of the KEY, not its value, so an explicit `null` clear is still an authoritative write.
+ * With no prior cache entry there is nothing to preserve and the response is taken whole.
+ */
+export function mergeMeCache(prev: MeDto | undefined, dto: MeDto, body: UpdateMeBody): MeDto {
+  if (!prev) return dto;
+  return {
+    ...dto,
+    ...(!('email' in body) && { email: prev.email, emailNotifyAvailable: prev.emailNotifyAvailable }),
+    ...(!('kindleEmail' in body) && { kindleEmail: prev.kindleEmail }),
+    ...(!('notifyOn' in body) && { notifyOn: prev.notifyOn }),
+  };
 }

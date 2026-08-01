@@ -28,6 +28,7 @@ import { SettingsService } from '../services/settings.service.js';
 import { ConnectorSettingsService } from '../services/connector-settings.service.js';
 import { SecretCodec, deriveSettingsKey } from '../util/secret-codec.js';
 import { NarratorrClientHolder } from '../services/narratorr-client-holder.js';
+import { FeatureService } from '../services/feature.service.js';
 import { Notifier } from '../services/notifications/index.js';
 import { errorHandlerPlugin } from '../plugins/error-handler.js';
 import { registerSettingsRoutes } from './settings.js';
@@ -45,9 +46,15 @@ async function buildApp(): Promise<FastifyInstance> {
   const db = await createTestDb();
   await new SettingsService(db).ensure();
   connectorSettings = new ConnectorSettingsService(db, codec);
+  // ONE holder, shared as both the client slot and the resolver's connection generation — the
+  // production shape since #145 (a narratorr save swaps the connection, and that swap is what
+  // retires the capability cache). Two separate holders would let this builder pass while the
+  // real wiring diverged.
+  const narratorr = new NarratorrClientHolder(null);
   const deps = {
     connectorSettings,
-    narratorr: new NarratorrClientHolder(null),
+    narratorr,
+    features: new FeatureService(narratorr, narratorr),
     notifier: new Notifier([], null, silentLog),
     requests: { reconfigureQuota: vi.fn() },
   } as unknown as AppDeps;

@@ -41,7 +41,7 @@ async function narratorrSystem(holder: NarratorrClientHolder): Promise<SystemInf
       version: sys.version,
       ...(sys.commit !== undefined && { commit: sys.commit }),
     };
-  } catch (err) {
+  } catch (err: unknown) {
     if (err instanceof NarratorrError) {
       if (err.upstreamCode === 'NOT_CONFIGURED') return { state: 'not_configured' };
       if (err.upstreamCode === 'CONTRACT_MISMATCH') return { state: 'unavailable' };

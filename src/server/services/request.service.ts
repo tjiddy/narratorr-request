@@ -15,7 +15,7 @@ import { OPEN_REQUEST_STATUSES, ACTIVE_REQUEST_STATUSES, APPROVED_REQUEST_STATUS
 import { roleSchema, sanitizeNotifyOn, normalizeContactEmail, type Role, type RequestQuotaMode } from '../../shared/schemas/user.js';
 import type { DefaultQuota, QuotaWindowDays } from '../../shared/schemas/connectors.js';
 import type { V1Book } from '../../shared/schemas/v1/books.js';
-import type { INarratorrClient } from './narratorr-client.js';
+import type { IBookHandoffClient } from './narratorr-client.js';
 import {
   isTerminalHandoffError,
   handoffFailureReason,
@@ -103,7 +103,7 @@ export interface QuotaUsage {
 export class RequestService {
   constructor(
     private readonly db: Db,
-    private readonly client: INarratorrClient,
+    private readonly client: IBookHandoffClient,
     private readonly policy: RequestPolicy,
     private readonly notifyDeps?: RequestFailureNotifyDeps,
   ) {}
@@ -166,6 +166,12 @@ export class RequestService {
       requestedAt: row.requestedAt.toISOString(),
       decidedAt: row.decidedAt ? row.decidedAt.toISOString() : null,
       narratorrBookId: row.narratorrBookId,
+      // ALWAYS null here (issue #147). The field is transient read-time decoration owned by
+      // `CompanionEbookService`, which only the caller's own request list runs; setting it
+      // unconditionally is what keeps every other `toDto()` caller — the admin queue, the
+      // per-user list, the detail route and both mutation responses — serializing against the
+      // response schema unchanged.
+      companionEbook: null,
       requester,
     };
   }
@@ -330,7 +336,7 @@ export class RequestService {
         .returning();
       if (!created) throw new Error('insert returned no row');
       return { row: created, created: true };
-    } catch (err) {
+    } catch (err: unknown) {
       // Race: the partial unique index fired between our preflight and insert.
       if (isUniqueViolation(err)) {
         const dupe = await this.findActiveDuplicate(userId, body.asin);
@@ -406,7 +412,7 @@ export class RequestService {
         .where(and(eq(requests.id, row.id), eq(requests.status, row.status)))
         .returning();
       return updated ?? row;
-    } catch (err) {
+    } catch (err: unknown) {
       if (!isTerminalHandoffError(err)) throw err; // transient — stays `approved`, poller retries
       // Terminal handoff failure: claim the failed edge (emits request.failed once) and
       // PRESERVE the existing rethrow — callers/tests depend on the error surfacing.
@@ -429,7 +435,7 @@ export class RequestService {
     try {
       const result = await this.handoff(row);
       return result.status === 'failed' ? 'failed' : 'recovered';
-    } catch (err) {
+    } catch (err: unknown) {
       if (!isTerminalHandoffError(err)) throw err; // transient — poller counts an upstream error & retries
       return 'failed'; // terminal: handoff already claimed `failed` and emitted once — a real transition
     }
@@ -602,7 +608,7 @@ export class RequestService {
     for (const { request: row, notifyOn, email } of owed) {
       try {
         await this.notifyOneAvailable(row, notifyOn, email, sender, logger);
-      } catch (err) {
+      } catch (err: unknown) {
         // Transient SMTP failure (send threw) or a post-delivery marker-write fault. Never unwind the
         // sweep; leave the marker null so the row is re-attempted. redact() before logging: a send
         // fault can embed SMTP credentials.

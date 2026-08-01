@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { DEFAULT_LIMIT, MAX_LIMIT } from './v1/common.js';
+import { v1CompanionEbookSchema } from './v1/companion-ebook.js';
 
 // =============================================================================
 // coverUrl SSRF guard. A request-supplied coverUrl is rendered as <img src> in
@@ -209,6 +210,13 @@ export const requestDtoSchema = z.object({
   requestedAt: z.string(),
   decidedAt: z.string().nullable(),
   narratorrBookId: z.string().nullable(),
+  // The companion ebook narratorr advertises for this book (issue #147). TRANSIENT and
+  // READ-TIME: nothing is persisted and there is no column — `RequestService.toDto()` always
+  // emits `null` and only the caller's own `GET /api/requests` list is enriched afterwards, so
+  // every other surface serializes a truthful `null`. PRESENT-and-nullable (never optional) on
+  // purpose: a mapper that forgot to set it then fails serialization loudly on the UNENRICHED
+  // admin paths rather than silently dropping the affordance on the enriched one.
+  companionEbook: v1CompanionEbookSchema.nullable(),
   requester: z.object({ publicId: z.string(), username: z.string() }),
 });
 export type RequestDto = z.infer<typeof requestDtoSchema>;

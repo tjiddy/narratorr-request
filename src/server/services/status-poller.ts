@@ -2,12 +2,12 @@ import { Cron } from 'croner';
 import type { FastifyBaseLogger } from 'fastify';
 import type { RequestService } from './request.service.js';
 import { BOOK_VANISHED_REASON } from './request.service.js';
-import type { INarratorrClient } from './narratorr-client.js';
+import type { IBookStatusClient } from './narratorr-client.js';
 import { NarratorrError } from './narratorr-client.js';
 
 export interface StatusPollerOptions {
   requests: RequestService;
-  client: INarratorrClient;
+  client: IBookStatusClient;
   logger: FastifyBaseLogger;
   /** Poll cadence (seconds). */
   intervalSeconds?: number;
@@ -28,7 +28,7 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
  */
 export class StatusPoller {
   private readonly requests: RequestService;
-  private readonly client: INarratorrClient;
+  private readonly client: IBookStatusClient;
   private readonly logger: FastifyBaseLogger;
   private readonly batchSize: number;
   private readonly jitterMs: number;
@@ -72,7 +72,7 @@ export class StatusPoller {
       } else {
         this.failureStreak = 0;
       }
-    } catch (err) {
+    } catch (err: unknown) {
       this.logger.error({ err }, 'status-poller tick failed');
       this.backoff();
     }
@@ -109,7 +109,7 @@ export class StatusPoller {
         } else {
           this.logger.info({ request: row.publicId }, 'recovered stranded approved request via handoff');
         }
-      } catch (err) {
+      } catch (err: unknown) {
         upstreamErrors += 1;
         this.logger.warn({ request: row.publicId, err }, 'handoff recovery failed');
       }
@@ -127,7 +127,7 @@ export class StatusPoller {
           transitioned += 1;
           this.logger.info({ request: row.publicId, status: next }, 'request status updated');
         }
-      } catch (err) {
+      } catch (err: unknown) {
         if (err instanceof NarratorrError && err.upstreamStatus === 404) {
           // markFailed claims the edge atomically; only count/log when THIS call transitioned
           // it (a row another caller already failed returns false → no double count/emit).

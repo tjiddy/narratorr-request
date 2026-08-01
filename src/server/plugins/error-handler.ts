@@ -11,6 +11,37 @@ function isValidationError(error: FastifyError | Error): boolean {
 }
 
 /**
+ * Body-parser failures Fastify raises BEFORE any route code runs. None of them is an `ApiError`,
+ * none carries `error.validation`, and none is a 429 — so without this clause every one of them
+ * fell through to `500 INTERNAL`, which is wrong for what are plainly client mistakes (a malformed
+ * JSON login body 500'd).
+ *
+ * Fastify's own status is preserved and paired with a stable app code and OUR message — never
+ * Fastify's raw text, per this handler's existing no-leak doctrine. The set is an ALLOWLIST: an
+ * unlisted `FST_ERR_CTP_*` (e.g. `FST_ERR_CTP_INVALID_PARSE_TYPE`, a wiring/programmer error)
+ * keeps falling through to 500.
+ *
+ * This is a shared-plugin change, so it corrects the same latent defect on every body-accepting
+ * route, not just the one that surfaced it. That is deliberate and strictly more correct.
+ */
+const PARSER_ERROR_ANSWERS: Readonly<Record<string, { status: number; code: string; message: string }>> = {
+  FST_ERR_CTP_EMPTY_JSON_BODY: { status: 400, code: 'BAD_REQUEST', message: 'A JSON request body is required.' },
+  FST_ERR_CTP_INVALID_JSON_BODY: { status: 400, code: 'BAD_REQUEST', message: 'The request body is not valid JSON.' },
+  FST_ERR_CTP_INVALID_CONTENT_LENGTH: { status: 400, code: 'BAD_REQUEST', message: 'The request body did not match its Content-Length.' },
+  FST_ERR_CTP_BODY_TOO_LARGE: { status: 413, code: 'PAYLOAD_TOO_LARGE', message: 'The request body is too large.' },
+  FST_ERR_CTP_INVALID_MEDIA_TYPE: { status: 415, code: 'UNSUPPORTED_MEDIA_TYPE', message: 'That content type is not supported.' },
+};
+
+function parserErrorAnswer(error: FastifyError | Error): { status: number; code: string; message: string } | null {
+  const code = (error as { code?: unknown }).code;
+  if (typeof code !== 'string' || !Object.hasOwn(PARSER_ERROR_ANSWERS, code)) return null;
+  const answer = PARSER_ERROR_ANSWERS[code];
+  if (!answer) return null;
+  const status = (error as { statusCode?: unknown }).statusCode;
+  return typeof status === 'number' ? { ...answer, status } : answer;
+}
+
+/**
  * Translates thrown errors into the v1 error envelope `{ error: { code, message } }`.
  * Typed `ApiError`s carry their own status/code; Fastify/Zod validation failures
  * become 400 BAD_REQUEST; anything else is a 500 with a generic message (no leak).
@@ -41,6 +72,12 @@ async function errorHandlerInner(app: FastifyInstance): Promise<void> {
     if (isValidationError(error)) {
       request.log.warn({ err: error }, 'validation error');
       return reply.status(400).send(errorBody('BAD_REQUEST', error.message));
+    }
+
+    const parserAnswer = parserErrorAnswer(error);
+    if (parserAnswer) {
+      request.log.warn({ code: parserAnswer.code }, 'request body could not be parsed');
+      return reply.status(parserAnswer.status).send(errorBody(parserAnswer.code, parserAnswer.message));
     }
 
     // Rate-limit rejections arrive as a plain error carrying statusCode 429 (the limiter

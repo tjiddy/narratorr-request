@@ -15,21 +15,39 @@ import {
 import type { TestConnectorResult } from '../../shared/schemas/connectors.js';
 import { requireAdmin } from '../plugins/auth.js';
 import { NarratorrClient, NarratorrError } from '../services/narratorr-client.js';
+import { buildNarratorrClients } from '../services/narratorr-clients.js';
 import { Mutex } from '../util/mutex.js';
 import {
   buildNotifier,
   buildNotifierChannel,
   render,
   redact,
+  describeSendFailure,
   type NotificationEvent,
   type NotificationPayload,
   type SendContext,
 } from '../services/notifications/index.js';
 import { NOTIFIER_REGISTRY, type NotifierType } from '../../shared/notifier-registry.js';
 
+/**
+ * Deliberately NOT the notifier's `'The destination did not respond in time.'` (#207): the two
+ * sentences name different subjects, so they stay separate strings rather than a shared constant.
+ */
+const NARRATORR_TIMEOUT_COPY = 'Narratorr did not respond in time.';
+
 function describeNarratorrError(err: unknown): string {
   if (err instanceof NarratorrError) {
-    if (err.upstreamStatus === 0) return 'Could not reach narratorr — check the URL.';
+    // The FIRST code-keyed branch here, so the status guard is load-bearing, not decoration:
+    // `errorEnvelopeSchema.error.code` is an unrestricted string that `classifyErrorBody` passes
+    // through with the REAL HTTP status, so a hostile narratorr can answer 401 with
+    // `{"error":{"code":"TIMEOUT"}}`. Only a STATUS-ZERO code is locally authored by our own
+    // client (#213) — the same provenance rule `mapUpstreamFailure` applies to NOT_CONFIGURED.
+    // Ordered ahead of the generic status-0 branch below, which would otherwise swallow it.
+    if (err.upstreamStatus === 0 && err.upstreamCode === 'TIMEOUT') return NARRATORR_TIMEOUT_COPY;
+    // Same admin-facing gap as the notifier Test (#207): NarratorrClient folds a `redirect:
+    // 'error'` rejection (#171) into this same status-0 NETWORK branch, so an `http://` base
+    // behind a proxy that 301s lands here indistinguishable from a dead host. Name both.
+    if (err.upstreamStatus === 0) return 'Could not reach narratorr — check the URL, including whether it redirects.';
     if (err.upstreamStatus === 401 || err.upstreamStatus === 403) return 'Authentication failed — check the API key.';
     return `narratorr responded ${err.upstreamStatus}.`;
   }
@@ -73,8 +91,9 @@ function testContext(event: NotificationEvent, publicUrl: string | null): SendCo
 
 /**
  * The resolved (plaintext) secret values in a candidate notifier config — passed to
- * redact() so a Test error embedding a token/key/capability-URL never reaches the admin
- * raw. Walks the registry's secret metadata, so it covers every type without a per-type branch.
+ * describeSendFailure() (and through it to redact()) so a Test error embedding a
+ * token/key/capability-URL never reaches the admin raw on the fallback path. Walks the
+ * registry's secret metadata, so it covers every type without a per-type branch.
  */
 function candidateSecrets(candidate: { type: NotifierType; config: Record<string, unknown> }): string[] {
   return NOTIFIER_REGISTRY[candidate.type].secretFields
@@ -95,12 +114,34 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: AppDeps): voi
   // DB-level locking instead — see Mutex.)
   const writeLock = new Mutex();
 
-  // Rebuild the live narratorr client + notifier from the freshly-saved DB settings, and
+  // Rebuild the live narratorr connection + notifier from the freshly-saved DB settings, and
   // refresh the request-quota policy so an edited default limit/window takes effect on the
   // next request (no restart). Notifier-only saves re-apply the same quota — a cheap no-op read.
-  async function reconfigure(): Promise<void> {
-    const ncfg = await deps.connectorSettings.getNarratorrConfig();
-    deps.narratorr.set(ncfg ? new NarratorrClient({ baseUrl: ncfg.url, apiKey: ncfg.apiKey }) : null);
+  //
+  // `narratorrChanged` (issues #144/#145) gates the CONNECTION SWAP, which is also what retires
+  // the cached companion-ebook capability (the holder's generation is the resolver's cache key,
+  // so the swap IS the invalidation — there is no separate call to forget). Three things about
+  // that statement are load-bearing:
+  //   • It is ONE synchronous step: both inner clients and the generation move together, with no
+  //     `await` in between. `/api/features` reads deliberately do NOT take `writeLock` (a
+  //     capability read must not block on a settings save), so anything less would leave a real
+  //     window in which a concurrent read sees the NEW connection paired with the OLD
+  //     generation's cache entry. Run-to-completion closes that window by construction — it is
+  //     what substitutes for a shared lock here.
+  //   • It runs BEFORE the fallible tail. If either later read rejects, the PUT 500s — but the DB
+  //     update has already committed, so a swap placed after the tail would be skipped and strand
+  //     the saved connection behind the previous one's clients and cache.
+  //   • It is CONDITIONAL. A save that cannot change the connection must not rebuild it:
+  //     re-installing an identical client would bump the generation and discard a valid
+  //     capability result and its 15-minute stale budget on every notifier save, quota edit,
+  //     public-URL edit, Kindle-sender selection and ebook-toggle save.
+  async function reconfigure(narratorrChanged = false): Promise<void> {
+    if (narratorrChanged) {
+      // ONE config read feeds BOTH clients through the shared factory, so the JSON and stream
+      // halves can never end up built from different credentials.
+      const ncfg = await deps.connectorSettings.getNarratorrConfig();
+      deps.narratorr.set(ncfg ? buildNarratorrClients({ baseUrl: ncfg.url, apiKey: ncfg.apiKey }) : null);
+    }
     deps.notifier = buildNotifier(await deps.connectorSettings.getNotificationsConfig(), app.log);
     deps.requests.reconfigureQuota(await deps.connectorSettings.getDefaultQuota());
   }
@@ -121,7 +162,11 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: AppDeps): voi
       requireAdmin(request);
       return writeLock.run(async () => {
         await deps.connectorSettings.update(request.body);
-        await reconfigure();
+        // `body.narratorr !== undefined` is exhaustive: it is the only input that can change the
+        // stored connection (`ConnectorSettingsService.update()` assigns `next.narratorr` solely
+        // under that condition). Re-saving the card with unchanged values does swap — one
+        // redundant probe, accepted over a before/after config comparison.
+        await reconfigure(request.body.narratorr !== undefined);
         return deps.connectorSettings.getDto();
       });
     },
@@ -193,7 +238,7 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: AppDeps): voi
         // DB state, so building it here (still inside the try) needs no lock.
         candidate = await writeLock.run(() => deps.connectorSettings.buildCandidateNotifier(body));
         channel = buildNotifierChannel(candidate.type, candidate.config);
-      } catch (err) {
+      } catch (err: unknown) {
         // A bad candidate (e.g. a required secret that won't resolve) is a failed test. No
         // resolved candidate config to enumerate here → pattern-based redaction only.
         return { success: false, message: redact(err) };
@@ -202,10 +247,13 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: AppDeps): voi
       try {
         await channel.send(testContext(body.event, body.publicUrl ?? null));
         return { success: true, message: 'Test notification sent.' };
-      } catch (err) {
-        // redact() before returning: a fetch/network error can embed the capability webhook
-        // URL or a token — scrub both the resolved candidate secrets and URL-path secrets.
-        return { success: false, message: redact(err, candidateSecrets(candidate)) };
+      } catch (err: unknown) {
+        // The network class (a fetch rejection / a fired timeout) maps to static, actionable
+        // copy — the raw runtime text says `fetch failed` for a dead host, a bad DNS name, a
+        // TLS failure AND a destination that answers a redirect alike (#207). Everything else
+        // still goes through redact(), which scrubs the resolved candidate secrets by value and
+        // URL-embedded secrets (capability webhooks, the Telegram token) by pattern.
+        return { success: false, message: describeSendFailure(err, candidateSecrets(candidate)) };
       }
     },
   );
@@ -225,7 +273,7 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: AppDeps): voi
       try {
         await new NarratorrClient({ baseUrl: cfg.url, apiKey: cfg.apiKey }).ping();
         return { success: true, message: 'Connected to narratorr.' };
-      } catch (err) {
+      } catch (err: unknown) {
         return { success: false, message: describeNarratorrError(err) };
       }
     },

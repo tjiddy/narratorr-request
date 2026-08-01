@@ -15,6 +15,40 @@ export const USER_STATUSES = ['pending', 'active', 'rejected'] as const;
 export const userStatusSchema = z.enum(USER_STATUSES);
 export type UserStatus = z.infer<typeof userStatusSchema>;
 
+/**
+ * THE approval-queue policy — the single home of "does this account count as approved?".
+ *
+ * Admins are always approved: role is orthogonal to the queue, and an admin must never be able to
+ * lock themselves out of the app that grants approvals. Everyone else needs an explicit `active`.
+ *
+ * Deliberately shared rather than restated per layer. Three call sites must agree or the app
+ * misbehaves in ways every layer's own tests would still call green:
+ *   • `requireActiveUser` (`server/plugins/auth.ts`) — the AUTHORIZATION boundary; the only one
+ *     that actually enforces anything.
+ *   • `App.tsx` — which shell an authenticated caller sees (app vs. the pending/rejected screen).
+ *   • `featuresQueryEnabled` (`client/features.ts`) — whether to issue an active-user-only request.
+ * If the client half drifted permissive the SPA would fire requests the server 403s; if it drifted
+ * restrictive it would suppress requests a valid account is entitled to make. `auth.route.test.ts`
+ * pins the server boundary against this predicate over the full role × status matrix, so a change
+ * here that the guard doesn't follow fails loudly.
+ */
+export const isApprovedUser = (user: { role: Role; status: UserStatus }): boolean =>
+  user.role === 'admin' || user.status === 'active';
+
+/** The queue states an unapproved account can be in — `active` is approved by definition. */
+export type UnapprovedStatus = Exclude<UserStatus, 'active'>;
+
+/**
+ * The same decision as {@link isApprovedUser}, but carrying WHICH unapproved state the account is
+ * in — `null` when it is approved. Lets a caller that must render a per-state screen (`App.tsx`)
+ * branch off the shared policy instead of restating it, and keeps the resulting status typed
+ * without a cast. The leading `active` test is what narrows the return type; it is not a second
+ * policy decision (an `active` account is always approved, so that arm is unreachable for a
+ * non-admin and already covered by `isApprovedUser` for an admin).
+ */
+export const unapprovedStatus = (user: { role: Role; status: UserStatus }): UnapprovedStatus | null =>
+  user.status === 'active' || isApprovedUser(user) ? null : user.status;
+
 // Per-user request-quota override as an explicit POLICY MODE (discriminated union), NOT an
 // overloaded `number | null`. The four modes are first-class admin intentions:
 //   • inherit   — no override; fall back to the app default.
@@ -106,6 +140,32 @@ export function hasDeliverableContact(email: string | null | undefined): boolean
   return normalizeContactEmail(email) !== null;
 }
 
+// --- Send-to-Kindle device address (issue #142) -------------------------------
+// The user's own Kindle device address, the destination Send-to-Kindle delivers an ebook to. A
+// STRICTER SUBTYPE of `contactEmailSchema`, not a parallel construction: it DERIVES from it, so the
+// common mailbox contract (trim + lowercase + structural validity + the 254 bound) has exactly one
+// home and can't drift between the contact and Kindle paths. The only addition is the domain.
+//
+// Amazon issues these on `@kindle.com` only. The check is an EXACT-LABEL comparison against the
+// substring after the FINAL `@` — never `.endsWith('kindle.com')` (which accepts `a@evilkindle.com`)
+// and never `.includes(...)` (which additionally accepts `a@kindle.com.evil.io`). It is attached with
+// `.refine()`, i.e. AFTER the trim/lowercase pipe, so `USER@KINDLE.COM` normalizes first and passes —
+// a constraint on the raw input would reject it.
+//
+// Amazon also issues `@free.kindle.com` (Wi-Fi-only free delivery); those are deliberately rejected
+// here. Widening the accepted domain set is a product decision, not an implementation detail.
+export const KINDLE_EMAIL_DOMAIN = 'kindle.com';
+
+/** The domain label of an already-normalized address: everything after the FINAL `@`. */
+function emailDomain(normalized: string): string {
+  return normalized.slice(normalized.lastIndexOf('@') + 1);
+}
+
+export const kindleEmailSchema = contactEmailSchema.refine(
+  (value) => emailDomain(value) === KINDLE_EMAIL_DOMAIN,
+  { message: `enter your Kindle address (ends in @${KINDLE_EMAIL_DOMAIN})` },
+);
+
 // Shape returned to the client for a user.
 export const userDtoSchema = z.object({
   publicId: z.string(),
@@ -154,6 +214,11 @@ export const meDtoSchema = userDtoSchema.extend({
   // source. Drives the opt-in control's enabled state and the one-time discoverability nudge;
   // opt-in STORAGE is permissive (may outlive a contact), but DELIVERY + the UI gate on this.
   emailNotifyAvailable: z.boolean(),
+  // The caller's own Send-to-Kindle device address, or null when never set (issue #142). SELF-SCOPED
+  // ONLY — deliberately on `MeDto` and NOT on the admin `userDtoSchema`: it's the caller's own PII and
+  // no admin surface ever exposes (or edits) another user's Kindle address. Populated in `buildMeDto`,
+  // never in `UserService.toDto` (the admin mapper).
+  kindleEmail: z.string().nullable(),
 });
 export type MeDto = z.infer<typeof meDtoSchema>;
 
@@ -168,12 +233,17 @@ export type MeDto = z.infer<typeof meDtoSchema>;
 //     lowercased + validated by the shared `contactEmailSchema` (#120), so an invalid /
 //     whitespace-only / over-254 value is a 400. Because `contactEmailSchema` rejects the empty
 //     string, `email: ""` is a 400 (NOT a clear) — clearing is `email: null` only.
+//   • `kindleEmail` — the caller's own Send-to-Kindle device address (#142). Same set/clear/omit
+//     semantics as `email` (omitted = no change, `null` clears, `""` is a 400), validated by
+//     `kindleEmailSchema` so only an exact `@kindle.com` mailbox is storable.
+// The three fields are MUTUALLY INDEPENDENT: any subset applies without touching the others.
 // Strict so a stray key (e.g. an attempt to smuggle `role`) is refused — this endpoint can never
-// mutate anything but the caller's own opt-in set and contact email.
+// mutate anything but the caller's own opt-in set, contact email, and Kindle address.
 export const updateMeBodySchema = z
   .object({
     notifyOn: z.array(notifiableTransitionSchema).optional(),
     email: contactEmailSchema.nullable().optional(),
+    kindleEmail: kindleEmailSchema.nullable().optional(),
   })
   .strict();
 export type UpdateMeBody = z.infer<typeof updateMeBodySchema>;

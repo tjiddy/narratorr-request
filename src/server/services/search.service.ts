@@ -1,5 +1,5 @@
 import type { V1AudibleResult } from '../../shared/schemas/v1/metadata.js';
-import type { INarratorrClient } from './narratorr-client.js';
+import type { IMetadataSearchClient } from './narratorr-client.js';
 import { tooManyRequests } from '../util/errors.js';
 
 export interface SearchServiceOptions {
@@ -37,6 +37,9 @@ interface RateState {
  * downstream (narratorr is idempotent by ASIN, we dedupe per-(user,asin)). The real fix
  * (separate the static-metadata cache from the live library annotation) is deferred until
  * the field is live and we can measure actual staleness — not built speculatively here.
+ * The nested `library.companionEbook` (narratorr #1961) rides along in that same snapshot,
+ * so a book that gains a companion ebook can likewise read stale for up to cacheTtlMs —
+ * same bound, same deferral, no behavior change here.
  */
 export class SearchService {
   private readonly cache = new Map<string, CacheEntry>();
@@ -47,7 +50,7 @@ export class SearchService {
   private readonly maxCacheEntries: number;
 
   constructor(
-    private readonly client: INarratorrClient,
+    private readonly client: IMetadataSearchClient,
     opts: SearchServiceOptions = {},
   ) {
     this.cacheTtlMs = opts.cacheTtlMs ?? 60_000;

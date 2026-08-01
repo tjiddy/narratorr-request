@@ -23,13 +23,14 @@ afterEach(async () => {
 
 // The full CSP helmet emits today, as a golden string — INCLUDING the default-merged
 // `form-action 'self'`, `script-src-attr 'none'`, and `upgrade-insecure-requests` in helmet's
-// exact append order. Pinned so any future helmet merge drift (reorder / new default) fails loudly
-// instead of silently changing the security posture of the prod-behind-TLS deploy.
+// exact emission order (since @fastify/helmet 13.1: `default-src` first, the rest alphabetical).
+// Pinned so any future helmet merge drift (reorder / new default) fails loudly instead of
+// silently changing the security posture of the prod-behind-TLS deploy.
 const CSP_BEHIND_TLS =
-  "default-src 'self';base-uri 'self';object-src 'none';frame-ancestors 'none';" +
-  "img-src 'self' https: data:;script-src 'self';" +
+  "default-src 'self';base-uri 'self';font-src 'self' https://fonts.gstatic.com;" +
+  "form-action 'self';frame-ancestors 'none';img-src 'self' https: data:;object-src 'none';" +
+  "script-src 'self';script-src-attr 'none';" +
   "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;" +
-  "font-src 'self' https://fonts.gstatic.com;form-action 'self';script-src-attr 'none';" +
   'upgrade-insecure-requests';
 
 describe('buildHelmetOptions — behindTls header emission', () => {

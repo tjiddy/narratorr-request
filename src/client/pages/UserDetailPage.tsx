@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { Link, useParams } from 'react-router';
 import type { UserDto } from '@shared/schemas/user';
 import { DEFAULT_LIMIT } from '@shared/schemas/v1/common';
 import { useMe, useUsers, useUpdateUser, useUserRequests } from '../hooks';

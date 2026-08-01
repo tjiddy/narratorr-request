@@ -86,18 +86,42 @@ apply on boot and are **forward-only**. Note: libSQL `:memory:` breaks across `d
 
 ## Testing
 
-Vitest, node environment; co-located `*.test.ts` next to source. All new/changed code needs
-tests. The narratorr integration is exercised via the MSW fixture (`src/server/mocks/`).
+Vitest, two projects (`test.projects` in `vitest.config.ts`), co-located next to source. All
+new/changed code needs tests. The narratorr integration is exercised via the MSW fixture
+(`src/server/mocks/`).
+
+| Project | Glob | Environment |
+|---|---|---|
+| `node` | `src/{server,shared,db,client}/**/*.test.ts` | node |
+| `client` | `src/client/**/*.test.tsx` | jsdom + React Testing Library |
+
+`pnpm test` runs both; `pnpm test --project=node` / `--project=client` runs one. The jsdom project
+loads `src/client/test/setup.ts`, which registers the `@testing-library/jest-dom` matchers and an
+explicit `afterEach(cleanup)` (this repo keeps `globals` off, so RTL's auto-cleanup doesn't
+register itself — don't turn `globals` on to work around that). Start from the exemplar,
+`src/client/components/EmptyState.test.tsx`.
 
 Test-quality bar: assert **arguments**, not just invocation (`toHaveBeenCalledWith`); cover every
 branch and error path; isolate ambient inputs (fixed clock / stubbed env / MSW — no live
 `Date.now()` or network); and don't write vacuous tests (one that passes before the production
 code exists is a bug, not coverage).
 
-> **Client tests are pure-logic only** (node env, no DOM) for now — React component/interaction
-> tests aren't set up yet. That's tracked in
-> [#7](https://github.com/tjiddy/narratorr-requests/issues/7) and is a good first contribution.
-> For now, test extractable hook/transform logic, not rendering.
+> **Extract pure logic first.** jsdom exists for **DOM-only** behavior — conditional rendering,
+> focus/keyboard handling, multi-step side-effect orchestration. Payload/parse/decision logic
+> (mutation bodies, parse-and-guard, sort/format, conditional defaults) still belongs in extracted
+> pure helpers with a co-located `.test.ts`, not asserted through a render. Reach for a `.test.tsx`
+> when there is no pure seam to extract.
+
+Cross-app behavior (real sockets, real SMTP) lives in `src/server/integration/`, composed by
+`src/server/test-support/integration-harness.ts` against a real fake narratorr and a real fake SMTP
+server. **MSW is never registered there** — it honors an abort only while a resolver is pending and
+re-buffers passthrough bodies, so truncation/backpressure assertions would be vacuous under it.
+
+## Release verification
+
+Some things no fake can stand in for — a real Amazon allowlist, a real relay, a real browser
+download. Before tagging a release that touches companion ebooks, walk the manual two-app checklist
+in [docs/companion-ebook-smoke.md](docs/companion-ebook-smoke.md) against a real narratorr.
 
 ## Security
 

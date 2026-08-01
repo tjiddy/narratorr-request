@@ -1,7 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import {
   connectorSettingsDtoSchema,
+  isKnownNotifierDto,
   notifierDtoSchema,
+  resolvedKindleSenderSchema,
+  storedConnectorsSchema,
+  storedKindleSenderSchema,
   storedNotifierSchema,
   testConnectorBodySchema,
   testConnectorResultSchema,
@@ -181,6 +185,97 @@ describe('createNotifierBodySchema / notifierTestBodySchema', () => {
   });
 });
 
+describe('storedConnectorsSchema — kindleSender containment (#143)', () => {
+  const blob = (over: Record<string, unknown> = {}) => ({
+    publicUrl: null,
+    narratorr: { url: 'https://n:3000', apiKey: 'enc:v1:abc' },
+    notifiers: [{ id: 'nf_1', name: 'Phone', type: 'ntfy', events: ['request.created'], config: { topic: 't' } }],
+    ...over,
+  });
+
+  it('parses a PRE-FEATURE blob (no kindleSender key) with the siblings intact', () => {
+    const parsed = storedConnectorsSchema.parse(blob());
+    expect(parsed.narratorr).toEqual({ url: 'https://n:3000', apiKey: 'enc:v1:abc' });
+    expect(parsed.notifiers).toHaveLength(1);
+    expect(parsed.kindleSender ?? null).toBeNull();
+  });
+
+  it('round-trips a healthy selection', () => {
+    expect(storedConnectorsSchema.parse(blob({ kindleSender: { notifierId: 'nf_1', confirmedFrom: 'Bot@Ex.com' } })).kindleSender)
+      .toEqual({ notifierId: 'nf_1', confirmedFrom: 'Bot@Ex.com' });
+  });
+
+  // The member carries its own `.catch(null)` so a malformed value degrades ROW-LOCALLY. Without
+  // it the whole envelope fails, and `connectorsFrom()` resets the blob to EMPTY — discarding the
+  // encrypted narratorr key. Assert the SIBLINGS survive, not just that the member is null.
+  it.each([
+    ['a non-object', 42],
+    ['a wrong-typed member', { notifierId: 42 }],
+    ['a missing member', {}],
+  ])('contains %s to null while narratorr + notifiers survive', (_label, kindleSender) => {
+    const parsed = storedConnectorsSchema.safeParse(blob({ kindleSender }));
+    expect(parsed.success).toBe(true);
+    expect(parsed.data?.kindleSender ?? null).toBeNull();
+    expect(parsed.data?.narratorr).toEqual({ url: 'https://n:3000', apiKey: 'enc:v1:abc' });
+    expect(parsed.data?.notifiers).toHaveLength(1);
+  });
+
+  it('accepts an explicit null (a cleared selection)', () => {
+    expect(storedConnectorsSchema.parse(blob({ kindleSender: null })).kindleSender).toBeNull();
+  });
+
+  // Both boundaries DERIVE from `storedKindleSenderSchema`, so a constraint tightened there must
+  // reach storage and the wire together. Restating the pair in the resolved schema is the drift
+  // shape this pins: with two hand-copied field lists, a value can be valid at one layer and
+  // rejected (or silently stripped) at the other.
+  it('the stored member and the resolved DTO share ONE pair contract', () => {
+    const pairKeys = Object.keys(storedKindleSenderSchema.shape).sort();
+    expect(pairKeys).toEqual(['confirmedFrom', 'notifierId']);
+    // The resolved schema is the pair PLUS the read-time fields — nothing dropped, nothing renamed.
+    expect(Object.keys(resolvedKindleSenderSchema.shape).sort()).toEqual(
+      [...pairKeys, 'currentFrom', 'status'].sort(),
+    );
+    // …and the shared members are the very same schema objects, not look-alike copies.
+    expect(resolvedKindleSenderSchema.shape.notifierId).toBe(storedKindleSenderSchema.shape.notifierId);
+    expect(resolvedKindleSenderSchema.shape.confirmedFrom).toBe(storedKindleSenderSchema.shape.confirmedFrom);
+  });
+});
+
+describe('updateConnectorSettingsBodySchema — kindleSender (#143)', () => {
+  it('accepts an id-only selection, an explicit null, and omission', () => {
+    expect(parse({ kindleSender: { notifierId: 'nf_1' } }).kindleSender).toEqual({ notifierId: 'nf_1' });
+    expect(parse({ kindleSender: null }).kindleSender).toBeNull();
+    expect(parse({}).kindleSender).toBeUndefined();
+  });
+
+  // The inner object is `.strict()` so a client can never SUPPLY the confirmation — the server
+  // always derives it from the notifier's live `from`, which is what makes it unspoofable.
+  it('rejects a client-supplied confirmedFrom (or any other extra inner key)', () => {
+    expect(accepts({ kindleSender: { notifierId: 'nf_1', confirmedFrom: 'x@y.com' } })).toBe(false);
+    expect(accepts({ kindleSender: { notifierId: 'nf_1', bogus: 1 } })).toBe(false);
+  });
+
+  it('rejects an empty notifierId and a non-object selection', () => {
+    expect(accepts({ kindleSender: { notifierId: '' } })).toBe(false);
+    expect(accepts({ kindleSender: 'nf_1' })).toBe(false);
+  });
+});
+
+describe('updateConnectorSettingsBodySchema — ebooksEnabled (#144)', () => {
+  it('accepts true, false, and omission (omit-to-keep); there is no null clear', () => {
+    expect(parse({ ebooksEnabled: true }).ebooksEnabled).toBe(true);
+    // The load-bearing half: an explicit `false` must survive as `false`, distinguishable from
+    // the omitted case below. A write path branching on truthiness would collapse the two.
+    expect(parse({ ebooksEnabled: false }).ebooksEnabled).toBe(false);
+    expect(parse({}).ebooksEnabled).toBeUndefined();
+    expect(accepts({ ebooksEnabled: null })).toBe(false);
+  });
+
+  it('rejects a non-boolean (no string/number coercion)', () => {
+    for (const bad of ['true', 'false', 1, 0, {}]) expect(accepts({ ebooksEnabled: bad })).toBe(false);
+  });
+});
+
 describe('storedNotifierSchema — type-lenient persistence boundary', () => {
   it('parses a row whose type is NOT in the registry (round-trips, type: string)', () => {
     const row = { id: 'nf_x', name: 'Legacy', type: 'apprise', events: ['user.pending'], config: { token: 'enc:v1:abc' } };
@@ -213,6 +308,24 @@ describe('notifierDtoSchema — discriminated known | unknown', () => {
   });
 });
 
+describe('isKnownNotifierDto — the one owner of the DTO known/degraded decision', () => {
+  const known = { id: 'nf_1', name: 'Mail', type: 'email' as const, events: [], config: { from: 'a@ex.com' } };
+  const degraded = { id: 'nf_2', name: 'Broken', type: 'email', events: [], unknown: true as const };
+
+  it('accepts a known row and rejects a degraded one', () => {
+    expect(isKnownNotifierDto(known)).toBe(true);
+    expect(isKnownNotifierDto(degraded)).toBe(false);
+  });
+
+  // The whole point of one owner: the notifier list's affordances and the Kindle picker's
+  // eligibility must agree about the SAME row. A degraded row carries a known-looking raw
+  // `type`, so a type-only check would classify it differently on each surface.
+  it('classifies a degraded row by its `unknown` marker, not its raw type', () => {
+    expect(degraded.type).toBe('email'); // raw type alone would say "known"
+    expect(isKnownNotifierDto(degraded)).toBe(false);
+  });
+});
+
 describe('connectorSettingsDtoSchema', () => {
   it('accepts a representative masked payload with a notifier list', () => {
     const dto = {
@@ -224,20 +337,66 @@ describe('connectorSettingsDtoSchema', () => {
       ],
       defaultQuota: { mode: 'limited', limit: 10, windowDays: 30 },
       requesterEmailWarning: false,
+      kindleSender: null,
+      ebooksEnabled: false,
     };
     expect(connectorSettingsDtoSchema.safeParse(dto).success).toBe(true);
   });
 
   it('accepts empty notifiers + null connections + an unlimited default', () => {
-    expect(
-      connectorSettingsDtoSchema.parse({
-        publicUrl: null,
-        narratorr: null,
-        notifiers: [],
-        defaultQuota: { mode: 'unlimited', windowDays: 30 },
-        requesterEmailWarning: false,
-      }),
-    ).toEqual({ publicUrl: null, narratorr: null, notifiers: [], defaultQuota: { mode: 'unlimited', windowDays: 30 }, requesterEmailWarning: false });
+    const dto = {
+      publicUrl: null,
+      narratorr: null,
+      notifiers: [],
+      defaultQuota: { mode: 'unlimited', windowDays: 30 },
+      requesterEmailWarning: false,
+      kindleSender: null,
+      ebooksEnabled: true,
+    };
+    expect(connectorSettingsDtoSchema.parse(dto)).toEqual(dto);
+  });
+
+  // The response object is non-`.strict()`, so a resolved kindleSender the mapper emits but the
+  // schema omitted would be SILENTLY stripped off the wire. Pin that it survives serialization.
+  it('carries the resolved kindleSender through, and rejects an unknown status', () => {
+    const dto = (kindleSender: unknown) => ({
+      publicUrl: null,
+      narratorr: null,
+      notifiers: [],
+      defaultQuota: { mode: 'unlimited' as const, windowDays: 30 },
+      requesterEmailWarning: false,
+      kindleSender,
+      ebooksEnabled: false,
+    });
+    const resolved = { notifierId: 'nf_1', confirmedFrom: 'Bot@Ex.com', status: 'sender-changed', currentFrom: 'new@ex.com' };
+    expect(connectorSettingsDtoSchema.parse(dto(resolved)).kindleSender).toEqual(resolved);
+    for (const status of ['ok', 'notifier-missing', 'not-email', 'config-unusable', 'from-unparseable', 'sender-changed']) {
+      expect(connectorSettingsDtoSchema.safeParse(dto({ ...resolved, status })).success, status).toBe(true);
+    }
+    expect(connectorSettingsDtoSchema.safeParse(dto({ ...resolved, status: 'bogus' })).success).toBe(false);
+    expect(connectorSettingsDtoSchema.safeParse(dto({ notifierId: 'nf_1', confirmedFrom: 'x@y.com' })).success).toBe(false);
+  });
+
+  // Same non-`.strict()` trap as kindleSender above (issue #144): a field added to the
+  // hand-written `ConnectorSettingsDto` interface but FORGOTTEN in this schema compiles fine and
+  // is then silently stripped off the wire, so the Settings page reads the toggle as absent. This
+  // must be asserted on the PARSED OUTPUT — `safeParse().success` stays true either way.
+  it('retains ebooksEnabled through the response schema (both true and false)', () => {
+    const dto = (ebooksEnabled: unknown) => ({
+      publicUrl: null,
+      narratorr: null,
+      notifiers: [],
+      defaultQuota: { mode: 'unlimited' as const, windowDays: 30 },
+      requesterEmailWarning: false,
+      kindleSender: null,
+      ebooksEnabled,
+    });
+    expect(connectorSettingsDtoSchema.parse(dto(true)).ebooksEnabled).toBe(true);
+    expect(connectorSettingsDtoSchema.parse(dto(false)).ebooksEnabled).toBe(false);
+    // Required, and a boolean — not coerced from a truthy/falsy stand-in.
+    expect(connectorSettingsDtoSchema.safeParse(dto(undefined)).success).toBe(false);
+    expect(connectorSettingsDtoSchema.safeParse(dto('true')).success).toBe(false);
+    expect(connectorSettingsDtoSchema.safeParse(dto(1)).success).toBe(false);
   });
 
   it('requires defaultQuota in the masked DTO', () => {
@@ -251,6 +410,8 @@ describe('connectorSettingsDtoSchema', () => {
       notifiers: [],
       defaultQuota: { mode: 'limited', limit: 10, windowDays },
       requesterEmailWarning: false,
+      kindleSender: null,
+      ebooksEnabled: false,
     });
     for (const allowed of [1, 7, 30]) {
       expect(connectorSettingsDtoSchema.safeParse(dto(allowed)).success).toBe(true);

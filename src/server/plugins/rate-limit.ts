@@ -1,4 +1,5 @@
 import type { FastifyRequest } from 'fastify';
+import { isApprovedUser } from '../../shared/schemas/user.js';
 
 /**
  * Shared @fastify/rate-limit registration options for the auth endpoints. Factored out
@@ -27,4 +28,46 @@ export const authRateLimitOptions = {
         : '';
     return `${req.ip}|${email}`;
   },
+};
+
+/** Per-user companion-EPUB download cap. Frozen constants (issue #146 AC29). */
+export const EBOOK_DOWNLOAD_MAX = 10;
+export const EBOOK_DOWNLOAD_WINDOW = '1 minute';
+
+/**
+ * The key the anonymous/unapproved bucket would use. Unreachable in practice —
+ * {@link ebookDownloadAllowList} exempts every caller without a `request.user` — but the plugin
+ * computes the key BEFORE evaluating the allowList, so the generator must be total.
+ */
+export const EBOOK_DOWNLOAD_PLACEHOLDER_KEY = 'unauthenticated';
+
+/**
+ * Key the download cap on the USER, not the IP: a household behind one NAT address must not share
+ * a bucket, and one member's burst must not throttle another's. `request.user` is attached by
+ * `authPlugin`'s `onRequest` hook, which runs before the limiter's `preHandler`.
+ */
+export const ebookDownloadKeyGenerator = (req: FastifyRequest): string =>
+  req.user?.publicId ?? EBOOK_DOWNLOAD_PLACEHOLDER_KEY;
+
+/**
+ * Guard precedence over throttling (issue #146 AC37). The limiter runs on `preHandler`, i.e.
+ * BEFORE the handler's lexical `requireActiveUser`, so it must never be the thing that answers a
+ * caller the guard would refuse — an anonymous, pending or rejected caller must get its
+ * deterministic 401/403 no matter how many requests preceded it.
+ *
+ * Exempting them is safe precisely because they cost nothing: the guard refuses them with zero
+ * upstream traffic and zero DB writes. There is deliberately no IP fallback bucket.
+ *
+ * The predicate is the SHARED `isApprovedUser` — the same one `requireActiveUser` enforces with —
+ * so the exemption and the refusal cannot drift apart.
+ */
+export const ebookDownloadAllowList = (req: FastifyRequest): boolean =>
+  !req.user || !isApprovedUser(req.user);
+
+/** The per-route `config.rateLimit` value for the companion-EPUB download proxy. */
+export const ebookDownloadRateLimitOptions = {
+  max: EBOOK_DOWNLOAD_MAX,
+  timeWindow: EBOOK_DOWNLOAD_WINDOW,
+  keyGenerator: ebookDownloadKeyGenerator,
+  allowList: ebookDownloadAllowList,
 };

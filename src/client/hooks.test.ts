@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { RequestDto } from '@shared/schemas/request';
 import type { UserDto, MeDto } from '@shared/schemas/user';
-import type { ConnectorSettingsDto, TestConnectorResult } from '@shared/schemas/connectors';
+import type { ConnectorSettingsDto, TestConnectorResult, UpdateConnectorSettingsBody } from '@shared/schemas/connectors';
 // Type-only namespace imports (erased at runtime, so they don't fight the mocks below) —
 // give importActual its return type without an inline `import()` annotation.
 import type * as ApiModule from './api';
@@ -13,7 +13,9 @@ import type * as ReactModule from 'react';
 // directly) and `useQueryClient` returns a fake client of spies. `sonner`'s toast
 // is spied so we can assert the surfaced text.
 const hoisted = vi.hoisted(() => ({
-  qc: { invalidateQueries: vi.fn(), setQueryData: vi.fn() },
+  // `cancelQueries` belongs here because `reconcileMeWrite` cancels an in-flight read before
+  // invalidating (#201 F2) — a client without it throws straight out of `onSettled`.
+  qc: { invalidateQueries: vi.fn(), setQueryData: vi.fn(), cancelQueries: vi.fn() },
   // Spies for the local-auth boundary functions and the three request-list wrappers
   // (so a paged hook's queryFn can be driven and its args asserted); the rest of `./api`
   // is preserved (importActual) so `ApiError` and unrelated exports stay real.
@@ -24,6 +26,17 @@ const hoisted = vi.hoisted(() => ({
     listAdminQueue: vi.fn(),
     listUserRequests: vi.fn(),
     updateMe: vi.fn(),
+    updateConnectorSettings: vi.fn(),
+    getFeatures: vi.fn(),
+    sendEbookToKindle: vi.fn(),
+    requestBookFrom: vi.fn(),
+    decideRequest: vi.fn(),
+    updateUser: vi.fn(),
+    testConnector: vi.fn(),
+    createNotifier: vi.fn(),
+    updateNotifier: vi.fn(),
+    deleteNotifier: vi.fn(),
+    testNotifier: vi.fn(),
   },
   // A module-scoped slot backing the test-only `react` useState mock so a re-invoked
   // `useTheme()` observes the value a prior `toggleTheme()` wrote.
@@ -52,6 +65,17 @@ vi.mock('./api', async (importActual) => {
     listAdminQueue: hoisted.api.listAdminQueue,
     listUserRequests: hoisted.api.listUserRequests,
     updateMe: hoisted.api.updateMe,
+    updateConnectorSettings: hoisted.api.updateConnectorSettings,
+    getFeatures: hoisted.api.getFeatures,
+    sendEbookToKindle: hoisted.api.sendEbookToKindle,
+    requestBookFrom: hoisted.api.requestBookFrom,
+    decideRequest: hoisted.api.decideRequest,
+    updateUser: hoisted.api.updateUser,
+    testConnector: hoisted.api.testConnector,
+    createNotifier: hoisted.api.createNotifier,
+    updateNotifier: hoisted.api.updateNotifier,
+    deleteNotifier: hoisted.api.deleteNotifier,
+    testNotifier: hoisted.api.testNotifier,
   };
 });
 
@@ -89,6 +113,7 @@ import {
   useUpdateMe,
   useDecide,
   useUpdateConnectors,
+  useUpdateKindleSender,
   useTestConnector,
   useCreateNotifier,
   useUpdateNotifier,
@@ -101,12 +126,16 @@ import {
   useUserRequests,
   useUsers,
   useConnectorSettings,
+  useUpdateEbooksEnabled,
+  useFeatures,
+  useSendToKindle,
   useSystemInfo,
   useAuthProviders,
   useLocalAuth,
   useTheme,
 } from './hooks';
 import { ApiError } from './api';
+
 
 const success = vi.mocked(toast.success);
 const error = vi.mocked(toast.error);
@@ -116,8 +145,18 @@ const error = vi.mocked(toast.error);
 interface Callbacks {
   onSuccess: (...args: any[]) => unknown;
   onError: (...args: any[]) => unknown;
+  /** Cache reconciliation lives here, not on onSuccess — a settings write can commit and 500. */
+  onSettled: (...args: any[]) => unknown;
 }
 const cb = (hook: unknown): Callbacks => hook as Callbacks;
+
+/**
+ * Flush pending microtasks. `reconcileMeWrite` AWAITS a `cancelQueries` before invalidating (#201
+ * F2), so a `qk.me` settlement's invalidation lands a tick after `onSettled` returns — asserting it
+ * synchronously reads zero calls. Only the two hooks routed through that helper need this; the
+ * request/decide/user settlements still invalidate synchronously.
+ */
+const settled = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 // `useMutation` returns the raw options; for the auth hook we drive its mutationFn.
 interface MutationOptions {
@@ -125,6 +164,11 @@ interface MutationOptions {
   onSuccess: () => unknown;
 }
 const mut = (hook: unknown): MutationOptions => hook as MutationOptions;
+
+// A hook's `mutationFn` typed to its own body — lets a test drive the real API call the
+// mutation makes (not just its settled callbacks) and assert the exact payload it sends.
+const mutFn = <TBody>(hook: unknown): ((body: TBody) => Promise<unknown>) =>
+  (hook as { mutationFn: (body: TBody) => Promise<unknown> }).mutationFn;
 
 // `useQuery` now returns the raw options too — read the derived enabled/queryKey plus the
 // paging wiring (queryFn / refetchInterval / placeholderData) the paged hooks set.
@@ -142,8 +186,30 @@ const query = (hook: unknown): QueryOptions => hook as QueryOptions;
 type PlaceholderFn = (prev: unknown, prevQuery?: { queryKey: readonly unknown[] }) => unknown;
 const placeholder = (q: QueryOptions): PlaceholderFn => q.placeholderData as PlaceholderFn;
 
-// Minimal cast helpers — the callbacks only read the few fields we set.
-const req = (over: Partial<RequestDto>): RequestDto => ({ title: 'Dune', status: 'pending', ...over } as RequestDto);
+// A COMPLETE RequestDto, deliberately un-cast: the callbacks under test only read `title` and
+// `status`, but building the whole shape is what makes a newly-required response field (e.g.
+// `companionEbook`, issue #147) a compile error HERE rather than something a `as RequestDto`
+// silently absorbs.
+const req = (over: Partial<RequestDto> = {}): RequestDto => ({
+  publicId: 'rq_1',
+  asin: 'B01',
+  title: 'Dune',
+  author: null,
+  narrator: null,
+  coverUrl: null,
+  status: 'pending',
+  note: null,
+  failureReason: null,
+  requestedAt: '2026-07-01T00:00:00.000Z',
+  decidedAt: null,
+  narratorrBookId: null,
+  companionEbook: null,
+  requester: { publicId: 'us_1', username: 'ann' },
+  ...over,
+});
+// Still a cast: MeDto's unread half is large and not what any receipt here turns on.
+const meDto = (over: Partial<MeDto>): MeDto =>
+  ({ publicId: 'us_1', username: 'ann', role: 'user', status: 'active', ...over }) as MeDto;
 
 beforeEach(() => vi.clearAllMocks());
 afterEach(() => {
@@ -176,6 +242,7 @@ describe('qk query-key builders', () => {
     expect(qk.users).toEqual(['admin', 'users']);
     expect(qk.connectors).toEqual(['admin', 'settings', 'connectors']);
     expect(qk.system).toEqual(['admin', 'system']);
+    expect(qk.features).toEqual(['features']);
     expect(qk.authProviders).toEqual(['auth', 'providers']);
   });
 });
@@ -333,6 +400,28 @@ describe('centralized read-site keys + prefix guards', () => {
     expect(query(useConnectorSettings()).queryKey).toEqual(qk.connectors);
   });
 
+  // AC24/AC25 (#144) — the features query's key, fetcher and the active-only enablement. Without
+  // this the hook could key elsewhere, call the wrong endpoint, or fire on the login /
+  // pending / rejected screens, where `/api/features` only ever 401s or 403s.
+  it('useFeatures keys on qk.features and fetches through getFeatures', async () => {
+    const q = query(useFeatures(meDto({ status: 'active' })));
+    expect(q.queryKey).toEqual(qk.features);
+    expect(q.queryKey).toEqual(['features']);
+    hoisted.api.getFeatures.mockResolvedValue({ ebooksEnabled: true, kindleDeliveryAvailable: false, kindleSenderEmail: null });
+    await q.queryFn();
+    expect(hoisted.api.getFeatures).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['a signed-out caller', undefined, false],
+    ['a pending account', meDto({ status: 'pending' }), false],
+    ['a rejected account', meDto({ status: 'rejected' }), false],
+    ['an active user', meDto({ status: 'active' }), true],
+    ['an admin (never gated by the queue)', meDto({ role: 'admin', status: 'pending' }), true],
+  ] as const)('useFeatures is enabled=%s for %s', (_label, me, expected) => {
+    expect(query(useFeatures(me)).enabled).toBe(expected);
+  });
+
   it('useSystemInfo keys on qk.system', () => {
     expect(query(useSystemInfo()).queryKey).toEqual(qk.system);
   });
@@ -342,20 +431,54 @@ describe('centralized read-site keys + prefix guards', () => {
   });
 });
 
+// SCOPE OF THE INVALIDATION ROWS BELOW (#168): they prove only that each settlement REQUESTS the
+// right keys. That mounted observers then converge on the committed row is a consequence this mocked
+// modality structurally cannot express (no cache, no observer, no refetch — see the file header);
+// that is proven at the API boundary in `hooks.request-error-path.test.tsx`.
 describe('useRequestBook', () => {
-  it('toasts "already available" and invalidates myRequests + me on an available result', () => {
+  // The dispatch row: driving only the settled callbacks would leave `mutationFn` free to drop
+  // or rewrite the search result with every test below still green.
+  it('dispatches requestBookFrom with the untouched search result', async () => {
+    const result = { asin: 'B01', title: 'Dune' } as never;
+    await mutFn(useRequestBook())(result);
+    expect(hoisted.api.requestBookFrom).toHaveBeenCalledTimes(1);
+    expect(hoisted.api.requestBookFrom).toHaveBeenCalledWith(result);
+  });
+
+  it('toasts "already available" on an available result — and the toast alone, no invalidation', () => {
     cb(useRequestBook()).onSuccess(req({ status: 'available', title: 'Dune' }));
     expect(success).toHaveBeenCalledWith('“Dune” is already available!');
-    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.myRequests });
-    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.me });
-    // Keys must equal the qk definitions verbatim (no drift).
-    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['requests', 'mine'] });
-    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['me'] });
+    // Reconciliation moved to onSettled; a leftover copy here would double every invalidation.
+    expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalled();
   });
 
   it('toasts "Requested" for a non-available result', () => {
     cb(useRequestBook()).onSuccess(req({ status: 'pending', title: 'Dune' }));
     expect(success).toHaveBeenCalledWith('Requested “Dune”');
+  });
+
+  // `POST /api/requests` INSERTS the row and only then runs the fallible auto-approve `handoff()`,
+  // which rethrows over a row that is already durable (`failed` terminal, or still `approved` on a
+  // transient upstream failure). So a non-2xx is not evidence that nothing was written.
+  it.each([
+    ['a rejected create (committed, then 502)', undefined, new ApiError(502, 'UPSTREAM', 'narratorr blew up')],
+    ['a successful create', req({ status: 'pending' }), null],
+  ])('invalidates BOTH myRequests and me on %s', (_label, data, err) => {
+    cb(useRequestBook()).onSettled(data, err, {});
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.myRequests });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.me });
+    // Keys must equal the qk definitions verbatim (no drift).
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['requests', 'mine'] });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['me'] });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledTimes(2);
+  });
+
+  // `qk.me` is the load-bearing half: the request lists poll at 4s and self-heal, `useMe` does not
+  // (no refetchInterval, 60s staleTime), and an `approved` row occupies a quota slot — so a
+  // transient handoff failure would leave QuotaMeter under-reporting with nothing to repair it.
+  it('refetches the quota-bearing me key even though the request lists poll', () => {
+    cb(useRequestBook()).onSettled(undefined, new ApiError(502, 'UPSTREAM', 'boom'), {});
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.me });
   });
 
   it('surfaces an ApiError message, else the generic fallback, on error', () => {
@@ -368,15 +491,38 @@ describe('useRequestBook', () => {
 });
 
 describe('useDecide', () => {
-  it('toasts Approved/Denied with curly quotes and invalidates the admin-requests prefix', () => {
+  // The variables object is SPLIT into positional args on the wire — exactly the seam a
+  // callbacks-only test can't see (swapping id/action would keep every row below green).
+  it('dispatches decideRequest with id, action and note split into positional args', async () => {
+    await mutFn(useDecide())({ publicId: 'rq_1', action: 'approve', note: 'ok by me' });
+    expect(hoisted.api.decideRequest).toHaveBeenCalledWith('rq_1', 'approve', 'ok by me');
+
+    await mutFn(useDecide())({ publicId: 'rq_2', action: 'deny' });
+    expect(hoisted.api.decideRequest).toHaveBeenLastCalledWith('rq_2', 'deny', undefined);
+  });
+
+  it('toasts Approved/Denied with curly quotes — and the toast alone, no invalidation', () => {
     const h = cb(useDecide());
     h.onSuccess(req({ title: 'Dune' }), { action: 'approve' });
     expect(success).toHaveBeenCalledWith('Approved “Dune”');
     h.onSuccess(req({ title: 'Dune' }), { action: 'deny' });
     expect(success).toHaveBeenCalledWith('Denied “Dune”');
+    // Reconciliation moved to onSettled (#168); a leftover copy here would double it.
+    expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalled();
+  });
+
+  // `decide()` ATOMICALLY CLAIMS the status and only then emits the decision email and hands off,
+  // either of which can throw over an already-committed decision (and the route can still 404 on a
+  // missing requester row).
+  it.each([
+    ['a rejected decision (claimed, then 502)', undefined, new ApiError(502, 'UPSTREAM', 'handoff failed')],
+    ['a successful decision', req({ status: 'approved' }), null],
+  ])('invalidates the admin-requests prefix on %s', (_label, data, err) => {
+    cb(useDecide()).onSettled(data, err, { action: 'approve' });
     // DRY-1 guard: the invalidation keys on qk.adminRequests, which stays a prefix of
     // both admin-queue key variants so every loaded queue page still refetches.
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.adminRequests });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledTimes(1);
     expect(qk.adminQueue(undefined).slice(0, qk.adminRequests.length)).toEqual(qk.adminRequests);
     expect(qk.adminQueuePaged('pending', 100).slice(0, qk.adminRequests.length)).toEqual(qk.adminRequests);
   });
@@ -393,10 +539,30 @@ describe('useDecide', () => {
 describe('useUpdateUser', () => {
   const user = { username: 'todd' } as UserDto;
 
-  it('toasts the saved username and invalidates admin/users', () => {
+  it('dispatches updateUser with the target id and the exact patch, split positionally', async () => {
+    await mutFn(useUpdateUser())({ publicId: 'us_1', patch: { role: 'admin' } });
+    expect(hoisted.api.updateUser).toHaveBeenCalledTimes(1);
+    expect(hoisted.api.updateUser).toHaveBeenCalledWith('us_1', { role: 'admin' });
+  });
+
+  it('toasts the saved username — and the toast alone, no invalidation', () => {
     cb(useUpdateUser()).onSuccess(user);
     expect(success).toHaveBeenCalledWith('Saved changes to todd');
+    // Reconciliation moved to onSettled (#168); a leftover copy here would double it.
+    expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalled();
+  });
+
+  // The route's UPDATE is atomic, so the commit-then-fail shape here is the generic one: the write
+  // lands and the client still rejects because the RESPONSE was lost or unparseable. Nothing polls
+  // `qk.users`, so a success-only reconciliation strands the table on the pre-write row.
+  it.each([
+    ['a rejected update (committed, response lost)', undefined, new ApiError(500, 'NON_JSON', 'Unexpected non-JSON response (500)')],
+    ['a successful update', { username: 'todd' } as UserDto, null],
+  ])('invalidates the admin-users prefix on %s', (_label, data, err) => {
+    cb(useUpdateUser()).onSettled(data, err, { publicId: 'us_1', patch: {} });
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.users });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['admin', 'users'] });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledTimes(1);
   });
 
   it('surfaces ApiError message, else "Failed to update user", on error', () => {
@@ -422,13 +588,83 @@ describe('useUpdateMe — account save with proportional feedback (#50, #134)', 
     expect(hoisted.api.updateMe).toHaveBeenCalledWith({ notifyOn: ['available'] });
   });
 
-  it('writes the returned DTO into the me cache directly (not invalidate) for every payload shape', () => {
-    cb(useUpdateMe()).onSuccess(dto, { email: 'new@x.com' });
-    expect(hoisted.qc.setQueryData).toHaveBeenCalledWith(qk.me, dto);
-    expect(hoisted.qc.setQueryData).toHaveBeenCalledWith(['me'], dto); // key verbatim, no drift
-    cb(useUpdateMe()).onSuccess(dto, { notifyOn: ['available'] });
+  // The cache write is a FUNCTIONAL update (#142 F1): the two account rows own independent mutation
+  // instances, so an earlier request settling last must not roll back a newer sibling save. Drive the
+  // updater the hook handed to setQueryData and assert the folded RESULT, not just that it was called.
+  const applyMeUpdate = (call: number, prev: MeDto | undefined): MeDto => {
+    const [key, updater] = hoisted.qc.setQueryData.mock.calls[call] as [
+      unknown,
+      (p: MeDto | undefined) => MeDto,
+    ];
+    expect(key).toEqual(['me']); // key verbatim, no drift
+    return updater(prev);
+  };
+
+  it('folds the returned DTO into the me cache field-wise (a merge, never a wholesale replace) for every payload shape', () => {
+    const cached = { email: 'old@x.com', kindleEmail: 'old@kindle.com', notifyOn: [] } as unknown as MeDto;
+    const response = {
+      email: 'new@x.com',
+      kindleEmail: null, // a stale sibling snapshot from a concurrent save
+      notifyOn: ['available'],
+    } as unknown as MeDto;
+
+    cb(useUpdateMe()).onSuccess(response, { email: 'new@x.com' });
+    // The body wrote only `email`, so only `email` is taken from the response.
+    expect(applyMeUpdate(0, cached)).toMatchObject({
+      email: 'new@x.com',
+      kindleEmail: 'old@kindle.com',
+      notifyOn: [],
+    });
+
+    cb(useUpdateMe()).onSuccess(response, { notifyOn: ['available'] });
+    expect(applyMeUpdate(1, cached)).toMatchObject({
+      email: 'old@x.com',
+      kindleEmail: 'old@kindle.com',
+      notifyOn: ['available'],
+    });
+
     expect(hoisted.qc.setQueryData).toHaveBeenCalledTimes(2);
+    // The merge is the SUCCESS path's whole cache job — the settlement refetch is a separate
+    // callback (below), so driving onSuccess alone must issue no invalidation.
     expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalled();
+  });
+
+  // `PATCH /api/me` applies email / kindleEmail / notifyOn as THREE independent writes and only then
+  // re-reads through the fallible `buildMeDto()` tail, so a save can PARTIALLY commit and a
+  // fully-committed save can still 500. The merge never runs on those paths — the settlement refetch
+  // is what recovers them.
+  it.each([
+    ['a rejected save (partially committed, then 500)', undefined, new ApiError(500, 'E', 'quota lookup blew up')],
+    ['a successful save', { notifyOn: [] } as unknown as MeDto, null],
+  ])('invalidates qk.me on %s', async (_label, data, err) => {
+    cb(useUpdateMe()).onSettled(data, err, { email: 'new@x.com' });
+    await settled();
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.me });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['me'] });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledTimes(1);
+  });
+
+  // The cancel is what makes the invalidation issue a FRESH read even when the key holds no data —
+  // the state in which `Query.fetch`'s supersession arm is unavailable and a bare invalidation
+  // silently adopts the in-flight read (#201 F2). Both the arguments and the ORDER are the contract:
+  // cancelling after invalidating would kill the read it just asked for.
+  it('cancels any in-flight me read BEFORE invalidating', async () => {
+    cb(useUpdateMe()).onSettled({ notifyOn: [] } as unknown as MeDto, null, { email: 'new@x.com' });
+    await settled();
+    expect(hoisted.qc.cancelQueries).toHaveBeenCalledWith({ queryKey: qk.me }, { silent: true });
+    expect(hoisted.qc.cancelQueries.mock.invocationCallOrder[0]!).toBeLessThan(
+      hoisted.qc.invalidateQueries.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  // Unconditional on purpose. Reconciling only the ERROR path would let an error-triggered GET
+  // issued before a sibling's commit settle after that sibling's merge and replace the whole entry —
+  // the exact #142 rollback `mergeMeCache` exists to prevent. Every settlement ending in an
+  // invalidation is what makes the LAST settler's read the last word.
+  it('reconciles a notifyOn-only save too — no body-keyed exemption', async () => {
+    cb(useUpdateMe()).onSettled({ notifyOn: ['available'] } as unknown as MeDto, null, { notifyOn: ['available'] });
+    await settled();
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.me });
   });
 
   // Positive case FIRST — this must pass before the absence assertion below is trusted (non-vacuous).
@@ -444,7 +680,8 @@ describe('useUpdateMe — account save with proportional feedback (#50, #134)', 
     cb(useUpdateMe()).onSuccess(dto, { notifyOn: ['available'] });
     expect(success).not.toHaveBeenCalled();
     // Cache write still happens — silence is only about the toast.
-    expect(hoisted.qc.setQueryData).toHaveBeenCalledWith(qk.me, dto);
+    expect(hoisted.qc.setQueryData).toHaveBeenCalledWith(qk.me, expect.any(Function));
+    expect(applyMeUpdate(0, undefined)).toBe(dto); // no prior entry ⇒ the response is taken whole
   });
 
   it('surfaces ApiError message, else "Could not save preferences", on error (unchanged for both shapes)', () => {
@@ -459,11 +696,76 @@ describe('useUpdateMe — account save with proportional feedback (#50, #134)', 
 describe('useUpdateConnectors', () => {
   const dto = { publicUrl: null } as ConnectorSettingsDto;
 
-  it('writes the connectors cache directly (not invalidate) and toasts "Settings saved"', () => {
-    cb(useUpdateConnectors()).onSuccess(dto);
-    expect(hoisted.qc.setQueryData).toHaveBeenCalledWith(qk.connectors, dto);
+  it('puts the submitted body on the wire through updateConnectorSettings, unmodified', async () => {
+    hoisted.api.updateConnectorSettings.mockResolvedValue(dto);
+    const body: UpdateConnectorSettingsBody = { publicUrl: 'https://app.example.com' };
+
+    await expect(mutFn(useUpdateConnectors())(body)).resolves.toBe(dto);
+    expect(hoisted.api.updateConnectorSettings).toHaveBeenCalledTimes(1);
+    expect(hoisted.api.updateConnectorSettings).toHaveBeenCalledWith({ publicUrl: 'https://app.example.com' });
+  });
+
+  it('INVALIDATES the connectors cache (never setQueryData) and toasts "Settings saved"', () => {
+    // It used to write `dto` wholesale. That is a lost-update race now that Public URL, quota,
+    // Narratorr and the ebook toggle each own a save against this one key: the response that
+    // settles last overwrites the entry with a snapshot that may predate a sibling's committed
+    // write (#160). Convergence is asserted end-to-end against a real QueryClient in
+    // `hooks.connector-cache.test.tsx`; this row pins the operation that makes it possible.
+    cb(useUpdateConnectors()).onSettled(dto, null, {});
+    expect(hoisted.qc.setQueryData).not.toHaveBeenCalled();
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
+    cb(useUpdateConnectors()).onSuccess();
     expect(success).toHaveBeenCalledWith('Settings saved');
-    expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalled();
+  });
+
+  // F2 — a narratorr connection swap retires the server's capability generation
+  // (`reconfigure(narratorrChanged)`), so a mounted `useFeatures` must be told to refetch. A
+  // `staleTime` lapse alone only MARKS data stale; it schedules nothing.
+  it('retires the derived feature query on a NARRATORR write', () => {
+    cb(useUpdateConnectors()).onSettled(dto, null, { narratorr: { url: 'http://n:3000', apiKey: 'k' } });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
+  });
+
+  it('clearing the narratorr connection (null) also retires it', () => {
+    // `null` is a real write — it disconnects narratorr, which definitively drops the capability.
+    cb(useUpdateConnectors()).onSettled(dto, null, { narratorr: null });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
+  });
+
+  it.each([
+    ['publicUrl only', { publicUrl: 'https://app.example.com' }],
+    ['defaultQuota only', { defaultQuota: { mode: 'unlimited' as const, windowDays: 30 as const } }],
+  ])('does NOT retire the feature query for %s — it cannot change the derived payload', (_label, body) => {
+    // Mirrors the server's own trigger set: `reconfigure()` bumps the generation only when
+    // `body.narratorr !== undefined`. Over-invalidating here would cost a refetch on every
+    // unrelated General save.
+    cb(useUpdateConnectors()).onSettled(dto, null, body);
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
+    expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalledWith({ queryKey: qk.features });
+  });
+
+  // F5 — the route persists BEFORE awaiting its fallible reconfiguration tail
+  // (`routes/settings.ts`), so a 500 is not evidence that nothing was written; the server's own
+  // rejecting-tail tests assert exactly that pairing.
+  //
+  // SCOPE OF THIS ROW: it proves only that the error path REQUESTS the right invalidations. That
+  // the mounted observers then converge on the committed row is a consequence this mocked
+  // modality structurally cannot express (no cache, no observer, no refetch — see the file
+  // header), and is proven at the API boundary in `hooks.settings-error-path.test.tsx`.
+  it('requests BOTH invalidations when a narratorr write commits and then 500s', () => {
+    cb(useUpdateConnectors()).onSettled(undefined, new ApiError(500, 'E', 'reconfigure blew up'), {
+      narratorr: { url: 'http://n:3000', apiKey: 'k' },
+    });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
+  });
+
+  it('keeps the body-sensitive feature trigger on the error path too', () => {
+    // A failed publicUrl save must not start refetching features either — the trigger is the
+    // BODY, not the outcome.
+    cb(useUpdateConnectors()).onSettled(undefined, new ApiError(500, 'E', 'boom'), { publicUrl: null });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
+    expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalledWith({ queryKey: qk.features });
   });
 
   it('surfaces ApiError message, else "Save failed", on error', () => {
@@ -475,7 +777,125 @@ describe('useUpdateConnectors', () => {
   });
 });
 
+describe('useUpdateEbooksEnabled (#144)', () => {
+  it('puts the built body on the wire unmodified, including an explicit false', async () => {
+    const dto = { ebooksEnabled: false } as ConnectorSettingsDto;
+    hoisted.api.updateConnectorSettings.mockResolvedValue(dto);
+
+    await expect(mutFn(useUpdateEbooksEnabled())({ ebooksEnabled: false })).resolves.toBe(dto);
+    expect(hoisted.api.updateConnectorSettings).toHaveBeenCalledWith({ ebooksEnabled: false });
+
+    await mutFn(useUpdateEbooksEnabled())({ ebooksEnabled: true });
+    expect(hoisted.api.updateConnectorSettings).toHaveBeenLastCalledWith({ ebooksEnabled: true });
+  });
+
+  it('invalidates connectors AND features — never setQueryData', () => {
+    // The toggle is a SECOND per-card save on a page that already runs Public URL and quota saves
+    // through `useUpdateConnectors`'s wholesale `setQueryData`. Adding another wholesale writer to
+    // `qk.connectors` is the #160 rollback shape: under reverse settlement an earlier response
+    // snapshot overwrites a later sibling's committed field, so the toggle visibly reverts even
+    // though its own write succeeded. Invalidating re-reads the authoritative row instead.
+    cb(useUpdateEbooksEnabled()).onSettled();
+    expect(hoisted.qc.setQueryData).not.toHaveBeenCalled();
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
+    // …and the derived payload is stale the moment the flag lands.
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
+    cb(useUpdateEbooksEnabled()).onSuccess();
+    expect(success).toHaveBeenCalledWith('Settings saved');
+  });
+
+  // F5 — the toggle write commits before the route's fallible reconfiguration tail, so an
+  // errored save still has to refresh both keys or the admin sees the old gating for a flag
+  // that is durably set.
+  it('requests both invalidations when the toggle commits and then 500s', () => {
+    cb(useUpdateEbooksEnabled()).onSettled(undefined, new ApiError(500, 'E', 'reconfigure blew up'));
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
+  });
+
+  it('neither the toggle nor its sibling ever blind-writes the shared connectors entry', () => {
+    // This file mocks the QueryClient, so it can only prove which cache OPERATIONS are requested —
+    // never what the cache converges on. That is the necessary condition; the sufficient one (the
+    // final value after a reverse-order settle) is asserted against a REAL QueryClient in
+    // `hooks.connector-cache.test.tsx`, which fails if either mutation reverts to setQueryData.
+    cb(useUpdateEbooksEnabled()).onSettled();
+    cb(useUpdateConnectors()).onSettled({} as ConnectorSettingsDto, null, {});
+    expect(hoisted.qc.setQueryData).not.toHaveBeenCalled();
+  });
+
+  it('surfaces the ApiError message, else a fallback', () => {
+    const h = cb(useUpdateEbooksEnabled());
+    h.onError(new ApiError(400, 'BAD', 'nope'));
+    expect(error).toHaveBeenCalledWith('nope');
+    h.onError(new Error('x'));
+    expect(error).toHaveBeenCalledWith('Save failed');
+  });
+});
+
+describe('useUpdateKindleSender (#143)', () => {
+  // The picker gets its OWN mutation rather than reusing useUpdateConnectors, and it INVALIDATES
+  // the shared key instead of writing it wholesale — a second `setQueryData` writer behind a
+  // second Save on the same page is the issue #160 shape. It also re-runs the server's read-time
+  // resolution, which is what turns a reconfirm into `ok` on screen.
+  // The picker's Save must actually reach the connectors PUT carrying the body it built —
+  // driving only onSuccess/onError would leave `mutationFn` free to drop, rewrite, or route the
+  // selection somewhere else with every test still green.
+  it('puts the submitted body on the wire through updateConnectorSettings, unmodified', async () => {
+    const dto = { publicUrl: null } as ConnectorSettingsDto;
+    hoisted.api.updateConnectorSettings.mockResolvedValue(dto);
+    const body: UpdateConnectorSettingsBody = { kindleSender: { notifierId: 'nf_1' } };
+
+    await expect(mutFn(useUpdateKindleSender())(body)).resolves.toBe(dto);
+
+    expect(hoisted.api.updateConnectorSettings).toHaveBeenCalledTimes(1);
+    expect(hoisted.api.updateConnectorSettings).toHaveBeenCalledWith({ kindleSender: { notifierId: 'nf_1' } });
+  });
+
+  it('forwards a clear body verbatim too (null is a value, not an omission)', async () => {
+    hoisted.api.updateConnectorSettings.mockResolvedValue({} as ConnectorSettingsDto);
+    await mutFn(useUpdateKindleSender())({ kindleSender: null });
+    expect(hoisted.api.updateConnectorSettings).toHaveBeenCalledWith({ kindleSender: null });
+  });
+
+  it('invalidates the connectors key (never setQueryData) and toasts "Kindle sender saved"', () => {
+    cb(useUpdateKindleSender()).onSettled();
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
+    expect(hoisted.qc.setQueryData).not.toHaveBeenCalled();
+    cb(useUpdateKindleSender()).onSuccess();
+    expect(success).toHaveBeenCalledWith('Kindle sender saved');
+  });
+
+  // F3 — `/api/features` derives `kindleSenderEmail` / `kindleDeliveryAvailable` from the SAME
+  // read-time sender resolution this save changes, so the selection must retire both keys.
+  it('also retires the derived feature query (selection changes Kindle readiness)', () => {
+    cb(useUpdateKindleSender()).onSettled();
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
+  });
+
+  // F5 — the sender write commits before the fallible tail, so a 500 still has to reconcile.
+  it('requests both invalidations when a sender selection commits and then 500s', () => {
+    cb(useUpdateKindleSender()).onSettled(undefined, new ApiError(500, 'E', 'reconfigure blew up'));
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
+  });
+
+  it('surfaces the ApiError message (the case-specific KINDLE_SENDER_INVALID text), else a fallback', () => {
+    const h = cb(useUpdateKindleSender());
+    h.onError(new ApiError(400, 'KINDLE_SENDER_INVALID', 'The Kindle sender must be an email (SMTP) notifier.'));
+    expect(error).toHaveBeenCalledWith('The Kindle sender must be an email (SMTP) notifier.');
+    h.onError(new Error('x'));
+    expect(error).toHaveBeenCalledWith('Could not save the Kindle sender');
+  });
+});
+
 describe('useTestConnector', () => {
+  it('dispatches testConnector with the exact probe body (unsaved form values ride along)', async () => {
+    const body = { channel: 'narratorr', narratorr: { url: 'http://n:3000', apiKey: 'k' } } as never;
+    await mutFn(useTestConnector())(body);
+    expect(hoisted.api.testConnector).toHaveBeenCalledTimes(1);
+    expect(hoisted.api.testConnector).toHaveBeenCalledWith(body);
+  });
+
   it('routes a success result to toast.success and a failure to toast.error', () => {
     const h = cb(useTestConnector());
     h.onSuccess({ success: true, message: 'Connected' } as TestConnectorResult);
@@ -499,11 +919,53 @@ describe('notifier mutation hooks — cache invalidation + toast contract', () =
   // freshly-masked secrets. All three assert the shared qk.connectors entry, so a drift
   // between the four connectors sites would fail here.
 
+  // Dispatch rows — the CRUD trio splits its variables differently on the wire (body verbatim /
+  // id+body positional / bare id), so each seam gets its own exact-args receipt.
+  it('useCreateNotifier dispatches createNotifier with the body verbatim', async () => {
+    const body = { name: 'ops', type: 'ntfy', events: ['request.created'], config: { topic: 't' } } as never;
+    await mutFn(useCreateNotifier())(body);
+    expect(hoisted.api.createNotifier).toHaveBeenCalledTimes(1);
+    expect(hoisted.api.createNotifier).toHaveBeenCalledWith(body);
+  });
+
+  it('useUpdateNotifier splits { id, body } into positional args', async () => {
+    const body = { name: 'ops', type: 'ntfy', events: ['request.created'], config: { topic: 't' } } as never;
+    await mutFn(useUpdateNotifier())({ id: 'nf_1', body });
+    expect(hoisted.api.updateNotifier).toHaveBeenCalledTimes(1);
+    expect(hoisted.api.updateNotifier).toHaveBeenCalledWith('nf_1', body);
+  });
+
+  it('useDeleteNotifier dispatches deleteNotifier with the bare id', async () => {
+    await mutFn(useDeleteNotifier())('nf_2');
+    expect(hoisted.api.deleteNotifier).toHaveBeenCalledTimes(1);
+    expect(hoisted.api.deleteNotifier).toHaveBeenCalledWith('nf_2');
+  });
+
   it('useCreateNotifier invalidates the connectors key and toasts "Notifier added"', () => {
-    cb(useCreateNotifier()).onSuccess();
+    cb(useCreateNotifier()).onSettled();
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
     expect(hoisted.qc.setQueryData).not.toHaveBeenCalled();
+    cb(useCreateNotifier()).onSuccess();
     expect(success).toHaveBeenCalledWith('Notifier added');
+  });
+
+  // F3 — the Kindle sender is resolved at READ time against the live notifier list, so editing
+  // the selected notifier's `from` flips it to `sender-changed` and deleting it to
+  // `notifier-missing`; both change the `/api/features` payload. CREATE is the one notifier
+  // mutation that cannot: the resolver matches the stored selection by id, and a new notifier gets
+  // a fresh `publicId('nf')` that no stored selection can already name.
+  it('useCreateNotifier does NOT retire the feature query (a new id can never be the selected sender)', () => {
+    cb(useCreateNotifier()).onSettled();
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
+    expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalledWith({ queryKey: qk.features });
+  });
+
+  // F6 sibling — create cannot change the SENDER, but its own write is just as durable-before-500
+  // as the others, so the notifier list still has to reconcile on the error path.
+  it('useCreateNotifier requests only the connectors invalidation when the create commits and then 500s', () => {
+    cb(useCreateNotifier()).onSettled(undefined, new ApiError(500, 'E', 'reconfigure blew up'));
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
+    expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalledWith({ queryKey: qk.features });
   });
 
   it('useCreateNotifier surfaces ApiError message, else "Could not add notifier"', () => {
@@ -515,9 +977,23 @@ describe('notifier mutation hooks — cache invalidation + toast contract', () =
   });
 
   it('useUpdateNotifier invalidates the connectors key and toasts "Notifier saved"', () => {
-    cb(useUpdateNotifier()).onSuccess();
+    cb(useUpdateNotifier()).onSettled();
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
+    cb(useUpdateNotifier()).onSuccess();
     expect(success).toHaveBeenCalledWith('Notifier saved');
+  });
+
+  it('useUpdateNotifier retires the feature query (an edited `from` can break the saved sender)', () => {
+    cb(useUpdateNotifier()).onSettled();
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
+  });
+
+  // F6 — notifier edit persists before the fallible tail, so a 500 must still
+  // reconcile the Kindle-derived feature state.
+  it('useUpdateNotifier requests both invalidations when the write commits and then 500s', () => {
+    cb(useUpdateNotifier()).onSettled(undefined, new ApiError(500, 'E', 'reconfigure blew up'));
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
   });
 
   it('useUpdateNotifier surfaces ApiError message, else "Could not save notifier"', () => {
@@ -529,9 +1005,23 @@ describe('notifier mutation hooks — cache invalidation + toast contract', () =
   });
 
   it('useDeleteNotifier invalidates the connectors key and toasts "Notifier deleted"', () => {
-    cb(useDeleteNotifier()).onSuccess();
+    cb(useDeleteNotifier()).onSettled();
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
+    cb(useDeleteNotifier()).onSuccess();
     expect(success).toHaveBeenCalledWith('Notifier deleted');
+  });
+
+  it('useDeleteNotifier retires the feature query (deleting the selected sender ends delivery)', () => {
+    cb(useDeleteNotifier()).onSettled();
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
+  });
+
+  // F6 — notifier delete persists before the fallible tail, so a 500 must still
+  // reconcile the Kindle-derived feature state.
+  it('useDeleteNotifier requests both invalidations when the write commits and then 500s', () => {
+    cb(useDeleteNotifier()).onSettled(undefined, new ApiError(500, 'E', 'reconfigure blew up'));
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.connectors });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.features });
   });
 
   it('useDeleteNotifier surfaces ApiError message, else "Could not delete notifier"', () => {
@@ -544,6 +1034,13 @@ describe('notifier mutation hooks — cache invalidation + toast contract', () =
 });
 
 describe('useTestNotifier — routes the probe result to a toast', () => {
+  it('dispatches testNotifier with the exact candidate body (type/config/event, no save)', async () => {
+    const body = { type: 'webhook', config: { url: 'https://x' }, event: 'request.created' } as never;
+    await mutFn(useTestNotifier())(body);
+    expect(hoisted.api.testNotifier).toHaveBeenCalledTimes(1);
+    expect(hoisted.api.testNotifier).toHaveBeenCalledWith(body);
+  });
+
   it('routes a success result to toast.success and a failure to toast.error', () => {
     const h = cb(useTestNotifier());
     h.onSuccess({ success: true, message: 'Test notification sent.' } as TestConnectorResult);
@@ -598,10 +1095,29 @@ describe('useLocalAuth', () => {
     expect(hoisted.api.localLogin).not.toHaveBeenCalled();
   });
 
-  it('invalidates the me query on success (exact ["me"] key)', () => {
-    mut(useLocalAuth('login')).onSuccess();
+  // Both routes call `setSessionCookie()` BEFORE the response body is produced, and the client can
+  // still reject while reading/parsing it — so a rejected signup/login can leave a VALID SESSION
+  // behind the login screen. Reconciling on settlement is what recovers into the app; nothing else
+  // refetches `qk.me` on that screen. Errors keep surfacing on the form (no toast).
+  it.each([
+    ['login', 'a rejected attempt (cookie set, body unparseable)', undefined, new ApiError(200, 'NON_JSON', 'Unexpected non-JSON response (200)')],
+    ['login', 'a successful attempt', { ok: true }, null],
+    ['signup', 'a rejected attempt (cookie set, body unparseable)', undefined, new ApiError(200, 'NON_JSON', 'Unexpected non-JSON response (200)')],
+    ['signup', 'a successful attempt', { ok: true }, null],
+  ] as const)('mode=%s invalidates the me query on %s (exact ["me"] key)', async (mode, _label, data, err) => {
+    // Awaiting the RETURNED promise, not just a tick: this hook returns its reconciliation from
+    // `onSettled` so the mutation stays pending across the read (#201 F1) — so the promise is the
+    // settlement, and awaiting it is also what pins that it is still handed back.
+    await cb(useLocalAuth(mode)).onSettled(data, err, { email: 'a@b.c', password: 'pw' });
+    expect(hoisted.qc.cancelQueries).toHaveBeenCalledWith({ queryKey: qk.me }, { silent: true });
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: qk.me });
     expect(hoisted.qc.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['me'] });
+    expect(hoisted.qc.invalidateQueries).toHaveBeenCalledTimes(1);
+    expect(hoisted.qc.cancelQueries.mock.invocationCallOrder[0]!).toBeLessThan(
+      hoisted.qc.invalidateQueries.mock.invocationCallOrder[0]!,
+    );
+    expect(success).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
   });
 });
 
@@ -666,4 +1182,40 @@ describe('useTheme', () => {
     expect(m.setItem).toHaveBeenLastCalledWith('theme', 'dark');
     expect(m.add).toHaveBeenLastCalledWith('dark');
   });
+});
+
+describe('useSendToKindle — the send mutation (#149)', () => {
+  // This mutation is the ONE that converges no cache: a send changes no cached resource, so the
+  // right receipt here is exactly what the wholesale react-query mock can prove — which API call it
+  // dispatches and that it carries NO handlers at all. Outcome PRESENTATION is the sheet's
+  // (in-sheet success panel + inline failures, UAT 2026-07-29 — a corner toast was invisible from
+  // inside the modal), covered in EbookSheet.test.tsx.
+  it('dispatches sendEbookToKindle with the book id and the sheet’s title', async () => {
+    hoisted.api.sendEbookToKindle.mockResolvedValue({ outcome: 'sent' });
+
+    const dispatch = mutFn<{ bookId: string; title: string }>(useSendToKindle());
+
+    await expect(dispatch({ bookId: 'bk_abc123', title: 'The Hobbit' })).resolves.toEqual({ outcome: 'sent' });
+
+    expect(hoisted.api.sendEbookToKindle).toHaveBeenCalledTimes(1);
+    expect(hoisted.api.sendEbookToKindle).toHaveBeenCalledWith('bk_abc123', 'The Hobbit');
+  });
+
+  it('is a BARE mutation — no cache writes, no toast handlers; the sheet owns presentation', () => {
+    const hook = useSendToKindle() as { onSuccess?: unknown; onError?: unknown; onSettled?: unknown };
+    // No handlers at all: a handler here would be presentation the sheet cannot see or a cache
+    // write the send has no business making (`me`, `features` and the request lists are all
+    // unaffected by a send).
+    expect(hook.onSuccess).toBeUndefined();
+    expect(hook.onError).toBeUndefined();
+    expect(hook.onSettled).toBeUndefined();
+    expect(hoisted.qc.setQueryData).not.toHaveBeenCalled();
+    expect(hoisted.qc.invalidateQueries).not.toHaveBeenCalled();
+    expect(success).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
+  });
+
+  // The rejected-request → error-code-table mapping (ApiError code vs generic fallback) moved
+  // WITH the presentation into the sheet: `sendFailureText`'s pure tests in ebook-sheet.test.ts
+  // pin both branches, and EbookSheet.test.tsx pins them through the DOM.
 });

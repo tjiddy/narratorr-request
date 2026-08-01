@@ -25,7 +25,11 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: 24
+          # Pin CI to the engines floor (package.json `>=24.10`) so verify proves the floor
+          # actually runs; the Docker build tracks the 24 tip separately (docker.yml).
+          # Quoted on purpose: a bare 24.10 is YAML-float-coerced to "24.1" (the setup-python
+          # `3.10` gotcha) and would silently install Node 24.1.x — below the floor.
+          node-version: '24.10'
           cache: pnpm
 
       - name: Install dependencies

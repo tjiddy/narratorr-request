@@ -11,6 +11,8 @@ const { sendMail, createTransport } = vi.hoisted(() => {
 });
 vi.mock('nodemailer', () => ({ default: { createTransport } }));
 
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { eq } from 'drizzle-orm';
 import { createTestDb } from '../test-support/db.js';
 import { appSettings } from '../../db/schema.js';
@@ -20,12 +22,15 @@ import { SettingsService } from '../services/settings.service.js';
 import { ConnectorSettingsService } from '../services/connector-settings.service.js';
 import { SecretCodec, deriveSettingsKey } from '../util/secret-codec.js';
 import { NarratorrClientHolder } from '../services/narratorr-client-holder.js';
+import { FeatureService } from '../services/feature.service.js';
 import { Notifier } from '../services/notifications/index.js';
 import { errorHandlerPlugin } from '../plugins/error-handler.js';
 import { registerSettingsRoutes } from './settings.js';
+import { registerFeatureRoutes } from './features.js';
 import type { AppDeps } from '../services/deps.js';
 import type { AuthUser } from '../types.js';
 import type { CreateNotifierBody } from '../../shared/schemas/connectors.js';
+import type { V1Capabilities } from '../../shared/schemas/v1/capabilities.js';
 
 const codec = new SecretCodec(deriveSettingsKey({ sessionSecret: 'route-test' }));
 const silentLog = { info() {}, warn() {}, error() {}, debug() {} };
@@ -38,15 +43,38 @@ let deps: AppDeps;
 let db: Db;
 let connectorSettings: ConnectorSettingsService;
 let narratorr: NarratorrClientHolder;
+let features: FeatureService;
+let capability: CountingCapabilityClient;
+
+/**
+ * The upstream the capability resolver probes (issue #144), counting calls so a test can tell a
+ * cache hit from a re-probe. Deliberately handed to `FeatureService` as its CLIENT directly rather
+ * than through `narratorr`: `reconfigure()` replaces the holder's inner clients with REAL ones
+ * pointed at the saved URL, which would turn every probe here into an actual socket. Bypassing the
+ * holder on the client side isolates what these tests are about — whether the connection
+ * generation moved — from the network. The resolver's GENERATION still comes from the real holder
+ * (issue #145), which is precisely the seam under test.
+ */
+class CountingCapabilityClient {
+  calls = 0;
+  enabled = true;
+  async getCapabilities(): Promise<V1Capabilities> {
+    this.calls += 1;
+    return { companionEpub: { enabled: this.enabled } };
+  }
+}
 
 async function buildApp(): Promise<FastifyInstance> {
   db = await createTestDb();
   await new SettingsService(db).ensure();
   connectorSettings = new ConnectorSettingsService(db, codec);
   narratorr = new NarratorrClientHolder(null);
+  capability = new CountingCapabilityClient();
+  features = new FeatureService(capability, narratorr);
   deps = {
     connectorSettings,
     narratorr,
+    features,
     notifier: new Notifier([], null, silentLog),
     // reconfigure() refreshes the request-quota policy on every connector/notifier save.
     requests: { reconfigureQuota: vi.fn() },
@@ -63,6 +91,9 @@ async function buildApp(): Promise<FastifyInstance> {
     else if (role === 'user') req.user = USER;
   });
   registerSettingsRoutes(f, deps);
+  // Registered alongside so the AC16 tests can observe the generation through the real consumer
+  // surface (`/api/features` re-probes vs. serves the cached value), not just the counter.
+  registerFeatureRoutes(f, deps);
   await f.ready();
   return f;
 }
@@ -80,6 +111,9 @@ const asAdmin = { 'x-test-role': 'admin' };
 const asUser = { 'x-test-role': 'user' };
 const CONNECTORS_URL = '/api/admin/settings/connectors';
 const NOTIFIERS_URL = '/api/admin/settings/notifiers';
+
+/** The #207 network-class Test copy — pinned here so the route cases assert the exact string. */
+const UNREACHABLE_COPY = 'Could not reach the destination — check the URL, including whether it redirects.';
 
 const ntfyCreate = (over: Partial<CreateNotifierBody> = {}): CreateNotifierBody => ({
   name: 'Phone',
@@ -156,6 +190,114 @@ describe('settings routes — GET/PUT connectors', () => {
     const dto = res.json();
     expect(dto.narratorr).toBeNull();
     expect(dto.notifiers).toEqual([]);
+  });
+});
+
+describe('settings routes — Kindle sender selector (#143)', () => {
+  const emailCreate = (from: string, name = 'Mail'): CreateNotifierBody => ({
+    name,
+    type: 'email',
+    events: ['request.created'],
+    config: { host: 'smtp.example.com', port: 587, secure: false, user: 'u', pass: 'p', from, to: 'admin@ex.com' },
+  });
+
+  const putKindle = (kindleSender: unknown, headers = asAdmin) =>
+    app.inject({ method: 'PUT', url: CONNECTORS_URL, headers, payload: { kindleSender } });
+
+  it('GET carries the resolved kindleSender — null when unset, the resolved object once saved', async () => {
+    // Non-vacuous against the non-strict response schema: a field the mapper emits but the
+    // schema omits is silently stripped, so this would read `undefined` on that regression.
+    const before = await app.inject({ method: 'GET', url: CONNECTORS_URL, headers: asAdmin });
+    expect(before.json()).toHaveProperty('kindleSender', null);
+
+    const nf = (await createNotifier(emailCreate('Narratorr <Bot@Ex.com>'))).json();
+    await putKindle({ notifierId: nf.id });
+    const res = await app.inject({ method: 'GET', url: CONNECTORS_URL, headers: asAdmin });
+    expect(res.json().kindleSender).toEqual({
+      notifierId: nf.id,
+      confirmedFrom: 'Bot@Ex.com',
+      status: 'ok',
+      currentFrom: 'Bot@Ex.com',
+    });
+  });
+
+  it('PUT persists and ECHOES the freshly resolved value; a non-admin is still 403', async () => {
+    const nf = (await createNotifier(emailCreate('bot@ex.com'))).json();
+    const res = await putKindle({ notifierId: nf.id });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().kindleSender).toMatchObject({ notifierId: nf.id, confirmedFrom: 'bot@ex.com', status: 'ok' });
+    expect((await connectorSettings.getStored()).kindleSender).toEqual({ notifierId: nf.id, confirmedFrom: 'bot@ex.com' });
+
+    expect((await putKindle({ notifierId: nf.id }, asUser)).statusCode).toBe(403);
+  });
+
+  it('an invalid selection returns the standard envelope with a CASE-SPECIFIC message', async () => {
+    const res = await putKindle({ notifierId: 'nf_nope' });
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toEqual({
+      error: {
+        code: 'KINDLE_SENDER_INVALID',
+        message: 'That notifier no longer exists — pick an email notifier that is still configured.',
+      },
+    });
+
+    const ntfy = (await createNotifier(ntfyCreate())).json();
+    expect((await putKindle({ notifierId: ntfy.id })).json().error.message).toBe(
+      'The Kindle sender must be an email (SMTP) notifier.',
+    );
+  });
+
+  it('rejects a client-supplied confirmedFrom (inner .strict) — the confirmation is never spoofable', async () => {
+    const nf = (await createNotifier(emailCreate('bot@ex.com'))).json();
+    expect((await putKindle({ notifierId: nf.id, confirmedFrom: 'attacker@evil.com' })).statusCode).toBe(400);
+  });
+
+  it('editing the selected notifier’s From → sender-changed; re-PUTting the SAME id reconfirms to ok', async () => {
+    const nf = (await createNotifier(emailCreate('bot@ex.com'))).json();
+    await putKindle({ notifierId: nf.id });
+
+    await app.inject({ method: 'PUT', url: `${NOTIFIERS_URL}/${nf.id}`, headers: asAdmin, payload: emailCreate('new@ex.com') });
+    const changed = await app.inject({ method: 'GET', url: CONNECTORS_URL, headers: asAdmin });
+    expect(changed.json().kindleSender).toMatchObject({ status: 'sender-changed', confirmedFrom: 'bot@ex.com', currentFrom: 'new@ex.com' });
+
+    const reconfirm = await putKindle({ notifierId: nf.id });
+    expect(reconfirm.json().kindleSender).toMatchObject({ status: 'ok', confirmedFrom: 'new@ex.com' });
+  });
+
+  // The server-side half of AC21's no-same-id-Save rule: outside `sender-changed`, re-sending the
+  // saved id is a GUARANTEED 400 — which is exactly why the picker never offers it.
+  it('a same-id re-PUT after the notifier is deleted is rejected 400 (the UI must never offer it)', async () => {
+    const nf = (await createNotifier(emailCreate('bot@ex.com'))).json();
+    await putKindle({ notifierId: nf.id });
+    await app.inject({ method: 'DELETE', url: `${NOTIFIERS_URL}/${nf.id}`, headers: asAdmin });
+    expect((await app.inject({ method: 'GET', url: CONNECTORS_URL, headers: asAdmin })).json().kindleSender).toMatchObject({
+      status: 'notifier-missing',
+    });
+
+    const res = await putKindle({ notifierId: nf.id });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe('KINDLE_SENDER_INVALID');
+  });
+
+  it('kindleSender: null clears the selection through the route', async () => {
+    const nf = (await createNotifier(emailCreate('bot@ex.com'))).json();
+    await putKindle({ notifierId: nf.id });
+    expect((await putKindle(null)).json().kindleSender).toBeNull();
+    expect((await connectorSettings.getStored()).kindleSender).toBeNull();
+  });
+
+  // Regression: the parser gates ONLY the selector — retro-validating the notifier's own `from`
+  // would brick every working notifier whose From is a display string.
+  it('POST/PUT of an email notifier with an unparseable From still succeeds', async () => {
+    const created = await createNotifier(emailCreate('ops team'));
+    expect(created.statusCode).toBe(200);
+    const edited = await app.inject({
+      method: 'PUT',
+      url: `${NOTIFIERS_URL}/${created.json().id}`,
+      headers: asAdmin,
+      payload: emailCreate('a@x.com, b@y.com'),
+    });
+    expect(edited.statusCode).toBe(200);
   });
 });
 
@@ -438,9 +580,148 @@ describe('settings routes — notifier test (always 200)', () => {
     expect(body.success).toBe(false);
     expect(body.message).not.toContain(appToken);
   });
+
+  // --- #207: the SEND catch maps the network class to actionable copy (the two tests above
+  // now pin the FALLBACK path, which stays `redact(err, candidateSecrets(candidate))`).
+  it('a fetch network rejection (TypeError) becomes the redirect-aware copy, not the runtime text', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('fetch failed')));
+    const res = await test({ type: 'ntfy', config: { url: 'https://ntfy.sh', topic: 'reqs' } });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body).toEqual({ success: false, message: UNREACHABLE_COPY });
+    expect(body.message).not.toContain('fetch failed');
+  });
+
+  it('a fired AbortSignal.timeout (TimeoutError) becomes the timeout copy', async () => {
+    const timeout = new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(timeout));
+    const res = await test({ type: 'ntfy', config: { url: 'https://ntfy.sh', topic: 'reqs' } });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ success: false, message: 'The destination did not respond in time.' });
+  });
+
+  it('the CANDIDATE-BUILD catch is NOT the send mapper — it keeps redact(err) (AC6)', async () => {
+    // Pins the boundary: a config-resolution failure must never be reported as "could not reach
+    // the destination". A TypeError is used deliberately — it is exactly what the send mapper
+    // remaps, so routing this catch through describeSendFailure() would flip this assertion.
+    vi.spyOn(connectorSettings, 'buildCandidateNotifier').mockRejectedValue(new TypeError('candidate resolution exploded'));
+    const res = await test({ type: 'ntfy', config: { url: 'https://ntfy.sh', topic: 'reqs' } });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ success: false, message: 'candidate resolution exploded' });
+  });
 });
 
-describe('settings routes — narratorr test endpoint (unchanged)', () => {
+// A real redirect cannot be produced by an in-process fetch stub — `redirect: 'error'` is only
+// meaningful to a real HTTP client over a real socket, so correct and broken code behave
+// identically under a stub/MSW (learnings `fetch-redirect-error-invariant`, #199, and
+// `msw-cannot-test-body-read-abort`, #95). This is the filed case from #207 end to end: the
+// admin's base URL 301s, the send rejects, and the Test envelope must say so actionably.
+// This file uses no MSW, so the close/re-arm dance narratorr-client.test.ts needs does not apply.
+describe('settings routes — notifier test over a REAL redirecting socket (#207)', () => {
+  // Defensive: an earlier describe's stubbed fetch must never bleed in and fake this.
+  beforeEach(() => vi.unstubAllGlobals());
+
+  interface RecordingServer {
+    baseUrl: string;
+    requests: string[];
+    close(): Promise<void>;
+  }
+
+  async function startRecordingServer(handler: (req: IncomingMessage, res: ServerResponse) => void): Promise<RecordingServer> {
+    const requests: string[] = [];
+    const s = createServer((req, res) => {
+      requests.push(req.url ?? '');
+      // A client that walks away mid-response makes the socket error (EPIPE/ECONNRESET) — an
+      // unhandled 'error' would take the whole vitest worker down.
+      res.on('error', () => {});
+      req.on('error', () => {});
+      handler(req, res);
+    });
+    await new Promise<void>((resolve) => s.listen(0, '127.0.0.1', () => resolve()));
+    const { port } = s.address() as AddressInfo;
+    return {
+      baseUrl: `http://127.0.0.1:${port}`,
+      requests,
+      close: async () => {
+        s.closeAllConnections(); // undici pools keep-alive sockets; without this `close` hangs
+        await new Promise<void>((resolve) => s.close(() => resolve()));
+      },
+    };
+  }
+
+  it('a 301 from the configured base surfaces the redirect-aware copy (still 200), and never reaches the target', async () => {
+    const target = await startRecordingServer((_req, res) => res.writeHead(200).end());
+    const redirector = await startRecordingServer((req, res) => {
+      res.writeHead(301, { location: `${target.baseUrl}${req.url ?? '/'}` }).end();
+    });
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: `${NOTIFIERS_URL}/test`,
+        headers: asAdmin,
+        payload: { type: 'ntfy', config: { url: redirector.baseUrl, topic: 'reqs' } },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.message).toBe(UNREACHABLE_COPY);
+      // Vacuity guards — without these the test also passes if nothing was ever sent.
+      expect(redirector.requests).toEqual(['/reqs']);
+      expect(target.requests).toEqual([]);
+      expect(body.message).not.toContain('fetch failed');
+    } finally {
+      await redirector.close();
+      await target.close();
+    }
+  });
+});
+
+const NARRATORR_UNREACHABLE_COPY = 'Could not reach narratorr — check the URL, including whether it redirects.';
+
+describe('settings routes — narratorr test endpoint', () => {
+  it('an unreachable narratorr (NarratorrError status 0 / NETWORK) gets the redirect-aware copy (#207 AC8)', async () => {
+    // NarratorrClient maps a fetch rejection — including the `redirect: 'error'` one (#171) —
+    // into NarratorrError(0, 'NETWORK', …), which is the branch whose copy changed.
+    await connectorSettings.update({ narratorr: { url: 'https://n.example.com:443', apiKey: 'k' } });
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('fetch failed')));
+    const res = await app.inject({ method: 'POST', url: `${CONNECTORS_URL}/test`, headers: asAdmin, payload: { channel: 'narratorr', narratorr: { url: 'https://n.example.com:443' } } });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ success: false, message: NARRATORR_UNREACHABLE_COPY });
+  });
+
+  it('a narratorr that never answers (local timeout) gets its OWN copy, not the unreachable one (#213)', async () => {
+    // What undici raises when the client's own `controller.abort()` fires. The route builds
+    // NarratorrClient without a `timeoutMs`, so the real 15s default is not waitable here — the
+    // genuine end-to-end abort is covered by the client's own timeout tests.
+    await connectorSettings.update({ narratorr: { url: 'https://n.example.com:443', apiKey: 'k' } });
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new DOMException('This operation was aborted', 'AbortError')));
+    const res = await app.inject({ method: 'POST', url: `${CONNECTORS_URL}/test`, headers: asAdmin, payload: { channel: 'narratorr', narratorr: { url: 'https://n.example.com:443' } } });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ success: false, message: 'Narratorr did not respond in time.' });
+    // The pair with the TypeError test above: the two network classes no longer collapse.
+    expect(res.json().message).not.toBe(NARRATORR_UNREACHABLE_COPY);
+  });
+
+  // The `TIMEOUT` code is only trustworthy as a LOCAL signal — `errorEnvelopeSchema.error.code` is
+  // an unrestricted string, so a hostile narratorr can answer any status with `{"error":{"code":
+  // "TIMEOUT"}}`. These resolve a real Response so the production `classifyErrorBody` builds the
+  // error: only a STATUS-ZERO code is locally authored, and an HTTP-sourced one keeps its
+  // status-derived copy.
+  it.each([
+    [401, 'Authentication failed — check the API key.'],
+    [500, 'narratorr responded 500.'],
+  ])('a forged HTTP %i + upstream code "TIMEOUT" keeps its status copy (#213 AC5)', async (status, message) => {
+    await connectorSettings.update({ narratorr: { url: 'https://n.example.com:443', apiKey: 'k' } });
+    const forged = 'forged-timeout-marker';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => Promise.resolve(new Response(JSON.stringify({ error: { code: 'TIMEOUT', message: forged } }), { status }))),
+    );
+    const res = await app.inject({ method: 'POST', url: `${CONNECTORS_URL}/test`, headers: asAdmin, payload: { channel: 'narratorr', narratorr: { url: 'https://n.example.com:443' } } });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ success: false, message });
+    expect(res.body).not.toContain(forged);
+  });
+
   it('reports not-configured without throwing (always 200)', async () => {
     const res = await app.inject({ method: 'POST', url: `${CONNECTORS_URL}/test`, headers: asAdmin, payload: { channel: 'narratorr', narratorr: { url: 'https://n:3000' } } });
     expect(res.statusCode).toBe(200);
@@ -486,5 +767,216 @@ describe('settings routes — write mutex (no clobber on overlapping writes)', (
     const stored = await connectorSettings.getStored();
     expect(stored.publicUrl).toBe('https://app.example.com');
     expect(stored.notifiers).toHaveLength(1);
+  });
+});
+
+// AC16.7 (#144) / AC17-18 (#145): a narratorr CONNECTION CHANGE must install new clients AND
+// retire the cached companion-ebook capability — and nothing else may do either. Since #145 those
+// are the SAME event: the holder's generation is the resolver's cache key, so one synchronous
+// `deps.narratorr.set(...)` — before `reconfigure()`'s remaining awaits — is the whole mechanism.
+// A concurrent `/api/features` read (which deliberately does NOT take the settings write mutex)
+// therefore can never observe the new connection paired with the old generation's cache.
+describe('settings routes — connection swap on a narratorr change (#144/#145)', () => {
+  const FEATURES_URL = '/api/features';
+  const emailCreate = (from: string): CreateNotifierBody => ({
+    name: 'Mail',
+    type: 'email',
+    events: ['request.created'],
+    config: { host: 'smtp.example.com', port: 587, secure: false, user: 'u', pass: 'p', from, to: 'admin@ex.com' },
+  });
+
+  const readFeatures = () => app.inject({ method: 'GET', url: FEATURES_URL, headers: asAdmin });
+  const putConnectors = (payload: Record<string, unknown>) =>
+    app.inject({ method: 'PUT', url: CONNECTORS_URL, headers: asAdmin, payload });
+
+  /** Turn the feature on and warm the cache, so a later probe means the generation was bumped. */
+  async function primeCachedCapability(): Promise<void> {
+    await connectorSettings.update({ ebooksEnabled: true });
+    expect((await readFeatures()).json().ebooksEnabled).toBe(true);
+    expect(capability.calls).toBe(1);
+    // A second read inside the TTL is served from cache — the baseline every row below contrasts with.
+    await readFeatures();
+    expect(capability.calls).toBe(1);
+  }
+
+  it('swaps on a PUT carrying narratorr — the next read RE-PROBES instead of serving the cache', async () => {
+    await primeCachedCapability();
+    expect(narratorr.generation).toBe(0);
+
+    const res = await putConnectors({ narratorr: { url: 'http://n:3000', apiKey: 'k' } });
+    expect(res.statusCode).toBe(200);
+    expect(narratorr.generation).toBe(1);
+
+    expect((await readFeatures()).json().ebooksEnabled).toBe(true);
+    expect(capability.calls).toBe(2); // re-probed, despite being well inside the 60s TTL
+  });
+
+  it('rebuilds BOTH clients from ONE read of the saved config, observed with no restart', async () => {
+    // AC15/AC18/AC25. `fetch` is stubbed, so this asserts on what each half would put on the wire
+    // without opening a socket — the JSON and stream clients must carry the SAME freshly-saved
+    // base URL and api key, from a single `getNarratorrConfig()` read.
+    const reads = vi.spyOn(connectorSettings, 'getNarratorrConfig');
+    const before = narratorr.generation;
+
+    expect((await putConnectors({ narratorr: { url: 'http://new-n:3000', apiKey: 'fresh-key' } })).statusCode).toBe(200);
+    expect(narratorr.generation).toBe(before + 1);
+    expect(reads).toHaveBeenCalledTimes(1);
+
+    const seen: Array<{ url: string; apiKey: string | null }> = [];
+    vi.stubGlobal('fetch', (input: RequestInfo | URL, init?: RequestInit) => {
+      seen.push({ url: String(input), apiKey: new Headers(init?.headers).get('x-api-key') });
+      return Promise.resolve(new Response(null, { status: 500 }));
+    });
+    await narratorr.getBook('bk_1').catch(() => {});
+    await narratorr.openCompanionEpub('bk_1').catch(() => {});
+
+    expect(seen).toHaveLength(2);
+    expect(seen[0]?.url).toBe('http://new-n:3000/api/v1/books/bk_1');
+    expect(seen[1]?.url).toBe('http://new-n:3000/api/v1/books/bk_1/companion-epub');
+    expect(seen[0]?.apiKey).toBe('fresh-key');
+    expect(seen[1]?.apiKey).toBe('fresh-key');
+  });
+
+  it('DISCONNECTS on a PUT carrying narratorr: null — clears both clients and retires the cache', async () => {
+    // The null arm of the swap ternary. Every other case here saves a connection, so reversing or
+    // dropping that arm (leaving the retired server's live clients and its cached capability in
+    // place) would keep the whole suite green.
+    expect((await putConnectors({ narratorr: { url: 'http://n:3000', apiKey: 'k' } })).statusCode).toBe(200);
+    await primeCachedCapability();
+    expect(narratorr.configured).toBe(true);
+    const before = narratorr.generation;
+
+    expect((await putConnectors({ narratorr: null })).statusCode).toBe(200);
+
+    // Exactly one bump, and the connection is genuinely gone…
+    expect(narratorr.generation).toBe(before + 1);
+    expect(narratorr.configured).toBe(false);
+    await expect(Promise.resolve().then(() => narratorr.getBook('bk_1'))).rejects.toMatchObject({
+      statusCode: 502,
+      upstreamCode: 'NOT_CONFIGURED',
+    });
+    await expect(Promise.resolve().then(() => narratorr.openCompanionEpub('bk_1'))).rejects.toMatchObject({
+      statusCode: 502,
+      upstreamCode: 'NOT_CONFIGURED',
+    });
+    // …and the disconnected server's cached `true` is unreadable — the read re-probes rather than
+    // serving it, well inside the 60s TTL.
+    const callsBefore = capability.calls;
+    expect((await readFeatures()).json().ebooksEnabled).toBe(true);
+    expect(capability.calls).toBe(callsBefore + 1);
+  });
+
+  it('swaps ADJACENTLY to the DB write — visible while reconfigure() is still parked', async () => {
+    // An ordering-only assertion cannot distinguish an adjacent swap from one deferred past the
+    // awaits. So park `reconfigure()` INSIDE itself, right after the swap, and assert the new
+    // generation is already observable from a concurrent reader.
+    await primeCachedCapability();
+
+    let release!: () => void;
+    const parked = new Promise<void>((res) => {
+      release = res;
+    });
+    const real = connectorSettings.getNotificationsConfig.bind(connectorSettings);
+    vi.spyOn(connectorSettings, 'getNotificationsConfig').mockImplementation(async () => {
+      await parked;
+      return real();
+    });
+
+    const put = putConnectors({ narratorr: { url: 'http://n:3000', apiKey: 'k' } });
+    // Let the PUT run up to the parked await.
+    await vi.waitFor(() => expect(narratorr.generation).toBe(1));
+    // The holder has already swapped…
+    expect(narratorr.configured).toBe(true);
+    // …and a concurrent read is ALREADY in the new generation: it re-probes rather than serving
+    // the cached `true`. A swap deferred past the awaits would still serve the cache here.
+    expect((await readFeatures()).json().ebooksEnabled).toBe(true);
+    expect(capability.calls).toBe(2);
+
+    release();
+    expect((await put).statusCode).toBe(200);
+  });
+
+  it.each([
+    ['getNotificationsConfig', 'getNotificationsConfig' as const],
+    ['getDefaultQuota', 'getDefaultQuota' as const],
+  ])('survives a REJECTING %s tail — the swap already happened', async (_label, method) => {
+    // The DB update is already durable when the tail runs. A swap placed after it would be
+    // skipped entirely by the rejection, stranding the saved connection behind the previous
+    // one's clients and cache — indefinitely, since nothing retries.
+    await primeCachedCapability();
+    vi.spyOn(connectorSettings, method).mockRejectedValue(new Error('tail exploded'));
+
+    const res = await putConnectors({ narratorr: { url: 'http://n:3000', apiKey: 'k' } });
+    expect(res.statusCode).toBe(500);
+    expect(narratorr.generation).toBe(1);
+    expect(narratorr.configured).toBe(true);
+
+    vi.restoreAllMocks();
+    expect((await readFeatures()).json().ebooksEnabled).toBe(true);
+    expect(capability.calls).toBe(2); // the new generation, not the stranded old one
+  });
+
+  // The F13 regressions: `reconfigure()` runs on EVERY save, so an unconditional swap would
+  // discard a valid capability result — and its 15-minute stale budget — on each of these, and
+  // would silently replace live client instances for no reason. One row per non-narratorr write
+  // path. `generation` is exactly the "no silent rebuild" assertion: `set()` is the holder's only
+  // writer and always bumps, so an unchanged generation means the SAME client instances.
+  describe('does NOT swap on a save that cannot change the connection', () => {
+    it.each([
+      ['ebooksEnabled only', () => putConnectors({ ebooksEnabled: true })],
+      ['defaultQuota only', () => putConnectors({ defaultQuota: { mode: 'limited', limit: 3, windowDays: 7 } })],
+      ['publicUrl only', () => putConnectors({ publicUrl: 'https://app.example.com' })],
+    ])('%s', async (_label, save) => {
+      await primeCachedCapability();
+      const before = narratorr.generation;
+      expect((await save()).statusCode).toBe(200);
+      expect(narratorr.generation).toBe(before);
+      // The cached value — and its stale budget — survives.
+      expect((await readFeatures()).json().ebooksEnabled).toBe(true);
+      expect(capability.calls).toBe(1);
+    });
+
+    it('kindleSender only', async () => {
+      await primeCachedCapability();
+      const before = narratorr.generation;
+      const nf = (await createNotifier(emailCreate('bot@ex.com'))).json();
+      // (notifier CREATE also ran reconfigure() — assert across both writes)
+      expect((await putConnectors({ kindleSender: { notifierId: nf.id } })).statusCode).toBe(200);
+      expect(narratorr.generation).toBe(before);
+      expect((await readFeatures()).json().kindleSenderEmail).toBe('bot@ex.com');
+      expect(capability.calls).toBe(1);
+    });
+
+    it.each([
+      ['notifier create', async () => (await createNotifier(ntfyCreate())).statusCode],
+      [
+        'notifier update',
+        async () => {
+          const nf = (await createNotifier(ntfyCreate())).json();
+          const res = await app.inject({
+            method: 'PUT',
+            url: `${NOTIFIERS_URL}/${nf.id}`,
+            headers: asAdmin,
+            payload: ntfyCreate({ name: 'Renamed' }),
+          });
+          return res.statusCode;
+        },
+      ],
+      [
+        'notifier delete',
+        async () => {
+          const nf = (await createNotifier(ntfyCreate())).json();
+          const res = await app.inject({ method: 'DELETE', url: `${NOTIFIERS_URL}/${nf.id}`, headers: asAdmin });
+          return res.statusCode;
+        },
+      ],
+    ])('%s', async (_label, save) => {
+      await primeCachedCapability();
+      const before = narratorr.generation;
+      expect(await save()).toBe(200);
+      expect(narratorr.generation).toBe(before);
+      expect((await readFeatures()).json().ebooksEnabled).toBe(true);
+      expect(capability.calls).toBe(1);
+    });
   });
 });

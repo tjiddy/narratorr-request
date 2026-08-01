@@ -1,12 +1,13 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { and, eq } from 'drizzle-orm';
 import { RequestService, sanitizeAutoApproveRoles, type RequestPolicy, type RequestFailureNotifyDeps } from './request.service.js';
-import { NarratorrError, type INarratorrClient } from './narratorr-client.js';
+import { NarratorrError, type IBookHandoffClient } from './narratorr-client.js';
 import { UserService } from './user.service.js';
 import type { Notifier, NotificationPayload } from './notifications/index.js';
 import type { NotifierLogger } from './notifications/types.js';
 import type { RequesterEmailArgs, RequesterEmailSender, RequesterEmailOutcome } from './notifications/requester-email.js';
-import { createTestDb, insertUser } from '../test-support/db.js';
+import { createTestDb, drizzleConstraintError, insertUser } from '../test-support/db.js';
+import { isUniqueViolation } from '../util/db.js';
 import { requests, users } from '../../db/schema.js';
 import type { NotifiableTransition } from '../../shared/schemas/user.js';
 import type { Db } from '../../db/client.js';
@@ -16,7 +17,7 @@ import type { BookStatus } from '../../shared/schemas/book.js';
 import type { CreateRequestBody, RequestStatus } from '../../shared/schemas/request.js';
 
 /** Configurable fake — controls the book status the handoff/poll observes. */
-class FakeClient implements INarratorrClient {
+class FakeClient implements IBookHandoffClient {
   status: BookStatus = 'searching';
   throwOnAdd: Error | null = null;
   added: string[] = [];
@@ -225,8 +226,8 @@ describe('insert-time unique-violation race', () => {
   // so a pre-seeded duplicate alone only retests preflight dedupe and never reaches the
   // catch at insertRequest():225-232. Simulate the race window explicitly: drive the DB
   // read seam (db.query.requests.findFirst) so preflight MISSES and the catch re-query
-  // HITS, and make the insert throw the unique violation. (:memory: libSQL breaks across
-  // db.transaction() per CLAUDE.md, so a spy is preferred over real concurrency.)
+  // HITS, and let the REAL insert trip the partial unique index. (:memory: libSQL breaks
+  // across db.transaction() per CLAUDE.md, so a read spy is preferred over real concurrency.)
   afterEach(() => {
     vi.restoreAllMocks();
   });
@@ -245,14 +246,13 @@ describe('insert-time unique-violation race', () => {
       .values({ publicId: 'rq_dupe', userId: admin.id, asin: 'B1', title: 't', status: 'approved' })
       .returning();
 
-    // Preflight (create():154) misses; catch re-query (insertRequest():228) hits the seed.
+    // ONLY the read seam is stubbed: preflight (create():154) misses, catch re-query
+    // (insertRequest():228) hits the seed. The insert stays REAL, so idx_requests_user_asin_active
+    // raises an actual drizzle error — the classifier is proven against the driver's shape
+    // (constraint text on `cause`, not on the wrapper message), not a synthetic string.
     vi.spyOn(db.query.requests, 'findFirst')
       .mockResolvedValueOnce(undefined)
       .mockResolvedValueOnce(seeded);
-    // The insert trips the partial unique index between preflight and write.
-    vi.spyOn(db, 'insert').mockImplementation(() => {
-      throw new Error('UNIQUE constraint failed: requests.user_id, requests.asin');
-    });
 
     const svc = new RequestService(db, client, policy());
     const { row, created } = await svc.create(admin.id, body('B1'));
@@ -272,18 +272,53 @@ describe('insert-time unique-violation race', () => {
     expect(rows).toHaveLength(1);
   });
 
-  it('re-throws the original error when the catch re-query finds no duplicate (no silent null)', async () => {
+  it('re-throws the ORIGINAL error object when the catch re-query finds no duplicate (no silent null)', async () => {
     const user = await insertUser(db, { role: 'user' });
     // Both preflight and catch re-query miss; the unique violation must surface unchanged.
-    vi.spyOn(db.query.requests, 'findFirst')
+    // Identity-checked with toBe against a drizzle-shaped sentinel from the shared factory: a
+    // re-wrap carrying the same message would pass a message-only assertion while dropping the
+    // driver's cause chain. The `rawCode: 2067` is what makes the sentinel actually MATCH the
+    // classifier — without it the test would assert a re-throw that never entered the catch.
+    const original = drizzleConstraintError({
+      rawCode: 2067,
+      code: 'SQLITE_CONSTRAINT_UNIQUE',
+      driverMessage: 'UNIQUE constraint failed: requests.user_id, requests.asin',
+    });
+    expect(isUniqueViolation(original)).toBe(true); // the sentinel really does enter the catch
+    const findFirst = vi
+      .spyOn(db.query.requests, 'findFirst')
       .mockResolvedValueOnce(undefined)
       .mockResolvedValueOnce(undefined);
     vi.spyOn(db, 'insert').mockImplementation(() => {
-      throw new Error('UNIQUE constraint failed: requests.user_id, requests.asin');
+      throw original;
     });
 
     const svc = new RequestService(db, client, policy());
-    await expect(svc.create(user.id, body('B1'))).rejects.toThrow('UNIQUE constraint failed');
+    await expect(svc.create(user.id, body('B1'))).rejects.toBe(original);
+    // Preflight + the catch's re-query: the second call proves the fallthrough path ran.
+    expect(findFirst).toHaveBeenCalledTimes(2);
+  });
+
+  it('surfaces a NON-UNIQUE constraint breach directly — no catch re-query at all', async () => {
+    const user = await insertUser(db, { role: 'user' });
+    // A CHECK breach used to match the broad `SQLITE_CONSTRAINT` arm and route into the
+    // re-query path; it now surfaces at once.
+    const original = drizzleConstraintError({
+      rawCode: 275,
+      code: 'SQLITE_CONSTRAINT_CHECK',
+      driverMessage: 'CHECK constraint failed: requests_status',
+    });
+    // The read seam is SHARED between the mandatory preflight (create():263) and the catch
+    // re-query (insertRequest():342), so exactly ONE call means the preflight ran and the
+    // catch did not. The users lookup at :259 is a different query object and does not count.
+    const findFirst = vi.spyOn(db.query.requests, 'findFirst').mockResolvedValue(undefined);
+    vi.spyOn(db, 'insert').mockImplementation(() => {
+      throw original;
+    });
+
+    const svc = new RequestService(db, client, policy());
+    await expect(svc.create(user.id, body('B1'))).rejects.toBe(original);
+    expect(findFirst).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -472,9 +507,15 @@ describe('admin decisions + handoff', () => {
     expect(row?.status).toBe('failed');
   });
 
-  it('leaves a request `approved` on a TRANSIENT handoff error (5xx) for the poller to retry', async () => {
+  // Terminality is keyed on `upstreamStatus` (400/409/422), never on the code — so #213's new
+  // status-0 `TIMEOUT` stays transient exactly like the 5xx and the status-0 NETWORK it split from.
+  it.each([
+    ['5xx', () => new NarratorrError(502, 'UPSTREAM', 'down')],
+    ['status-0 NETWORK', () => new NarratorrError(0, 'NETWORK', 'unreachable')],
+    ['status-0 TIMEOUT', () => new NarratorrError(0, 'TIMEOUT', 'timed out')],
+  ])('leaves a request `approved` on a TRANSIENT handoff error (%s) for the poller to retry', async (_label, err) => {
     const admin = await insertUser(db, { role: 'admin' });
-    client.throwOnAdd = new NarratorrError(502, 'UPSTREAM', 'down');
+    client.throwOnAdd = err();
     const svc = new RequestService(db, client, policy());
     await expect(svc.create(admin.id, body('B1'))).rejects.toBeInstanceOf(NarratorrError);
     const [row] = await db.select().from(requests).where(eq(requests.asin, 'B1'));
@@ -630,6 +671,21 @@ describe('handoff failure reasons (friendly per-code add-handoff errors)', () =>
     const [row] = await db.select().from(requests).where(eq(requests.asin, 'B1'));
     expect(row?.status).toBe('failed');
     expect(row?.failureReason).toBe('some_new_code: a brand new reason');
+  });
+
+  it('persists the NON_JSON fallback copy for a BODILESS terminal add failure (#171)', async () => {
+    // Since #171 a bodiless non-2xx classifies as NON_JSON rather than HTTP_<status>, so this
+    // row's copy changed. It is pinned here so it can never drift silently again: the terminal
+    // classification keys on `upstreamStatus` (422), which the change preserves, and
+    // `handoffFailureReason()` deliberately gains no NON_JSON special case — both strings are
+    // the same raw-code fallback for a response narratorr is not supposed to produce.
+    const admin = await insertUser(db, { role: 'admin' });
+    client.throwOnAdd = new NarratorrError(422, 'NON_JSON', 'Narratorr POST /api/v1/books returned an empty body');
+    const svc = new RequestService(db, client, policy());
+    await expect(svc.create(admin.id, body('B1'))).rejects.toBeInstanceOf(NarratorrError);
+    const [row] = await db.select().from(requests).where(eq(requests.asin, 'B1'));
+    expect(row?.status).toBe('failed');
+    expect(row?.failureReason).toBe('NON_JSON: Narratorr POST /api/v1/books returned an empty body');
   });
 
   it('uses the generic fallback reason for a non-NarratorrError terminal throw', async () => {
@@ -930,6 +986,26 @@ describe('toDto', () => {
     await expect(svc.create(admin.id, body('B2'))).rejects.toBeInstanceOf(NarratorrError);
     const [failed] = await db.select().from(requests).where(eq(requests.asin, 'B2'));
     expect(svc.toDto(failed!, requester).failureReason).toBe("This edition is excluded by the library's filters.");
+  });
+
+  it('always emits companionEbook: null — including on an available row with a real book id', async () => {
+    // Issue #147: the field is TRANSIENT read-time decoration owned by CompanionEbookService,
+    // which only the caller's own list runs. The mapper setting it unconditionally is what keeps
+    // every other caller — the detail route, both mutation responses and both admin lists —
+    // serializing against the required-nullable response schema.
+    const admin = await insertUser(db, { role: 'admin' });
+    const svc = new RequestService(db, client, policy());
+
+    const { row: pending } = await svc.create(admin.id, body('B1'));
+    expect(svc.toDto(pending, requester).companionEbook).toBeNull();
+
+    // The row shape enrichment WOULD target (available + a narratorr book id) still maps to null
+    // here, so a mapper that started sourcing the field itself fails this receipt.
+    client.status = 'imported';
+    const { row: available } = await svc.create(admin.id, body('B2'));
+    expect(available.status).toBe('available');
+    expect(available.narratorrBookId).not.toBeNull();
+    expect(svc.toDto(available, requester).companionEbook).toBeNull();
   });
 });
 

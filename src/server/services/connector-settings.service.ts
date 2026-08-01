@@ -3,6 +3,13 @@ import { z } from 'zod';
 import type { Db } from '../../db/client.js';
 import { appSettings, users } from '../../db/schema.js';
 import { selectEmailSource } from './notifications/requester-email.js';
+import {
+  confirmSenderMailbox,
+  resolveKindleSender,
+  resolveKindleSenderTransport,
+  KINDLE_SENDER_INVALID_MESSAGE,
+  type KindleSenderResolution,
+} from './notifications/kindle-sender.js';
 import { notificationEventSchema, type NotificationEvent } from '../../shared/notification-events.js';
 import { quotaWindowDaysSchema, storedConnectorsSchema } from '../../shared/schemas/connectors.js';
 import { hasNotifyOn } from '../../shared/schemas/user.js';
@@ -17,6 +24,7 @@ import type {
   UpdateNotifierBody,
   NotifierTestBody,
   DefaultQuota,
+  ResolvedKindleSender,
 } from '../../shared/schemas/connectors.js';
 import {
   NOTIFIER_REGISTRY,
@@ -35,6 +43,7 @@ const EMPTY: StoredConnectors = {
   publicUrl: null,
   narratorr: null,
   notifiers: [],
+  kindleSender: null,
 };
 
 /** Minimal structural logger (Fastify's pino logger satisfies it). */
@@ -96,7 +105,13 @@ export class ConnectorSettingsService {
       );
       return { ...EMPTY };
     }
-    return parsed.data as unknown as StoredConnectors;
+    // `kindleSender` is `.optional()` at the schema layer so a PRE-FEATURE blob (no key at all)
+    // stays a normal, warn-free read; normalize the resulting `undefined` to `null` here so every
+    // reader sees exactly one shape (`exactOptionalPropertyTypes` forbids assigning `: undefined`).
+    return {
+      ...(parsed.data as unknown as StoredConnectors),
+      kindleSender: parsed.data.kindleSender ?? null,
+    };
   }
 
   /**
@@ -228,6 +243,54 @@ export class ConnectorSettingsService {
       notifiers: c.notifiers.map((n) => this.toNotifierDto(n)),
       defaultQuota: this.sanitizeQuota(row),
       requesterEmailWarning: await this.computeRequesterEmailWarning(c),
+      // Resolved at READ time against the live decrypted notifiers (no cross-write coordination:
+      // notifier CRUD never touches the stored pair — see resolveKindleSender in kindle-sender.ts).
+      kindleSender: resolveKindleSender(c.kindleSender, c.notifiers.map((n) => this.toRuntimeNotifier(n))),
+      // Off the row we already fetched (issue #144) — a column, not the blob, so a degraded
+      // envelope read can't flip it. `?? false` covers a row shape older than the column.
+      ebooksEnabled: row?.ebooksEnabled ?? false,
+    };
+  }
+
+  /**
+   * The NARROW read `/api/features` needs (issue #144): the companion-ebook opt-in plus the
+   * resolved Kindle sender, off ONE row read.
+   *
+   * Deliberately not `getDto()`: that endpoint is polled by every active client, and `getDto()`
+   * also computes `requesterEmailWarning`, which sweeps the `users` table. This accessor does the
+   * same single SELECT and reuses the same read-time sender resolution, so the two surfaces can
+   * never disagree about a sender's status.
+   */
+  async getEbookSettings(): Promise<{ ebooksEnabled: boolean; kindleSender: ResolvedKindleSender | null }> {
+    const row = await this.db.query.appSettings.findFirst({ where: eq(appSettings.id, SINGLETON_ID) });
+    const c = this.connectorsFrom(row);
+    return {
+      ebooksEnabled: row?.ebooksEnabled ?? false,
+      kindleSender: resolveKindleSender(c.kindleSender, c.notifiers.map((n) => this.toRuntimeNotifier(n))),
+    };
+  }
+
+  /**
+   * The Send-to-Kindle path's ONE settings seam (issue #148): the resolved sender AND the SELECTED
+   * notifier's transport config, both derived from a SINGLE decrypted snapshot of the singleton row.
+   *
+   * Composing `getEbookSettings()` with `getNotificationsConfig()` is NOT acceptable and this
+   * accessor exists to make that unrepresentable: each of those performs its own
+   * `appSettings.findFirst`, settings reads deliberately do not take the write mutex, and an admin
+   * switching sender A→B between the two reads would resolve stale selection A against the new
+   * notifier list and send as A — missing every household member's Amazon allowlist. What must be
+   * atomic is SELECTION ↔ TRANSPORT CONFIG, and one read is what makes it so.
+   *
+   * It deliberately does NOT return `ebooksEnabled`. The route's `resolveFeatures()` gate is
+   * authoritative for the feature flag, so a second copy here would be a field with no defined
+   * consumer semantics — there is no useful answer to "what does the service do when the snapshot
+   * flag disagrees with the gate that already admitted the request?". One gate, in one place.
+   */
+  async getKindleSendSettings(): Promise<{ sender: KindleSenderResolution }> {
+    const row = await this.db.query.appSettings.findFirst({ where: eq(appSettings.id, SINGLETON_ID) });
+    const c = this.connectorsFrom(row);
+    return {
+      sender: resolveKindleSenderTransport(c.kindleSender, c.notifiers.map((n) => this.toRuntimeNotifier(n))),
     };
   }
 
@@ -274,9 +337,11 @@ export class ConnectorSettingsService {
     const cur = await this.getStored();
     const next: StoredConnectors = { ...cur };
 
-    const hasConnectorFields = body.publicUrl !== undefined || body.narratorr !== undefined;
+    const hasConnectorFields =
+      body.publicUrl !== undefined || body.narratorr !== undefined || body.kindleSender !== undefined;
     if (body.publicUrl !== undefined) next.publicUrl = body.publicUrl;
     if (body.narratorr !== undefined) next.narratorr = this.resolveNarratorr(body.narratorr, cur.narratorr);
+    if (body.kindleSender !== undefined) next.kindleSender = this.resolveKindleSender(body.kindleSender, cur);
 
     const q = body.defaultQuota;
     const [row] = await this.db
@@ -288,6 +353,10 @@ export class ConnectorSettingsService {
           defaultQuotaLimit: q.mode === 'limited' ? q.limit : null,
           defaultQuotaWindowDays: q.windowDays,
         }),
+        // Issue #144 — omit-to-keep, branched on `!== undefined` and NEVER on truthiness: an
+        // explicit `false` is a real write (turning the feature back off), not a no-op. Rides the
+        // same single atomic UPDATE as the quota columns.
+        ...(body.ebooksEnabled !== undefined && { ebooksEnabled: body.ebooksEnabled }),
         updatedAt: new Date(),
       })
       .where(eq(appSettings.id, SINGLETON_ID))
@@ -547,6 +616,30 @@ export class ConnectorSettingsService {
     const apiKey = this.resolveSecret(body.apiKey, cur?.apiKey);
     if (!apiKey) throw badRequest('NARRATORR_KEY_REQUIRED', 'Narratorr requires an API key.');
     return { url: body.url, apiKey };
+  }
+
+  /**
+   * Resolve a Kindle-sender selection (issue #143) into the stored pair. The body carries ONLY the
+   * notifier id; `confirmedFrom` is DERIVED here from that notifier's live `from`, so the
+   * confirmation can never be spoofed by a client and re-sending an unchanged id is a meaningful
+   * write (the reconfirm out of `sender-changed`). Runs BEFORE the single UPDATE — like
+   * `resolveNarratorr` — so a rejected selection leaves the whole row (connector blob AND the
+   * quota columns) untouched, even in a mixed body. A selection that can't be confirmed is a
+   * `400 KINDLE_SENDER_INVALID` with a CASE-SPECIFIC message; there is deliberately no
+   * fall-through to another email notifier.
+   */
+  private resolveKindleSender(
+    body: NonNullable<UpdateConnectorSettingsBody['kindleSender']> | null,
+    cur: StoredConnectors,
+  ): StoredConnectors['kindleSender'] {
+    if (body === null) return null;
+    // Confirm against the DECRYPTED runtime notifiers — the same view the read-time resolver and
+    // the send path use, so a write can't succeed into a state `getDto()` would call invalid.
+    const confirmation = confirmSenderMailbox(body.notifierId, cur.notifiers.map((n) => this.toRuntimeNotifier(n)));
+    if ('failure' in confirmation) {
+      throw badRequest('KINDLE_SENDER_INVALID', KINDLE_SENDER_INVALID_MESSAGE[confirmation.failure]);
+    }
+    return { notifierId: body.notifierId, confirmedFrom: confirmation.mailbox };
   }
 
   /**

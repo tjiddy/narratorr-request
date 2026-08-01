@@ -108,7 +108,7 @@ function buildOne(nf: RuntimeNotifier, log: NotifierLogger): NotificationChannel
   let inner: NotificationChannel | null;
   try {
     inner = buildNotifierChannel(nf.type, nf.config);
-  } catch (err) {
+  } catch (err: unknown) {
     // A bad/undecryptable runtime config must not brick the whole dispatcher — skip it.
     log.warn({ notifier: nf.id, type: nf.type, err }, 'notifier could not be built — skipping');
     return null;
@@ -140,6 +140,7 @@ export { NOTIFIER_TYPES };
 export { Notifier } from './notifier.service.js';
 export { render } from './render.js';
 export { redact } from './redact.js';
+export { describeSendFailure } from './describe-send-failure.js';
 export type {
   NotificationEvent,
   NotificationPayload,

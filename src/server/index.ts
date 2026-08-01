@@ -5,7 +5,6 @@ import cors from '@fastify/cors';
 import cookie from '@fastify/cookie';
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
-import fastifyStatic from '@fastify/static';
 import { serializerCompiler, validatorCompiler, type ZodTypeProvider } from 'fastify-type-provider-zod';
 import { config, APP_ROOT } from './config.js';
 import { runMigrations } from '../db/migrate.js';
@@ -14,20 +13,23 @@ import { UserService } from './services/user.service.js';
 import { SettingsService } from './services/settings.service.js';
 import { RequestService, resolveRequestPolicy, sanitizeAutoApproveRoles } from './services/request.service.js';
 import { SearchService } from './services/search.service.js';
+import { CompanionEbookService } from './services/companion-ebook.service.js';
+import { KindleSendService } from './services/kindle-send.service.js';
+import { buildKindleTransport } from './services/kindle-send.transport.js';
 import { StatusPoller } from './services/status-poller.js';
-import { NarratorrClient } from './services/narratorr-client.js';
+import { buildNarratorrConnection } from './services/narratorr-clients.js';
 import { OidcService, makeOidcMapper, type OidcProfile } from './services/oidc.service.js';
 import { buildNotifier } from './services/notifications/index.js';
 import { RequesterEmailService } from './services/notifications/requester-email.js';
 import { ConnectorSettingsService } from './services/connector-settings.service.js';
-import { NarratorrClientHolder } from './services/narratorr-client-holder.js';
 import { SecretCodec, deriveSettingsKey } from './util/secret-codec.js';
 import { errorHandlerPlugin } from './plugins/error-handler.js';
 import { authRateLimitOptions } from './plugins/rate-limit.js';
 import { authPlugin } from './plugins/auth.js';
 import { buildHelmetOptions } from './plugins/helmet-options.js';
 import { registerRoutes } from './routes/index.js';
-import { errorBody } from '../shared/schemas/v1/common.js';
+import { registerClientSurface } from './routes/client-surface.js';
+import { startServing } from './boot.js';
 import type { AppDeps } from './services/deps.js';
 import './types.js';
 
@@ -56,10 +58,10 @@ async function main(): Promise<void> {
   // makes calls fail cleanly until the admin sets it, and saving rebuilds it live.
   const codec = new SecretCodec(deriveSettingsKey({ settingsKey: config.settingsKey, sessionSecret: config.sessionSecret }));
   const connectorSettings = new ConnectorSettingsService(db, codec, app.log);
-  const narratorrCfg = await connectorSettings.getNarratorrConfig();
-  const narratorr = new NarratorrClientHolder(
-    narratorrCfg ? new NarratorrClient({ baseUrl: narratorrCfg.url, apiKey: narratorrCfg.apiKey }) : null,
-  );
+  // One seam builds the whole graph — the client pair, the holder that owns it, and the capability
+  // resolver keyed to that holder's generation. `main()` runs on import, so this file can't be
+  // executed by a test; the seam is what makes those wiring invariants assertable.
+  const { narratorr, features } = buildNarratorrConnection(await connectorSettings.getNarratorrConfig());
   // Surface the unconfigured state at WARN so it survives the prod log level (info is
   // filtered in production) — the on-call breadcrumb for "search/requests don't work".
   if (!narratorr.configured) {
@@ -86,6 +88,24 @@ async function main(): Promise<void> {
     { getNotifier: () => deps.notifier, users, requesterEmail, logger: app.log },
   );
   const search = new SearchService(narratorr);
+  // Read-time companion enrichment for `GET /api/requests` (issue #147). Reads the same swappable
+  // holder for both its lookups and its cache generation, and the same feature inputs the
+  // `/api/features` route and the download proxy resolve through — so all three agree by
+  // construction and a connection swap retires the previous server's cached companions.
+  const companionEbooks = new CompanionEbookService(narratorr, narratorr, { connectorSettings, features }, app.log);
+  // Send-to-Kindle (issue #148). Narrow seams only: the same swappable holder for the raw EPUB
+  // stream, the SAME companion accessor the list enrichment uses (one cache, one in-flight slot,
+  // one generation rule), and the atomic Kindle settings snapshot. It deliberately takes NO feature
+  // deps — the route's `resolveFeatures()` is the single authoritative gate, so injecting them here
+  // would be a second, undefined feature-admission path.
+  const kindleSends = new KindleSendService({
+    db,
+    narratorr,
+    companions: companionEbooks,
+    settings: connectorSettings,
+    transport: buildKindleTransport,
+    logger: app.log,
+  });
   // One OidcService per configured provider, keyed by id. Authorization is the approval
   // queue (no per-provider gate), so the mapped profile flows straight to upsertFromOidc.
   const oidc = new Map<string, { service: OidcService<OidcProfile>; config: (typeof config.oidcProviders)[number] }>();
@@ -109,6 +129,9 @@ async function main(): Promise<void> {
     search,
     connectorSettings,
     narratorr,
+    features,
+    companionEbooks,
+    kindleSends,
     notifier,
     oidc,
   };
@@ -135,21 +158,18 @@ async function main(): Promise<void> {
 
   registerRoutes(app, deps);
 
-  if (serveClient) {
-    await app.register(fastifyStatic, { root: clientDir, wildcard: false });
-    app.setNotFoundHandler((request, reply) => {
-      if (request.method === 'GET' && !request.url.startsWith('/api/')) {
-        return reply.sendFile('index.html');
-      }
-      return reply.status(404).send(errorBody('NOT_FOUND', `Route ${request.method} ${request.url} not found`));
-    });
-  } else {
-    app.setNotFoundHandler((request, reply) =>
-      reply.status(404).send(errorBody('NOT_FOUND', `Route ${request.method} ${request.url} not found`)),
-    );
-  }
+  // One seam for the SPA mount + the 404 handler (issue #146 AC35). Extracted so it is reachable
+  // from a test — `main()` runs on import, so a wiring line left here is one no receipt can
+  // protect — and shared with the route-test harness, so the two cannot drift.
+  await registerClientSurface(app, { serveClient, clientDir });
 
-  await app.listen({ port: config.port, host: config.bindHost });
+  // Sweep, THEN listen — the ordering is the point, and it lives in a seam so a test can assert it
+  // (this file runs `main()` on import). The boot sweep is global across all users, which is only
+  // safe because nothing is in flight yet.
+  await startServing({
+    sweepKindleLeases: () => kindleSends.sweepExpiredLeasesAtBoot(),
+    listen: () => app.listen({ port: config.port, host: config.bindHost }),
+  });
   app.log.info(
     `narratorr-requests on :${config.port} (auth=${config.authMode}, narratorr=${narratorr.configured ? 'configured' : 'unconfigured'})`,
   );

@@ -1,24 +1,43 @@
 import { defineConfig } from 'vitest/config';
 import path from 'node:path';
 
-// Single node project for MVP — unit tests live in server/shared/db plus pure
-// client logic helpers (*.test.ts under src/client; no DOM needed). A jsdom client
-// project can be added later for React component tests (*.test.tsx).
+// Two projects, split by file extension (the globs are disjoint — no file runs twice):
+//   node   — server/shared/db plus pure client logic helpers (*.test.ts, no DOM).
+//   client — React component/interaction tests (*.test.tsx) under jsdom.
+// `extends: true` on each project is load-bearing: project entries are their own Vite configs
+// and would not inherit the root `resolve.alias` (@ / @shared) without it.
+// Coverage stays at the root `test` level — it is global in Vitest 4, not a per-project option.
 export default defineConfig({
   resolve: {
     alias: {
-      '@': path.resolve(__dirname, 'src/client'),
-      '@shared': path.resolve(__dirname, 'src/shared'),
+      '@': path.resolve(import.meta.dirname, 'src/client'),
+      '@shared': path.resolve(import.meta.dirname, 'src/shared'),
     },
   },
   test: {
-    environment: 'node',
-    include: ['src/{server,shared,db,client}/**/*.test.ts'],
+    projects: [
+      {
+        extends: true,
+        test: {
+          name: 'node',
+          environment: 'node',
+          include: ['src/{server,shared,db,client}/**/*.test.ts'],
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: 'client',
+          environment: 'jsdom',
+          include: ['src/client/**/*.test.tsx'],
+          setupFiles: ['src/client/test/setup.ts'],
+        },
+      },
+    ],
     coverage: {
       provider: 'v8',
       reportsDirectory: 'coverage',
-      // Components (.tsx) have no jsdom project yet; client pure-logic .ts files ARE covered.
-      exclude: ['src/server/index.ts', 'src/client/**/*.tsx'],
+      exclude: ['src/server/index.ts'],
     },
   },
 });

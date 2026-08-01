@@ -25,6 +25,11 @@ beforeEach(async () => {
       a.get('/boom/network', async () => {
         throw new NarratorrError(0, 'NETWORK', RAW_UPSTREAM);
       });
+      a.get('/boom/timeout', async () => {
+        // #213 split the status-0 class; only NOT_CONFIGURED is special-cased here, so the new
+        // code must take the same generic scrub path as NETWORK.
+        throw new NarratorrError(0, 'TIMEOUT', RAW_UPSTREAM);
+      });
       a.get('/boom/service-unavailable', async () => {
         // A 503-status ApiError must STAY 503 through the scrub path (not collapse to 502).
         throw new ApiError(503, 'DEP_DOWN', 'raw 503 detail that must not leak');
@@ -66,15 +71,18 @@ describe('error-handler — 5xx scrub (security) + status/code mapping', () => {
     expect(error.message).not.toBe(SCRUB);
   });
 
-  it('generic 5xx NarratorrError → 502, code preserved, message scrubbed, raw upstream detail absent', async () => {
-    const res = await get('/boom/network');
-    expect(res.statusCode).toBe(502);
-    const { error } = res.json();
-    expect(error.code).toBe('NARRATORR_UPSTREAM');
-    expect(error.message).toBe(SCRUB);
-    // The security property under test: the raw upstream string never reaches the browser.
-    expect(res.body).not.toContain(RAW_UPSTREAM);
-  });
+  it.each(['/boom/network', '/boom/timeout'])(
+    'generic 5xx NarratorrError (%s) → 502, code preserved, message scrubbed, raw upstream detail absent',
+    async (url) => {
+      const res = await get(url);
+      expect(res.statusCode).toBe(502);
+      const { error } = res.json();
+      expect(error.code).toBe('NARRATORR_UPSTREAM');
+      expect(error.message).toBe(SCRUB);
+      // The security property under test: the raw upstream string never reaches the browser.
+      expect(res.body).not.toContain(RAW_UPSTREAM);
+    },
+  );
 
   it('a 503-status ApiError stays 503 (not collapsed to 502) and is scrubbed', async () => {
     const res = await get('/boom/service-unavailable');

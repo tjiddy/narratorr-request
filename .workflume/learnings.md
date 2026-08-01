@@ -17,22 +17,24 @@ to, so the relevant lesson can be surfaced when that area is next touched.
 Frontend regression risk lives in **payload / decision logic** (mutation request bodies,
 parse-and-guard, sort/format, conditional defaults) — not in rendering. Extract that logic
 into pure functions with co-located `.test.ts` coverage. This repo already follows the
-pattern: `build*` / `init*` payload helpers in `src/client/pages/settings-channels.ts` and
-`settings-narratorr.ts`, mutation lifecycle in `hooks.test.ts`.
+pattern: `build*` / `init*` payload helpers in `src/client/pages/settings-narratorr.ts`,
+`settings-fields.ts`, `settings-notifiers.ts`, `settings-default-quota.ts`, mutation
+lifecycle in `hooks.test.ts`.
 
-The repo deliberately has **no** jsdom / `@testing-library/react` / `user-event` modality
-(vitest is a single node project, `.test.ts`-only glob). That is the **intended
-architecture**, not a coverage gap. A typed mutation payload is already guarded by typecheck
-+ the server's Zod validation (a malformed body 400s, it doesn't silently corrupt), so a
+(Updated 2026-07-30 — the original "the repo deliberately has no jsdom modality, single node
+project" claim is obsolete: vitest now runs TWO projects, `node` (`.test.ts`) and a jsdom
+`client` project (`.test.tsx`, RTL + jest-dom, explicit cleanup in `src/client/test/setup.ts`).)
+The division of labor survived the modality and is now doctrine (CLAUDE.md Testing): jsdom is
+for genuine **DOM-only** behavior — conditional rendering, focus/keyboard, multi-step
+side-effect orchestration, cache-state convergence ([[react-query-mock-hides-cache-convergence]])
+— and is NOT a license to test payload/parse/decision logic through the DOM. That logic still
+belongs in extracted pure helpers: a typed mutation payload is already guarded by typecheck +
+the server's Zod validation (a malformed body 400s, it doesn't silently corrupt), so a
 behavior-preserving extraction can't silently drop a payload past those gates.
 
-Reach for jsdom only when a feature has genuine **DOM-only** logic that can't be a pure
-function: complex conditional rendering, focus/keyboard handling, or multi-step side-effect
-orchestration (e.g. a logout flow chaining clear → navigate → reload with an error path).
-When an auto-filed finding says "no component-test modality," first triage what decision
-logic is **already pure-testable / pure-tested** — usually the high-value part is covered and
-standing up the whole harness is belt-and-suspenders. Prefer extracting one more pure helper
-over adding a test modality.
+When an auto-filed finding proposes a component test, first triage what decision logic is
+**already pure-testable / pure-tested** — usually the high-value part is covered. Prefer
+extracting one more pure helper over routing logic assertions through the jsdom project.
 
 ## triage-autofiled-debt-by-proportionality
 
@@ -109,3 +111,449 @@ instead, e.g. `(mode='x') = (n IS NOT NULL) AND (n IS NULL OR n > 0)` — the `=
 sub-expressions can never be NULL. Verify every corner against an in-memory libSQL DB applying the
 generated migration, since drizzle renders the JS `check()` SQL verbatim. Seen on the
 `request_quota` / `default_quota` mode↔limit constraints in `src/db/schema.ts` (#81).
+
+## zod-nested-catch-containment
+
+**source:** #140  
+**added:** 2026-07-28  
+**files:** src/shared/schemas/v1/metadata.ts  
+**tags:** zod-v4, vendored-contract, schema-leniency, catch
+
+---
+
+Zod's `.catch(fallback)` on an object recovers the WHOLE object, never one member. When you add a new member to a vendored object that already carries `.catch(undefined)` — e.g. `v1AudibleResultSchema.library` in `src/shared/schemas/v1/metadata.ts` — the existing outer catch does NOT protect its siblings from the new member: any drift on the new field fails the whole object, the outer catch swallows it, and every consumer of the parent silently degrades. For `library` that means `resolveBookCardState` (`src/client/components/book-card-state.ts`) loses the 'In library' / 'On the way' badge for every search result, with no error and no log line.
+
+Rule: every drift-prone member added inside a `.catch()`-guarded vendored object gets its OWN inner catch — `member: memberSchema.nullable().optional().catch(undefined)`. The inner catch confines drift to that member.
+
+This matters most where the guarded schema is load-bearing rather than decorative: `v1BookSchema` (`./books.ts`) backs `addBook()` and the poller's `getBook()`, so an uncaught drift there is a `502 CONTRACT_MISMATCH` that strands a request at `acquiring` indefinitely.
+
+Testing it: a containment test must assert the SIBLINGS survive, not just that the new field is undefined — the latter passes vacuously before the field is even declared, because non-`.strict()` schemas strip unknown keys. See 'confines companion drift to the companion field' in `src/shared/schemas/v1/metadata.test.ts`, which drives three drift shapes (wrong literal value, garbage scalar, missing required member) and asserts `bookId`/`status` intact. Confirm it is a genuine red by deleting the inner `.catch(undefined)` and rerunning.
+
+## nonstrict-response-schema-masks-mapper-leak
+
+**source:** #142  
+**added:** 2026-07-28  
+**files:** src/server/services/user.service.ts  
+**tags:** zod, fastify-type-provider-zod, dto-mapper, pii-exposure, test-design
+
+---
+
+A field-exposure test asserted at the ROUTE BOUNDARY cannot detect a leaking DTO mapper. `userDtoSchema` (src/shared/schemas/user.ts) is a non-`.strict()` `z.object`, and fastify-type-provider-zod's serializerCompiler parses handler return values through it — Zod strips unknown keys by default. So if `UserService.toDto` (src/server/services/user.service.ts) grows a self-scoped key, `GET /api/admin/users` and `PATCH /api/admin/users/:publicId` bodies are byte-identical and every `expect(res.payload).not.toContain(secret)` assertion stays green.
+
+Whenever a column is 'self-scoped only' (on `MeDto`, not on the admin `UserDto`), pin non-exposure with a DIRECT assertion on the mapper:
+
+    const row = await h.users.getById(seeded.id);
+    expect(row?.kindleEmail).toBe(KINDLE);      // the source genuinely has it
+    expect('kindleEmail' in h.users.toDto(row!)).toBe(false);
+
+Keep the route-body assertions too (they catch a leak via any other path), but the mapper assertion is the load-bearing one. Existing examples: the `passwordHash` pair and the `kindleEmail` trio in `src/server/routes/admin.route.test.ts`. Verified in #142 by mutation-testing: adding `kindleEmail` to `toDto` fails ONLY the direct assertion.
+
+Corollary: don't reach for `.strict()` on a response schema to close this. The stripping is genuine defence-in-depth at runtime, `.strict()` would turn a benign extra key into a 500, and it conflicts with the repo's consumer-lenient contract discipline. Fix the test, not the schema.
+
+## concurrent-mutations-full-dto-cache-rollback
+
+**source:** #142  
+**added:** 2026-07-28  
+**files:** src/client/pages/notify-prefs.ts, src/client/hooks.ts  
+**tags:** react-query, tanstack-query, setQueryData, concurrency, optimistic-cache
+
+---
+
+Two `useMutation` instances writing the same query key will overlap, and `onSuccess: dto => qc.setQueryData(key, dto)` makes the LAST response win for every field — including fields that response never wrote. When the server re-reads and returns a full DTO, an earlier-dispatched request carries the sibling field's pre-write value, so settling last silently rolls back the newer save. The UI symptom is a row that reverts and goes falsely dirty: its draft was reconciled correctly, but the cache it compares against was clobbered.
+
+The trigger is specifically: (a) two or more independently-triggered mutations, (b) one shared cache entry, (c) success handler replaces the entry wholesale. Giving each form row its own mutation instance — a reasonable thing to do so one row's in-flight save doesn't disable another's button — creates (a) on its own.
+
+Fix by folding field-wise on the request body rather than replacing. A response is authoritative only for the fields its own body wrote:
+
+    export function mergeMeCache(prev: MeDto | undefined, dto: MeDto, body: UpdateMeBody): MeDto {
+      if (!prev) return dto;
+      return {
+        ...dto,
+        ...(!('email' in body) && { email: prev.email, emailNotifyAvailable: prev.emailNotifyAvailable }),
+        ...(!('kindleEmail' in body) && { kindleEmail: prev.kindleEmail }),
+        ...(!('notifyOn' in body) && { notifyOn: prev.notifyOn }),
+      };
+    }
+
+    qc.setQueryData<MeDto>(qk.me, (prev) => mergeMeCache(prev, dto, body));
+
+Carry any DERIVED field with its source (`emailNotifyAvailable` moves with `email`). Key on the KEY's presence, not its value, so an explicit `null` clear stays an authoritative write. Fields the endpoint doesn't write (quota, identity) can still take the fresher response. This keeps the direct cache write — no `invalidateQueries` refetch round-trip — and lets the mutations stay independent.
+
+Test it at both layers: a pure order-convergence property (applying both responses in either order yields the same cache) and a component test that freezes response snapshots at dispatch time and releases them in reverse. Seen in #142 (`useUpdateMe` / AccountModal's contact + Kindle rows); `mergeMeCache` lives in `src/client/pages/notify-prefs.ts`.
+
+(Updated 2026-07-30 — the original closing example of a safe wholesale writer, `useUpdateConnectors`, is retired: six mutations now share `qk.connectors` and every one INVALIDATES instead (#160/#168; `hooks.ts` documents the retraction inline). Wholesale replacement is fine only while the single-writer condition genuinely holds — and the moment a second writer appears it silently stops holding, which is exactly how this entry's bug is born. The `qk.me` merge is the repo's one surviving `setQueryData`, now paired with settlement invalidation — see [[settlement-invalidate-both-outcomes]].)
+
+## addressparser-splits-not-validates
+
+**source:** #143  
+**added:** 2026-07-28  
+**files:** src/server/services/notifications/kindle-sender.ts  
+**tags:** nodemailer, addressparser, email-validation, zod
+
+---
+
+`nodemailer/lib/addressparser` (nodemailer@9.0.1) SPLITS an address header into parts; it does not validate them. When the input contains an `@` it falls back to returning that text verbatim as the `address`, so `'a@'`, `'@example.com'`, `'a@b'`, and `'a@b@c'` each parse to exactly ONE entry with a non-empty `address` — a `parsed.length === 1 && parsed[0].address` check accepts all four.
+
+Two rules when parsing an operator-supplied `from`/address field:
+
+1. **Structural gate** — require exactly one entry that has no `group` member and a non-empty `address`. Do NOT use `{ flatten: true }`: it silently promotes a one-member group (`'Undisclosed:a@x.com;'`) to a valid-looking single address. Also note `''`/whitespace parses to `[]`, and a bare token like `'ops team'` parses to one entry whose `address` is `''`.
+2. **Validity gate** — follow it with this repo's single mailbox-validity predicate, `hasDeliverableContact` (`src/shared/schemas/user.ts`, derived from `contactEmailSchema`: trim + lowercase + `z.email()` + max-254), already shared by local login, the OIDC email gate, and the availability sweep. Use it as a PREDICATE only and return the parser's `address` verbatim, so storage/display keep the original casing while comparisons lowercase both sides.
+
+Reference implementation + case table: `parseSingleMailbox` in `src/server/services/notifications/kindle-sender.ts`, tests in `kindle-sender.test.ts` (dropping the `hasDeliverableContact` call is a verified genuine red for the four malformed-`@` cases). `import addressparser from 'nodemailer/lib/addressparser/index.js'` typechecks as-is here; `@types/nodemailer` ships the declaration. nodemailer is Node-only — this must stay server-side and never reach `src/client`/`src/shared`.
+
+## narratorr-client-per-consumer-slices
+
+**source:** #144  
+**added:** 2026-07-28  
+**files:** src/server/services/narratorr-client.ts  
+**tags:** typescript, narratorr-client, test-doubles, interface-design
+
+---
+
+`INarratorrClient` in `src/server/services/narratorr-client.ts` is a broad `Pick<NarratorrClient, ...>`. Adding a method to it structurally breaks every hand-rolled test double that declares `implements INarratorrClient` or types an object literal as it — even doubles that never call the new method. Adding `getCapabilities` (issue #144) broke six test files, ~100 call sites in `request.service.test.ts` alone.
+
+Prefer PER-CONSUMER slices: each service depends only on the calls it makes, so widening the full interface costs nothing downstream. Established slices: `IMetadataSearchClient` (SearchService), `IBookHandoffClient` (RequestService), `IBookStatusClient` (StatusPoller), `ICapabilityClient` (FeatureService), and — since #145 — `IEbookStreamClient` (`narratorr-stream-client.ts`), deliberately its own interface on the separate streaming class rather than a member of `INarratorrClient`, so the ebook-stream consumer (`kindle-send.service.ts`) and its fakes never feel JSON-client widening either. `NarratorrClientHolder` implements the full set (`INarratorrClient` + `IEbookStreamClient`), so production wiring is unchanged and only genuine full-client consumers (`route-harness.ts`'s FakeNarratorrClient, `requests.route.test.ts`, `system.route.test.ts`, `narratorr-client-holder.test.ts`) must grow a new member.
+
+When adding a method (e.g. #145's raw streaming client): add it to `NarratorrClient` and `INarratorrClient`, forward it on the holder, add a slice for its consumer, and update only the full-client doubles. Check the blast radius with `pnpm typecheck` — vitest does not typecheck, so this class of break is invisible to a green test run.
+
+## react-query-mock-hides-cache-convergence
+
+**source:** #144  
+**added:** 2026-07-28  
+**files:** src/client/hooks.test.ts  
+**tags:** react-query, vitest, test-infra, cache-invalidation, jsdom
+
+---
+
+`src/client/hooks.test.ts` mocks `@tanstack/react-query` wholesale — `useQueryClient()` returns `{invalidateQueries: vi.fn(), setQueryData: vi.fn(), cancelQueries: vi.fn()}`, `useQuery`/`useMutation` return their options object. This is the right modality for asserting a hook's shape (query key, `queryFn`, `enabled`, which cache operation a mutation requests, toast text) and it is structurally INCAPABLE of asserting what the cache converges on: there is no QueryCache, no observer, no refetch.
+
+So a reverse-settlement / lost-update regression test written in this file is vacuous — it passes whether or not the defect exists. This is not hypothetical: #144 F1 (PR #165) was blocked for precisely this, a test asserting `invalidateQueries` was called while `useUpdateConnectors` still did `setQueryData(qk.connectors, dto)` and could clobber a sibling's committed field.
+
+When the assertion is about a FINAL CACHE VALUE after two responses settle in a given order, write a `.test.tsx` in the jsdom project using the real `QueryClient` + `QueryClientProvider` + `renderHook`. Exemplar: `src/client/hooks.connector-cache.test.tsx`. Two setup requirements:
+  • Mount the reader and every mutation in ONE `renderHook` call. Separate roots re-render independently, so a cache correction that reaches one is not observable through another's `result.current`.
+  • `await waitFor()` around the post-settle read — `result.current` only refreshes on re-render.
+Model the hazard by having the fake server commit a PUT body to an authoritative row immediately but resolve its RESPONSE through a deferred the test releases, snapshotting the response body at commit time; that reproduces "a response computed before a sibling's write, delivered after it".
+
+This refines [[frontend-logic-extract-not-jsdom]], which endorses `hooks.test.ts` for mutation lifecycle — that endorsement holds for lifecycle and payload shape, not for cache-state convergence. Related defect pattern: learning #160 (independent mutations replacing a shared full-DTO entry).
+
+## settings-routes-commit-before-fallible-tail
+
+**source:** #144  
+**added:** 2026-07-28  
+**files:** src/server/routes/settings.ts  
+**tags:** react-query, fastify, cache-invalidation, error-handling, settings-routes
+
+---
+
+Every write path in `src/server/routes/settings.ts` is ordered persist-then-fallible-tail: the connectors PUT does `await connectorSettings.update(body)` and only then `await reconfigure(...)`; notifier create/update/delete follow the same shape. `reconfigure()` awaits `getNotificationsConfig()` and `getDefaultQuota()` after swapping the narratorr holder, so either can reject and turn an already-committed write into a 500.
+
+**A 500 from these routes is not evidence that nothing was written.** The `survives a REJECTING <method> tail` rows in `settings.route.test.ts` assert exactly that pairing — 500 returned, write durable, capability generation already bumped.
+
+So client cache reconciliation for these endpoints belongs on `onSettled`, never `onSuccess`. Reconciling only on success strands the SPA on pre-write state for a change that landed, with nothing scheduled to repair it (a `staleTime` lapse only MARKS data stale — it schedules no refetch). This was PR #165 findings F5/F6.
+
+Pattern: `src/client/hooks.ts` exposes `reconcileConnectorWrite(qc, retiresCapability)`, called from `onSettled` by all six settings/notifier mutations; toasts stay on `onSuccess`/`onError`. `onSettled` receives `(data, error, variables)`, so a body-keyed trigger like `body.narratorr !== undefined` (mirroring the server's own `reconfigure(narratorrChanged)`) still works on the error path. Refetching after a genuine 400 costs one GET returning the unchanged row; a client cannot reliably infer from a status code which failures committed, so always reconcile.
+
+(The once-open instances are converted: #168 moved `useRequestBook`, `useDecide`, and `useUpdateUser` onto `onSettled` reconciliation too — kept inline rather than routed through `reconcileConnectorWrite`, with doc comments in `hooks.ts` explaining the commit-before-fallible-tail shape each one guards.) Distinct from [[react-query-mock-hides-cache-convergence]] (a test-modality blind spot) and from learning #160 (`setQueryData` vs `invalidate` on a shared entry) — this is a third axis: WHEN to reconcile, not how or with what.
+
+## fastify-hijack-for-no-response
+
+**source:** #146  
+**added:** 2026-07-28  
+**files:** src/server/routes/ebooks.ts  
+**tags:** fastify, reply-lifecycle, client-disconnect, streaming
+
+---
+
+In Fastify 5, a route handler cannot decline to respond by returning early. `wrap-thenable.js` calls `reply.send(undefined)` whenever the handler resolves with `undefined` and the reply is not sent/hijacked and the socket is not destroyed — producing an empty 200. Use `reply.hijack()` (then `return`) for a genuine no-response branch; it sets `kReplyHijacked`, which `wrapThenable` checks FIRST, and it also clears the handler timeout and abort listener.
+
+Two related facts that matter for disconnect handling:
+
+1. `reply.sent` is `kReplyHijacked || raw.writableEnded` (`lib/reply.js:98-103`), which is FALSE for a socket the client destroyed. Fastify therefore still runs your handler after a disconnect — a `close` listener installed inside the handler is too late to observe a `close` that fired during the auth/limiter hooks, so derive liveness from STATE (`request.raw.aborted || reply.raw.destroyed || controller.signal.aborted`) and seed an AbortController from it on entry.
+2. `Reply.prototype.then` (`lib/reply.js:466`) short-circuits to `fulfilled()` when `sent` is true, but otherwise waits on `eos(this.raw)` — the whole response. So `await reply.hijack()` is instant while `await reply.send(webStream)` blocks until the transfer finishes. Do NOT silence `@typescript-eslint/return-await` on a `return reply.send(...)` by adding `await`; restructure so the send is outside the try/catch instead.
+
+See the two AC26 seams in `src/server/routes/ebooks.ts` and the `sent === 0` receipts in `src/server/routes/ebooks.stream.route.test.ts`.
+
+## vitest-tofake-date-only
+
+**source:** #146  
+**added:** 2026-07-28  
+**files:** src/server/routes/ebooks.route.test.ts  
+**tags:** vitest, fake-timers, fastify-rate-limit, ambient-clock
+
+---
+
+When a test must pin behaviour that depends on time, prefer this repo's existing idiom: inject the instant as a trailing default parameter (`ebooksCapability(nowMs = Date.now())`, `SearchService.search`, `createSessionToken`). No fake timers, no globals.
+
+That only works for first-party code. When the clock lives in a dependency — e.g. `@fastify/rate-limit@11`, whose LocalStore reads ambient `Date.now()` at `store/LocalStore.js:12` to choose a window bucket and offers no injection point — use `vi.useFakeTimers({ toFake: ['Date'], now: <Date> })`.
+
+`toFake: ['Date']` is the load-bearing part. Plain `vi.useFakeTimers()` also fakes `setTimeout`/`setInterval`/`setImmediate`, which stalls anything real in the test: a Fastify instance from `buildRouteApp`, drizzle/libSQL migrations, `inject()`, and any actual socket I/O. The test then hangs rather than failing honestly. Faking Date alone leaves the event loop intact.
+
+Two follow-ups worth doing every time:
+
+1. Restore with `vi.useRealTimers()` in a describe-scoped `afterEach` — `vi.restoreAllMocks()` does NOT restore timers, so the frozen clock leaks into the rest of the file.
+2. Once the clock is yours, MOVE it: `vi.setSystemTime(frozen + windowMs + 1_000)` and assert the limit resets. That upgrades the freeze from defensive to asserted and pins the configured window's real value instead of trusting the exported constant.
+
+Worked example: the `rate limiting, per user (AC29-AC31)` describe in `src/server/routes/ebooks.route.test.ts`.
+
+## synchronize-dependent-query-before-absence-assert
+
+**source:** #147  
+**added:** 2026-07-29  
+**files:** src/client/pages/SearchPage.test.tsx  
+**tags:** react-query, vitest, jsdom, testing-library, test-assertions
+
+---
+
+A synchronous `queryBy*` absence assertion is only meaningful once you have PROVEN the app is in the state you think it is. Awaiting an element fetched by a DIFFERENT query does not establish that — it is a race you usually win, not a synchronization point.
+
+This is the complement to the `vi.waitFor cannot assert an absence` rule (issue #176 — applied here, never separately curated): that one says make the negative assertion synchronous; this one says you must first prove the terminal state, or the synchronous assertion just observes `pending`.
+
+Concretely, `useFeatures(me)` is gated on `/api/me` resolving, while `useSearch` / `useMyRequestsPaged` fire independently — and `ebooksVisible()` returns false for BOTH `pending` and `error`, so a test that awaits a row and then asserts no affordance passes whether or not the feature request ever settled.
+
+The shape (see `src/client/pages/SearchPage.test.tsx` and `MyRequestsPage.test.tsx`):
+
+```ts
+// stub: return a deferred the test owns
+if (url.startsWith('/api/features')) return new Promise<Response>((r) => { settleFeatures = r })
+
+async function settleFeaturesTo(client: QueryClient, response: Response, status: 'success' | 'error') {
+  await waitFor(() => expect(settleFeatures).not.toBeNull())   // the request was issued
+  await act(async () => { settleFeatures!(response) })
+  await waitFor(() => expect(client.getQueryState(qk.features)?.status).toBe(status))
+  await act(async () => {})                                     // flush the scheduled render
+}
+```
+
+For a genuine loading case, assert `getQueryState(key)?.status === 'pending'` AND that the request was issued — otherwise "loading" is indistinguishable from "the query never started". Needs `retry: false` on the test `QueryClient` so a 5xx reaches `error` in one tick.
+
+How to check such a test is not vacuous: mutate the gate so it fails ONLY in the branch under test (e.g. `ebooksVisible` -> `state.isError === true || state.data?.ebooksEnabled === true`) and confirm exactly that case goes red. On #147 this exposed a MyRequestsPage error-state test that stayed green while the affordance was fully regressed.
+
+## drizzle-error-cause-chain
+
+**source:** #148  
+**added:** 2026-07-29  
+**files:** src/server/util/db.ts, src/server/services/kindle-send.policy.ts  
+**tags:** drizzle, libsql, sqlite, error-handling, constraints
+
+---
+
+drizzle-orm wraps a rejected statement in its OWN error — `Failed query: insert into "…" (…)\nparams: …` — and hangs the driver error off `cause`. The outer message never names the constraint. So any classifier keyed on `err.message` (unique breach, FK breach, CHECK breach) returns false for every REAL failure while passing unit tests built from synthetic `new Error('UNIQUE constraint failed: …')` values, which have no cause chain.
+
+Walk the chain instead:
+
+    function causeChainMessages(err: unknown, depth = 0): string {
+      if (depth > 5) return '';
+      if (!(err instanceof Error)) return err == null ? '' : String(err);
+      return `${err.message}\n${causeChainMessages(err.cause, depth + 1)}`;
+    }
+
+With @libsql/client 0.17.3 the nested error is `LibsqlError: SQLITE_CONSTRAINT: UNIQUE constraint failed: <table>.<col>, <table>.<col>` carrying `code: 'SQLITE_CONSTRAINT'` and `rawCode: 2067` (`SQLITE_CONSTRAINT_UNIQUE`). Canonical helpers, both in `src/server/util/db.ts` (#183 moved them there): `causeChainMessages()` (the message walk) and, since #195, `hasSqliteRawCode()` (the STRUCTURAL walk — same chain, reads `rawCode` off each link). Prefer the structural walk when the constraint CLASS is the question: `isUniqueViolation()` (same file) is now `rawCode === 2067` only, because drizzle's wrapper message echoes the statement's `params:` line — user-supplied values — so a message regex for `UNIQUE constraint failed` was forgeable by input. Message matching remains necessary only when the classifier must name WHICH index: `isActiveKindleSendCollision()` (`src/server/services/kindle-send.policy.ts`) gates on the structural code first, then matches the index columns in `causeChainMessages()` output. (Full forgeability story + the synthetic-error factory corollary: `drizzle-params-echo-forges-constraint-text`.)
+
+Corollary for tests: a synthetic-error unit test CANNOT validate one of these classifiers. Drive at least one case through a real in-memory libSQL insert (`src/server/services/kindle-send.admission.test.ts` and `src/server/util/db.test.ts` both do). (The once-outstanding exception is fixed: #183 rewired `isUniqueViolation()` over the chain, so both race-resolution consumers — `user.service.ts` and `request.service.ts` — are live, each covered by a real-violation test.)
+
+## nodemailer-destroy-attachment-with-error
+
+**source:** #148  
+**added:** 2026-07-29  
+**files:** src/server/services/kindle-send.service.ts  
+**tags:** nodemailer, node-streams, smtp, timeouts, backpressure
+
+---
+
+When a Node `Readable` is handed to nodemailer as an attachment (`attachments: [{ content: stream }]`), `stream.destroy()` with NO argument closes it without emitting `error`, and nodemailer's `MimeNode` reader just waits — `transport.sendMail()` never settles. A deadline that tears the stream down this way selects an outcome but does not actually abort anything, and the awaiting code hangs.
+
+Always `stream.destroy(new Error(...))`. Erroring the attachment is what makes nodemailer abort before the `\r\n.\r\n` terminator, which is what makes the receiving server discard the partial message — i.e. it is the mechanism behind "a truncated file can never arrive as a successful email", not an implementation detail. Attach a no-op `stream.on('error', () => {})` at construction so the teardown cannot surface as an UNCAUGHT error in the window between nodemailer removing its handlers and the stream being destroyed; on a stream that already reached `end` the destroy is a harmless no-op (autoDestroy has already run).
+
+Related, same file: `SMTPTransport.close()` is cleanup, NOT cancellation (nodemailer 9.0.1, `lib/smtp-transport/index.js:420-425` — it only removes OAuth listeners and emits `'close'`; the live connection is a local inside `send()` and never listens for it). So once the attachment reaches `end` there is no cancellation seam on a non-pooled transport at all, and any claim of an absolute bound on the post-DATA window is false.
+
+Testing rule this came from: a deadline test must assert the work TERMINATES (the receiving server recorded no completed message; the call returned within a bound), not merely that the deadline produced a decision. `destroy()` vs `destroy(err)` is invisible to the latter and fails only the former — see `src/server/services/kindle-send.stream.test.ts`.
+
+## keyed-siblings-on-conditional-reorder
+
+**source:** #149  
+**added:** 2026-07-29  
+**files:** src/client/components/EbookSheet.tsx  
+**tags:** react, reconciliation, jsdom, testing-library
+
+---
+
+Two sibling elements whose ORDER flips on a state change must carry stable `key`s. React reconciles positional children by index, so `{cond ? <A/> : <B/>}{cond ? <B/> : <A/>}` keeps both DOM nodes in place on a flip and just rewrites their props — element identity, focus, hover and in-flight host state all transplant onto the wrong control.
+
+Found in `src/client/components/EbookSheet.tsx` (#149), where Send and Download swap position across the three hierarchy states. `MyRequestsPage.test.tsx`'s 'keeps the sheet mounted through a rerender while the download is still PENDING' captured the Download element, the features query then settled and moved the sheet State C -> State A, and the captured node had silently become Send — the test failed with 'unable to find a button named /downloading/i' while a Download button was plainly on screen.
+
+The fix is a keyed array, not a fragment pair: `const download = <Button key="download" …/>; const sendControl = <Button key="send" …/>;` then `{sendPrimary ? [sendControl, download] : [download, sendControl]}`.
+
+This is invisible to any test that renders one state and never transitions — which is most component tests. It only surfaces once a test drives the transition, or once live queries settle mid-interaction. So when a component reorders controls based on query state, add a transition case deliberately; related to [[synchronize-dependent-query-before-absence-assert]], which is about the same class of query-settles-mid-test timing.
+
+## react-query-observer-lags-cache-on-refetch-error
+
+**source:** #149  
+**added:** 2026-07-29  
+**files:** src/client/components/EbookSheet.test.tsx  
+**tags:** react-query, vitest, jsdom, testing-library, test-assertions
+
+---
+
+In TanStack Query v5, the CACHE and the mounted OBSERVER reach a refetch error at different times, and only the observer drives rendering.
+
+On a refetch failure with retained data the reducer sets `status: 'error'` without clearing `data`. So immediately after `await act(async () => { await client.refetchQueries({queryKey}) })`:
+
+- `client.getQueryState(key)` → `{status: 'error', errorUpdateCount: 1, data: <retained>}` — already correct.
+- the component's observer result → still `{status: 'success', isError: false, error: null, errorUpdateCount: 0}` — the pre-error snapshot.
+- `await act(async () => {})` does NOT flush it (measured render count unchanged). The notification lands later; `waitFor` on a DOM effect is required.
+
+This REFINES [[synchronize-dependent-query-before-absence-assert]], whose recipe is `waitFor(getQueryState(...).status)` then `act(async () => {})` then assert synchronously. That recipe is right for a query settling for the FIRST time; it is insufficient for a refetch-error transition, where it produces a test that reads the pre-error UI and fails as if the production gate were broken. Distinguishing the two costs an afternoon if you assume the library is reporting no error at all — which is what the stale observer snapshot looks like.
+
+The shape (`src/client/components/EbookSheet.test.tsx`):
+
+```ts
+await act(async () => { await client.refetchQueries({ queryKey: qk.features }) })
+// premise, asserted not assumed: errored AND payload retained
+expect(client.getQueryState(qk.features)?.status).toBe('error')
+expect(client.getQueryState(qk.features)?.data).toEqual(FEATURES_A)
+// the observer lags — wait for the POSITIVE effect before any synchronous absence assertion
+await waitFor(() => expect(sendButton()).toBeDisabled())
+expectStateC()
+```
+
+Why it matters beyond tests: retained-data-plus-error is the ONLY reachable state where `ebooksVisible`'s `!state.isError` term differs from a bare `state.data?.x === true`. Every other state has `data === undefined`, so without this case the fail-safe gate is untested — PR #186 F1 showed the entire suite staying green with the gate deleted.
+
+## verify-the-mutation-applied
+
+**source:** #150  
+**added:** 2026-07-29  
+**tags:** mutation-testing, genuine-red, vitest, test-verification
+
+---
+
+A genuine-red mutation that leaves the test GREEN is not evidence the test is vacuous until you have proved the mutation actually landed. `git diff --stat` is not that proof — it reports a changed line even when the replacement text was mangled (e.g. `perl -0pi -e "s/…/…\${x}…/"` in a double-quoted bash string: bash eats the backslash, perl interprets `${x}` itself, and something other than the intended code is written). Encountered in #150 while verifying the AC21 log-sweep assertion; the mangled mutation read as "the raw-line log assertion is not discriminating", and re-running it correctly turned the test red at once.
+
+Working pattern for the repo's mandated genuine-red step:
+
+1. apply the edit with a heredoc'd `python3` script that asserts the exact original string exists before replacing it (a silent no-match is the other half of this trap);
+2. `grep -n` the mutated line and read it;
+3. run only the named test (`pnpm exec vitest run --project=node <file> -t "<name>"`);
+4. `git checkout -- .` (commit new files first — checkout does not revert untracked ones).
+
+The cost of skipping step 2 is asymmetric: a false "still green" invites deleting or weakening a good assertion, which is precisely the vacuous-test outcome the genuine-red bar exists to prevent.
+
+## settlement-invalidate-both-outcomes
+
+**source:** #168  
+**added:** 2026-07-30  
+**files:** src/client/hooks.ts  
+**tags:** react-query, tanstack-query, cache-invalidation, concurrency, setQueryData
+
+---
+
+A shared query key written by several concurrent mutation instances needs its reconciliation on EVERY settlement — both outcomes, unconditionally — not just on the error path.
+
+Why the half-measure fails: combining a field-wise `setQueryData` merge on success (learning [[concurrent-mutations-full-dto-cache-rollback]]) with an error-only invalidation (learning [[settings-routes-commit-before-fallible-tail]]) reintroduces the very rollback the merge prevents. The error path's GET can be ISSUED before a sibling's commit and DELIVERED after that sibling's merge, replacing the whole entry with a pre-write snapshot.
+
+Why invalidating on every settlement converges: `invalidateQueries` delegates to `refetchQueries` with `cancelRefetch: true`, and `Query.fetch` cancels the in-flight retryer when `cancelRefetch` is set and `state.data !== undefined` (query-core 5.101.0) — so on a POPULATED key a later invalidation SUPERSEDES an earlier in-flight refetch, and the last mutation to settle issues the last GET. Callback order is `onSuccess` → `onSettled`, so the merge still updates the row without a round-trip and the trailing GET returns the same values (structural sharing keeps the reference stable): it costs a request, not a re-render storm. Note the supersession arm is DATA-GATED, which is a real trap on empty keys — see [[no-supersession-on-data-less-query]]; this repo's final reconciler (`reconcileMeWrite`, `src/client/hooks.ts`) cancels the in-flight read before invalidating, which makes last-settler-wins unconditional instead of resting on that gate.
+
+Two caveats worth stating explicitly:
+  • Supersession/cancellation is RESULT-level, not transport-level. `getMe()` (`src/client/api.ts`) never consumes the `QueryFunctionContext` abort signal, so the superseded HTTP request still completes on the wire. Every settlement costs a GET; they do not coalesce. Do not write "concurrent saves collapse into one request" in a spec or comment.
+  • Testing it needs SEPARATE gates for each COMMIT, each mutation RESPONSE, and each GET's snapshot and delivery. A fake that commits both fields before the first reconciliation GET is issued passes even with cancellation disabled — the assertion has to prove the first GET captured pre-sibling state AND was still pending. Exemplar: `AccountModal.test.tsx`, 'a stale reconciliation read cannot overwrite a newer sibling save'.
+
+Corollary for existing suites: a fake server that models RESPONSES but not durable state goes red the moment settlement reconciliation is added, because the reconciliation GET reads a row it never wrote. Either commit in the fake, or hold its reads open on purpose so the older rows keep asserting the merge in isolation.
+
+Implemented as `reconcileMeWrite()` in `src/client/hooks.ts`, used by `useUpdateMe` (fire-and-forget) and `useLocalAuth` (promise returned — see the sibling entry for why that distinction is hygiene, not correctness).
+
+## no-supersession-on-data-less-query
+
+**source:** #168  
+**added:** 2026-07-30  
+**files:** src/client/hooks.ts  
+**tags:** react-query, tanstack-query, cache-invalidation, concurrency, auth
+
+---
+
+`invalidateQueries` → `refetchQueries` defaults to `cancelRefetch: true`, but `Query.fetch` honours it ONLY when the query already holds data (`query-core@5.101.0`, `query.js:188`):
+
+    if (this.state.data !== void 0 && fetchOptions?.cancelRefetch) this.cancel({ silent: true })
+    else if (this.#retryer) { this.#retryer.continueRetry(); return this.#retryer.promise }
+
+With data: the later invalidation supersedes the in-flight fetch and wins — the assumption [[settlement-invalidate-both-outcomes]] rests on. WITHOUT data: no request is issued at all and the caller gets the ALREADY-RUNNING retryer's promise, so a read taken under older server state is the one that lands in the cache.
+
+That asymmetry bites wherever a reconciliation runs against a key that is legitimately empty — most obviously an auth/session key on a signed-out screen. Shape of the bug: failed login → settlement re-read issued while `qk.me` is a data-less 401 → user retries with correct credentials → the retry's settlement cannot supersede, so the pre-cookie 401 resolves → valid session, login screen still rendered, and nothing scheduled to repair it (`useMe` has no `refetchInterval`, and a `staleTime` lapse only MARKS stale).
+
+Remedy: CANCEL before invalidating — in the reconciler, not the UI:
+
+    await qc.cancelQueries({ queryKey }, { silent: true })
+    await qc.invalidateQueries({ queryKey })
+
+`cancelQueries` has no `data !== undefined` gate (`Query.cancel` → `retryer.cancel`), so it returns the query to `idle` and the invalidation ALWAYS issues a fresh read, for every caller and cache state. `{ silent: true }` matches the library's own supersession call — the cancelled read must not publish an error state on its way out; the fresh read decides. Both awaits are rejection-safe (`cancelQueries` resolves through `.then(noop).catch(noop)`; `refetchQueries` catches per-query rejections), and the ORDER is part of the contract: cancelling after invalidating kills the read you just requested.
+
+A UI pending-lock is NOT the correctness mechanism (PR #201 F2 disproved the first-draft remedy): returning the invalidation promise from `onSettled` does keep the mutation `pending` across the read (`mutation.js:137,181` await it on both paths), but the pending state only holds while the mutation observer stays attached — `MutationObserver.reset()` (which `LoginPage`'s login/signup mode switch calls) does `removeObserver(this)` on the still-running mutation and republishes an idle result, so `isPending` drops and any `disabled={isPending}` affordance re-enables while the data-less read is still open. A UI-layer lock cannot defend a cache-layer invariant. Keep the returned promise where double-submit ordering is nice to have (`useLocalAuth` returns it; `useUpdateMe` voids it — `qk.me` is populated by construction behind the authenticated shell, and each row's Save gates on its own `isPending`), but state it as hygiene, not the guarantee.
+
+Testing notes, earned the hard way: (1) making the reconciler async means a mocked `useQueryClient` must stub `cancelQueries`, and settlement assertions must flush a microtask (the reconciler awaits the cancel before invalidating — this broke the node project on first push); (2) a convergence test must FORCE the lock bypass (`auth.reset()` mid-read) rather than rely on the lock, or it only proves the lock works. Exemplars: `src/client/hooks.request-error-path.test.tsx` — 'holds the submit lock across the data-less reconciliation read' and 'converges even when the submit lock is bypassed mid-read by auth.reset() (the mode-switch shape)'; the cancel-then-invalidate ORDER is pinned in `hooks.test.ts` via `invocationCallOrder`.
+
+## fetch-redirect-error-invariant
+
+**source:** #199  
+**added:** 2026-07-30  
+**files:** src/server/services/notifications/adapters/*.ts, src/server/services/narratorr-client.ts, src/server/services/narratorr-stream-client.ts, src/server/services/notifications/adapters.test.ts  
+**tags:** fetch, redirect, undici, credential-exposure, notifications, real-socket-test
+
+---
+
+Every production `fetch` call site under `src/server` sets `redirect: 'error'` (#171, #145, #199) — the 7 notification adapters plus the 2 narratorr clients. A new outbound call site must set it too. `adapters/email.ts` and `kindle-sender.ts` are SMTP; `oidc.service.ts` uses openid-client's own HTTP.
+
+What actually replays across a cross-origin redirect, measured on Node 24 with two ephemeral `node:http` servers on different ports:
+
+| Redirect status | Custom header (`X-Gotify-Key`, `X-Api-Key`) | `Authorization: Bearer` | POST body | Original request path |
+|---|---|---|---|---|
+| 301/302/303 | replayed | stripped | dropped (method → GET) | not copied |
+| 307/308 | replayed | stripped | replayed verbatim | not copied |
+
+So: a CUSTOM auth header is the real exposure (the WHATWG cross-origin stripping rule covers only `Authorization`); body-borne credentials leak only on 307/308; and a secret in the URL path (telegram bot token, Discord/Slack/webhook capability URL) has no automatic replay vector at all, because fetch resolves the response `Location` into the new request URL and never copies the original path. Scope a redirect-hardening fix from this table, not from intuition.
+
+Non-redirect 3xx (`300`/`304`/`305`/`306`) are unaffected — never followed, before or after, and still reach the ordinary `if (!res.ok)` path with their real status. Do not add a "reject all 3xx" guard; `adapters.test.ts` has a contract-lock test (a `300` carrying a `Location`) pinning that.
+
+The rejection: `redirect: 'error'` rejects the fetch BEFORE any `!res.ok` check. Assert the `TypeError` TYPE only — fetch specifies a network error as a `TypeError` and says nothing about the message, and this repo floats on `node:24-slim` with `>=24.10.0` supported, so `"fetch failed"` / `cause: "unexpected redirect"` can change on any supported upgrade. Whether to map it is a per-boundary call: `NarratorrClient` maps to its existing `NETWORK` taxonomy because a raw `TypeError` would escape it; the notification adapters deliberately do NOT, because they have no taxonomy and every other network failure already surfaces the same way to the dispatcher and the Settings Test route.
+
+Testing: `vi.stubGlobal('fetch', ...)` and MSW cannot exercise this — in-process interception gives the credential no second host to leak to, so correct and broken code behave identically (see `msw-cannot-test-body-read-abort`). Use two `node:http` servers on `127.0.0.1:0`: a `redirector` answering the status with a `location` pointing at a recording `target`. Assert four things — `TypeError` type only, the target recorded ZERO requests, no recorded target request carries the credential header (state it over the requests, not just the count), and the redirector recorded exactly one request as a vacuity guard, without which the test also passes if nothing was ever sent. Harness hygiene, each a real failure mode: swallow `req/res.on('error')` (a client walking away mid-response emits EPIPE/ECONNRESET; an unhandled `'error'` takes the whole vitest worker down), call `server.closeAllConnections()` before `close()` (undici keep-alive otherwise hangs it), and close in a `finally` so a failed assertion cannot leak a listening port. `narratorr-client.test.ts:317-376` needs the MSW close/re-arm dance; `adapters.test.ts` uses no MSW, so it just leaves fetch unstubbed.
+
+For notifier types the option has ONE exhaustive owner rather than seven scattered assertions: a `Record<Exclude<NotifierType, 'email'>, NotificationChannel>` table in `adapters.test.ts`, so a new entry in `NOTIFIER_TYPES` fails `tsc` until its adapter gets a redirect assertion. Verified by deleting an entry and observing the type error — worth re-checking if that block is ever refactored, since an exhaustiveness guard that no longer guards looks exactly like one that does.
+
+## drizzle-params-echo-forges-constraint-text
+
+**source:** #195  
+**added:** 2026-07-30  
+**files:** src/server/util/db.ts, src/server/services/kindle-send.policy.ts, src/server/test-support/db.ts  
+**tags:** drizzle, libsql, sqlite, constraints, error-classification
+
+---
+
+drizzle-orm's `DrizzleQueryError` message is `Failed query: <sql>\nparams: <every bound value>`. The params line makes the wrapper message partly USER-CONTROLLED, so any classifier deciding over `causeChainMessages()` is forgeable: a `requests` insert whose `title` is literally `UNIQUE constraint failed: kindle_sends.user_id, kindle_sends.book_id` makes a real FOREIGN KEY breach classify as a unique collision. `params` is a single line, so `[^\n]*` anchoring does not save a target-specific regex either.
+
+Decide constraint CLASS structurally instead. With @libsql/client 0.17.3 the chain is DrizzleQueryError (no code) → LibsqlError (`code: 'SQLITE_CONSTRAINT'`, `rawCode`) → SqliteError (extended `code`, same `rawCode`); `rawCode` is the SQLite EXTENDED result code — 2067 UNIQUE, 787 FOREIGNKEY, 275 CHECK, 1299 NOTNULL, 1555 PRIMARYKEY. Keying on `rawCode` rather than the `code` string also avoids accepting both the generic and extended spellings. `hasSqliteRawCode()` (`src/server/util/db.ts`) is the depth-5-bounded walker; `isUniqueViolation()` is `!RangeError && hasSqliteRawCode(err, 2067)`.
+
+Exception, and why the message walk survives: a classifier that must distinguish WHICH unique index fired still needs the table/column names, which only the text carries. `isActiveKindleSendCollision()` therefore keeps `ACTIVE_COLLISION_RE` but gates it on the structural code first — text can narrow a match, never grant one.
+
+Corollary for tests: build synthetic constraint errors through `drizzleConstraintError()` (`src/server/test-support/db.ts`), not by hand. A hand-rolled `new Error('UNIQUE constraint failed: …')` now classifies FALSE, which silently turns any test staging one into a vacuous assertion — this is exactly what happened to both `re-throws the ORIGINAL … error object` tests (#195).
+
+Sibling entry: `drizzle-error-cause-chain` — why the chain must be walked at all (drizzle's wrapper never names the constraint; the driver error hangs off `cause`).
+
+## narratorr-upstream-code-provenance
+
+**source:** #213  
+**added:** 2026-07-30  
+**files:** src/server/services/narratorr-client.ts, src/server/services/narratorr-stream-client.ts, src/server/routes/settings.ts, src/server/routes/ebooks.ts  
+**tags:** narratorr-client, error-classification, zod, input-forgery, http-status
+
+---
+
+`NarratorrError.upstreamCode` is a deliberately unrestricted `string` carrying codes from TWO provenances, and only one of them is trustworthy.
+
+- **Locally authored** (always `upstreamStatus === 0`): `NETWORK` and `TIMEOUT` from the transport catches (`narratorr-client.ts`, `narratorr-stream-client.ts`), `ABORTED` from the stream client's caller-disconnect path. Plus the response-shape codes `NON_JSON` / `CONTRACT_MISMATCH` / `NO_BODY` / `HTTP_<status>`, which carry a REAL status.
+- **Upstream-supplied**: `classifyErrorBody()` (`narratorr-client.ts:55-76`) parses the v1 error envelope, whose `error.code` is a plain `z.string()` (`src/shared/schemas/v1/common.ts:71-77`), and passes the code through VERBATIM with the real HTTP status. So a broken or hostile narratorr can answer `401` with `{"error":{"code":"TIMEOUT"}}` — or `NOT_CONFIGURED`, or `ABORTED`, or anything else we branch on.
+
+**Rule: never branch on a code value alone. Pair it with `upstreamStatus === 0` whenever the code is one WE author.** Status 0 is the discriminator because `classifyErrorBody` is only ever reached from a `!res.ok` branch, so an upstream-sourced code always carries a non-zero status. Prior art: `mapUpstreamFailure` (`src/server/routes/ebooks.ts:43-54`) for `NOT_CONFIGURED`; `describeNarratorrError` (`src/server/routes/settings.ts:38-46`) for `TIMEOUT` (#213).
+
+**Branch ORDER is part of the rule.** A locally-authored code is also status 0, so a specific `status === 0 && code === X` test must sit BEFORE any generic `status === 0` branch, which would otherwise swallow it.
+
+**Test the guard through the real classifier**, not a hand-built `new NarratorrError(401, 'TIMEOUT', …)`: resolve an actual `Response` carrying the forged envelope so production `classifyErrorBody` constructs the error end to end. See `settings.route.test.ts` 'a forged HTTP %i + upstream code "TIMEOUT" keeps its status copy' and `ebooks.route.test.ts:498-516`. Do NOT pick `404` as the forgery status for a Settings-Test case — `ping()` (`narratorr-client.ts`) treats a structured 404 as SUCCESS and the test would assert nothing.
+
+Deliberately no enum/union for these codes (#213 AC9): the field must stay open to upstream drift. That means there is no type-level reminder — the provenance guard is a convention each new code-keyed consumer has to re-apply.

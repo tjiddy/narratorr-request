@@ -222,6 +222,51 @@ describe('POST /api/admin/requests/:publicId/decision', () => {
 });
 
 // AC4 — credential-leak guard: the serialized user list never carries passwordHash.
+// Issue #147 — the admin surfaces are deliberately UNENRICHED. `requestDtoSchema.companionEbook`
+// is required-and-nullable, so these paths must serialize a truthful `null` even for a book that
+// genuinely has a companion; `toDto()` is asserted directly too, because the response schema is
+// non-strict and a body assertion alone can't catch a mapper that drops the field.
+describe('admin request surfaces never carry a companion ebook (#147)', () => {
+  const COMPANION = { format: 'epub', sizeBytes: 4096 } as const;
+
+  it('the queue, the per-user list and the DECISION response all report null', async () => {
+    const admin = await insertUser(h.db, { role: 'admin', status: 'active' });
+    const user = await insertUser(h.db, { role: 'user', status: 'active', username: 'req' });
+    const cookie = h.cookieFor(admin);
+    h.narratorr.companionEpub = true;
+    await h.connectorSettings.update({ ebooksEnabled: true });
+    h.narratorr.status = 'imported';
+
+    // A pending row the admin approves — the handoff lands it `available` with a real book id.
+    const { row } = await h.requests.create(user.id, bodyFor('B01'));
+    const decision = await h.app.inject({
+      method: 'POST',
+      url: `/api/admin/requests/${row.publicId}/decision`,
+      cookies: cookie,
+      payload: { action: 'approve' },
+    });
+    expect(decision.statusCode).toBe(200);
+    expect(decision.json()).toMatchObject({ status: 'available', companionEbook: null });
+
+    const approved = await h.requests.getByPublicId(row.publicId);
+    h.narratorr.companions.set(approved!.narratorrBookId!, COMPANION);
+
+    const queue = await h.app.inject({ method: 'GET', url: '/api/admin/requests', cookies: cookie });
+    expect(queue.json().data.every((r: { companionEbook: unknown }) => r.companionEbook === null)).toBe(true);
+
+    const perUser = await h.app.inject({
+      method: 'GET',
+      url: `/api/admin/users/${user.publicId}/requests`,
+      cookies: cookie,
+    });
+    expect(perUser.json().data.every((r: { companionEbook: unknown }) => r.companionEbook === null)).toBe(true);
+
+    // …and the mapper itself, independent of any serializer.
+    const dto = h.requests.toDto(approved!, { publicId: user.publicId, username: 'req' });
+    expect(dto.companionEbook).toBeNull();
+  });
+});
+
 describe('GET /api/admin/users — no passwordHash leak', () => {
   it('returns {data,total} and the serialized body contains no passwordHash', async () => {
     const admin = await insertUser(h.db, { role: 'admin', status: 'active' });
@@ -253,6 +298,49 @@ describe('GET /api/admin/users — no passwordHash leak', () => {
     expect(row?.passwordHash).toBe('scrypt$super-secret-hash'); // the source genuinely has it
     const dto = h.users.toDto(row!);
     expect('passwordHash' in dto).toBe(false);
+  });
+});
+
+// issue #142 — the Send-to-Kindle device address is SELF-SCOPED PII: it lives on `MeDto` only and
+// must never reach an admin surface, neither as a key nor as a value. Mirrors the passwordHash pair
+// above: a direct `toDto` assertion (the mapper is the real guard) plus route-body assertions.
+describe('admin surfaces never expose users.kindle_email (#142)', () => {
+  const KINDLE = 'seeded-device@kindle.com';
+
+  it('toDto() omits kindleEmail even when the source UserRow carries one', async () => {
+    const seeded = await insertUser(h.db, { role: 'user', status: 'active', kindleEmail: KINDLE });
+    const row = await h.users.getById(seeded.id);
+    expect(row?.kindleEmail).toBe(KINDLE); // the source genuinely has it
+    // The mapper — not the HTTP serializer — is the guard. `userDtoSchema` is a NON-strict
+    // z.object, so Zod would silently strip an added key on the way out and a response-body
+    // assertion alone would still pass with a leaking mapper.
+    const dto = h.users.toDto(row!);
+    expect('kindleEmail' in dto).toBe(false);
+  });
+
+  it('GET /api/admin/users carries neither the key nor the address value', async () => {
+    const admin = await insertUser(h.db, { role: 'admin', status: 'active' });
+    await insertUser(h.db, { role: 'user', status: 'active', username: 'kindler', kindleEmail: KINDLE });
+
+    const res = await h.app.inject({ method: 'GET', url: '/api/admin/users', cookies: h.cookieFor(admin) });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().data.some((u: Record<string, unknown>) => 'kindleEmail' in u)).toBe(false);
+    // Assert on the RAW payload string: a value smuggled under any key name still fails here.
+    expect(res.payload).not.toContain('kindleEmail');
+    expect(res.payload).not.toContain(KINDLE);
+  });
+
+  it('PATCH /api/admin/users/:publicId carries neither the key nor the address value', async () => {
+    const admin = await insertUser(h.db, { role: 'admin', status: 'active' });
+    const target = await insertUser(h.db, { role: 'user', status: 'active', username: 'kindler', kindleEmail: KINDLE });
+
+    const res = await patchUser(h.cookieFor(admin), target.publicId, { autoApprove: true });
+    expect(res.statusCode).toBe(200);
+    expect('kindleEmail' in res.json()).toBe(false);
+    expect(res.payload).not.toContain('kindleEmail');
+    expect(res.payload).not.toContain(KINDLE);
+    // The admin write left the column alone — it isn't reachable from this surface at all.
+    expect((await h.users.getById(target.id))?.kindleEmail).toBe(KINDLE);
   });
 });
 

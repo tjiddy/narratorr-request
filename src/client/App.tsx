@@ -1,7 +1,9 @@
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router';
 import { useQueryClient } from '@tanstack/react-query';
 import { useMe, useInstanceBadge } from './hooks';
-import { ApiError, logout } from './api';
+import { logout } from './api';
+import { resolveMeShell } from './app-shell';
+import { unapprovedStatus } from '@shared/schemas/user';
 import { Layout } from './components/Layout';
 import { SearchPage } from './pages/SearchPage';
 import { MyRequestsPage } from './pages/MyRequestsPage';
@@ -18,7 +20,12 @@ export function App() {
 
   const me = useMe();
 
-  if (me.isLoading) {
+  // The whole shell policy is the pure `resolveMeShell` table (#168 AC6) — notably: a failed
+  // refetch that RETAINED data keeps the session, because the settlement reconciliations the
+  // mutation hooks now issue can fail on the same `buildMeDto()` tail the write just failed on.
+  const shell = resolveMeShell(me);
+
+  if (shell === 'loading') {
     return (
       <div className="flex min-h-screen items-center justify-center bg-background text-muted-foreground">
         Loading…
@@ -26,23 +33,25 @@ export function App() {
     );
   }
 
-  // 401 (or any load failure) → not signed in.
-  if (me.error || !me.data) {
-    if (me.error instanceof ApiError && me.error.status !== 401) {
-      return (
-        <div className="flex min-h-screen items-center justify-center bg-background text-destructive">
-          {me.error.message}
-        </div>
-      );
-    }
-    return <LoginPage />;
+  if (shell === 'fatal') {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-background text-destructive">
+        {me.error?.message}
+      </div>
+    );
   }
+
+  // `shell === 'app'` already implies `me.data` is present; the second term is the type narrowing.
+  if (shell === 'login' || !me.data) return <LoginPage />;
 
   const isAdmin = me.data.role === 'admin';
 
-  // Authenticated but not (yet) approved — admins are always active and skip this.
-  if (!isAdmin && me.data.status !== 'active') {
-    return <AccountStatusScreen status={me.data.status} />;
+  // Authenticated but not (yet) approved. Derived from the SHARED approval policy (which already
+  // exempts admins) rather than a local restatement, so this shell decision and the server's
+  // `requireActiveUser` boundary can never drift apart.
+  const unapproved = unapprovedStatus(me.data);
+  if (unapproved) {
+    return <AccountStatusScreen status={unapproved} />;
   }
 
   return (

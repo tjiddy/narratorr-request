@@ -6,6 +6,7 @@ import { registerSettingsRoutes } from './settings.js';
 import { NarratorrError, type INarratorrClient } from '../services/narratorr-client.js';
 import type { V1Book } from '../../shared/schemas/v1/books.js';
 import type { V1System } from '../../shared/schemas/v1/system.js';
+import type { V1Capabilities } from '../../shared/schemas/v1/capabilities.js';
 
 let h: RouteHarness;
 beforeEach(async () => {
@@ -77,6 +78,9 @@ describe('POST /api/requests — terminal handoff failure emits request.failed',
     }
     async getSystem(): Promise<V1System> {
       return { version: 'v1.0.0' };
+    }
+    async getCapabilities(): Promise<V1Capabilities> {
+      return { companionEpub: { enabled: false } };
     }
   }
 
@@ -306,6 +310,117 @@ describe('harness role-override (header shim)', () => {
     // the synthetic (non-owner) user is forbidden.
     expect((await h.app.inject({ method: 'GET', url, headers: h.asRole('admin') })).statusCode).toBe(200);
     expect((await h.app.inject({ method: 'GET', url, headers: h.asRole('user') })).statusCode).toBe(403);
+  });
+});
+
+describe('GET /api/requests — companion-ebook enrichment (issue #147)', () => {
+  const COMPANION = { format: 'epub', sizeBytes: 4096 } as const;
+
+  /** Seed an `available` row (admin auto-approve + an `imported` book) and return its book id. */
+  async function seedAvailable(user: { id: number }, asin: string): Promise<string> {
+    h.narratorr.status = 'imported';
+    const { row } = await h.requests.create(user.id, bodyFor(asin));
+    expect(row.status).toBe('available');
+    return row.narratorrBookId!;
+  }
+
+  async function enableEbooks(): Promise<void> {
+    h.narratorr.companionEpub = true;
+    await h.connectorSettings.update({ ebooksEnabled: true });
+  }
+
+  it('populates companionEbook for an available row with a companion, null for one without', async () => {
+    const admin = await insertUser(h.db, { role: 'admin', status: 'active' });
+    await enableEbooks();
+    const withEbook = await seedAvailable(admin, 'B01');
+    const without = await seedAvailable(admin, 'B02');
+    h.narratorr.companions.set(withEbook, COMPANION);
+    h.narratorr.companions.set(without, null);
+
+    const res = await h.app.inject({ method: 'GET', url: '/api/requests', cookies: h.cookieFor(admin) });
+
+    expect(res.statusCode).toBe(200);
+    const byAsin = new Map(res.json().data.map((r: { asin: string }) => [r.asin, r]));
+    expect(byAsin.get('B01')).toMatchObject({ companionEbook: COMPANION });
+    expect(byAsin.get('B02')).toMatchObject({ companionEbook: null });
+  });
+
+  it('a book whose companionEbook key is ABSENT (pre-#1961 narratorr) reads as null, not an error', async () => {
+    const admin = await insertUser(h.db, { role: 'admin', status: 'active' });
+    await enableEbooks();
+    await seedAvailable(admin, 'B01'); // id deliberately NOT registered in `companions`
+
+    const res = await h.app.inject({ method: 'GET', url: '/api/requests', cookies: h.cookieFor(admin) });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().data[0].companionEbook).toBeNull();
+  });
+
+  it('returns null for every row — and makes ZERO getBook calls — with the feature OFF', async () => {
+    const admin = await insertUser(h.db, { role: 'admin', status: 'active' });
+    const bookId = await seedAvailable(admin, 'B01');
+    h.narratorr.companions.set(bookId, COMPANION);
+    await h.connectorSettings.update({ ebooksEnabled: false });
+    h.narratorr.bookCalls.length = 0;
+
+    const res = await h.app.inject({ method: 'GET', url: '/api/requests', cookies: h.cookieFor(admin) });
+
+    expect(res.json().data.every((r: { companionEbook: unknown }) => r.companionEbook === null)).toBe(true);
+    expect(h.narratorr.bookCalls).toEqual([]);
+  });
+
+  it('caches across the 4s poll — a second list makes no additional getBook call', async () => {
+    const admin = await insertUser(h.db, { role: 'admin', status: 'active' });
+    await enableEbooks();
+    const bookId = await seedAvailable(admin, 'B01');
+    h.narratorr.companions.set(bookId, COMPANION);
+    const cookie = h.cookieFor(admin);
+
+    await h.app.inject({ method: 'GET', url: '/api/requests', cookies: cookie });
+    h.narratorr.bookCalls.length = 0;
+    const second = await h.app.inject({ method: 'GET', url: '/api/requests', cookies: cookie });
+
+    expect(second.json().data[0].companionEbook).toEqual(COMPANION);
+    expect(h.narratorr.bookCalls).toEqual([]);
+  });
+
+  it('leaves the UNENRICHED surfaces at null even when the book HAS a companion', async () => {
+    // The response schema is non-strict, so a route-body assertion alone can't catch a mapper
+    // that drops or leaks the field — `toDto()` is asserted directly alongside these.
+    const admin = await insertUser(h.db, { role: 'admin', status: 'active' });
+    await enableEbooks();
+    const bookId = await seedAvailable(admin, 'B01');
+    h.narratorr.companions.set(bookId, COMPANION);
+    const cookie = h.cookieFor(admin);
+    const row = (await h.requests.list({ userId: admin.id, limit: 50, offset: 0 })).data[0]!;
+
+    // The enriched list DOES carry it — the contrast that makes the nulls below meaningful.
+    const list = await h.app.inject({ method: 'GET', url: '/api/requests', cookies: cookie });
+    expect(list.json().data[0].companionEbook).toEqual(COMPANION);
+
+    const detail = await h.app.inject({ method: 'GET', url: `/api/requests/${row.publicId}`, cookies: cookie });
+    expect(detail.statusCode).toBe(200);
+    expect(detail.json().companionEbook).toBeNull();
+
+    // The mutation response is a direct toDto() caller too. (`available` is not an ACTIVE status,
+    // so re-requesting the same asin opens a NEW row — 201, and immediately available again.)
+    const created = await post(cookie, bodyFor('B01'));
+    expect(created.statusCode).toBe(201);
+    expect(created.json()).toMatchObject({ status: 'available', companionEbook: null });
+  });
+
+  it('toDto() itself always emits companionEbook: null', async () => {
+    const admin = await insertUser(h.db, { role: 'admin', status: 'active' });
+    await enableEbooks();
+    const bookId = await seedAvailable(admin, 'B01');
+    h.narratorr.companions.set(bookId, COMPANION);
+    const stored = await h.requests.getByPublicId(
+      (await h.requests.list({ userId: admin.id, limit: 50, offset: 0 })).data[0]!.publicId,
+    );
+
+    const dto = h.requests.toDto(stored!, { publicId: admin.publicId, username: 'admin' });
+
+    expect(dto.companionEbook).toBeNull();
   });
 });
 

@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { createServer, type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
 
 // Hoisted so the mock factory can reference them (vi.mock is hoisted above imports).
 const { sendMail, createTransport } = vi.hoisted(() => {
@@ -17,7 +19,8 @@ import { SlackChannel } from './adapters/slack.js';
 import { TelegramChannel } from './adapters/telegram.js';
 import { PushoverChannel } from './adapters/pushover.js';
 import { GotifyChannel } from './adapters/gotify.js';
-import type { SendContext } from './types.js';
+import type { NotificationChannel, SendContext } from './types.js';
+import type { NotifierType } from '../../../shared/notifier-registry.js';
 
 const ctx: SendContext = {
   payload: {
@@ -521,5 +524,146 @@ describe('GotifyChannel', () => {
     fetchMock.mockResolvedValue(new Response(null, { status: 403 }));
     const ch = new GotifyChannel({ serverUrl: 'https://gotify.example.com', appToken: 'g-tok' });
     await expect(ch.send(ctx)).rejects.toThrow(/403/);
+  });
+});
+
+// ---- Redirect hardening (#199) ----
+// A destination that answers a 30x must not get the request re-issued at the host IT named:
+// the WHATWG cross-origin stripping rule covers `Authorization` only, so gotify's custom
+// X-Gotify-Key would ride along, and a 307/308 replays the pushover body verbatim.
+
+describe('fetch adapters — redirect hardening (#199)', () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+  beforeEach(() => {
+    fetchMock = stubFetch(200);
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  // Exhaustive over every non-email notifier type: `email` is SMTP (nodemailer), not fetch.
+  // The Record type is the point — a new entry in NOTIFIER_TYPES fails typecheck here until
+  // its adapter gets a redirect assertion, so this block is the ONE owner of the claim (the
+  // per-adapter outbound-shape tests above deliberately do not duplicate it).
+  const FETCH_CHANNELS: Record<Exclude<NotifierType, 'email'>, NotificationChannel> = {
+    ntfy: new NtfyChannel({ url: 'https://ntfy.sh', topic: 'narr', token: 'tok', priority: null }),
+    webhook: new WebhookChannel({ url: 'https://hook.example.com/x' }),
+    discord: new DiscordChannel({ webhookUrl: 'https://discord.com/api/webhooks/1/abc', includeCover: true }),
+    slack: new SlackChannel({ webhookUrl: 'https://hooks.slack.com/services/x' }),
+    telegram: new TelegramChannel({ botToken: '123:secret', chatId: '-42' }),
+    pushover: new PushoverChannel({ appToken: 'app-tok', userKey: 'user-key' }),
+    gotify: new GotifyChannel({ serverUrl: 'https://gotify.example.com', appToken: 'g-tok' }),
+  };
+
+  it.each(Object.entries(FETCH_CHANNELS))(
+    '%s passes redirect:"error" (and keeps its timeout signal) in the fetch init',
+    async (_type, ch) => {
+      await ch.send(ctx);
+
+      const init = fetchMock.mock.calls[0]![1];
+      expect(init.redirect).toBe('error');
+      // Asserted in the same test so a future edit cannot trade one option away for the other.
+      expect(init.signal).toBeInstanceOf(AbortSignal);
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Real-socket harness. `redirect: 'error'` is only meaningful to a real HTTP client over a
+// real socket — an in-process fetch stub makes correct and broken code behave identically
+// (learning `msw-cannot-test-body-read-abort`, #95). This file uses no MSW, so the
+// close/re-arm dance that narratorr-client.test.ts needs does not apply; the blocks below
+// just leave `fetch` unstubbed.
+// ---------------------------------------------------------------------------
+
+interface RecordedRequest {
+  url: string;
+  headers: IncomingHttpHeaders;
+}
+
+interface RecordingServer {
+  baseUrl: string;
+  /** Every request this server saw — the credential-replay detector. */
+  requests: RecordedRequest[];
+  close(): Promise<void>;
+}
+
+async function startRecordingServer(
+  handler: (req: IncomingMessage, res: ServerResponse) => void,
+): Promise<RecordingServer> {
+  const requests: RecordedRequest[] = [];
+  const s = createServer((req, res) => {
+    requests.push({ url: req.url ?? '', headers: req.headers });
+    // A client that walks away mid-response makes the socket error (EPIPE/ECONNRESET) — swallow
+    // it so a hardening test can't take the whole worker down with an unhandled 'error'.
+    res.on('error', () => {});
+    req.on('error', () => {});
+    handler(req, res);
+  });
+  await new Promise<void>((resolve) => s.listen(0, '127.0.0.1', () => resolve()));
+  const { port } = s.address() as AddressInfo;
+  return {
+    baseUrl: `http://127.0.0.1:${port}`,
+    requests,
+    close: async () => {
+      s.closeAllConnections(); // undici pools keep-alive sockets; without this `close` hangs
+      await new Promise<void>((resolve) => s.close(() => resolve()));
+    },
+  };
+}
+
+describe('GotifyChannel — redirect hardening over real sockets (#199)', () => {
+  // Defensive: an earlier describe's stubbed fetch must never bleed into these tests.
+  beforeEach(() => vi.unstubAllGlobals());
+
+  // 302 is the filed status (header replay); 307 additionally replays a POST body verbatim,
+  // so the pair covers both mechanisms. The option is not status-conditional, so pinning all
+  // five here would be redundant — narratorr-client.test.ts already pins the full set.
+  it.each([302, 307])(
+    'does NOT follow a %d — the app token never reaches the host the destination named',
+    async (status) => {
+      const target = await startRecordingServer((_req, res) => {
+        res.writeHead(200);
+        res.end();
+      });
+      const redirector = await startRecordingServer((_req, res) => {
+        res.writeHead(status, { location: `${target.baseUrl}/message` });
+        res.end();
+      });
+      try {
+        const ch = new GotifyChannel({ serverUrl: redirector.baseUrl, appToken: 'g-tok' });
+
+        // Type only — the runtime owns the message/cause text and may change it (AC5). A
+        // `Gotify responded 200` here would instead mean the redirect WAS followed.
+        await expect(ch.send(ctx)).rejects.toBeInstanceOf(TypeError);
+        expect(target.requests).toEqual([]);
+        // Stated over the recorded requests so the claim is about the credential, not the count.
+        expect(target.requests.filter((r) => r.headers['x-gotify-key'] !== undefined)).toEqual([]);
+        // Vacuity guard — without it the test would also pass if nothing was ever sent.
+        expect(redirector.requests).toHaveLength(1);
+      } finally {
+        await redirector.close();
+        await target.close();
+      }
+    },
+  );
+
+  it('does not normalize a non-redirect 3xx — a 300 carrying a Location keeps its real status', async () => {
+    const target = await startRecordingServer((_req, res) => {
+      res.writeHead(200);
+      res.end();
+    });
+    // A Location header on a NON-redirect status separates "has a Location" from "is a
+    // redirect status" — 300 was never followed, before or after this change.
+    const server = await startRecordingServer((_req, res) => {
+      res.writeHead(300, { location: `${target.baseUrl}/message` });
+      res.end();
+    });
+    try {
+      const ch = new GotifyChannel({ serverUrl: server.baseUrl, appToken: 'g-tok' });
+      await expect(ch.send(ctx)).rejects.toThrow(/300/);
+      expect(target.requests).toEqual([]);
+    } finally {
+      await server.close();
+      await target.close();
+    }
   });
 });
